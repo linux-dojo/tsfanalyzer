@@ -1,0 +1,58 @@
+services:
+  api:
+    build: ./backend
+    command: ["/app/api"]
+    env_file: .env
+    ports:
+      - "8081:8081"
+    volumes:
+      - upload-data:/data/uploads
+    depends_on: [postgres, redis, minio]
+
+  worker:
+    build: ./backend
+    command: ["/app/worker"]
+    env_file: .env
+    volumes:
+      - upload-data:/data/uploads
+    depends_on: [postgres, redis, minio]
+
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pantsa}
+      POSTGRES_USER: ${POSTGRES_USER:-pantsa}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./backend/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-pantsa}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-too}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9001:9001"
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on: [api]
+
+volumes:
+  pg-data:
+  redis-data:
+  minio-data:
+  upload-data:

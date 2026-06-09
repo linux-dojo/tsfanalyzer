@@ -1,0 +1,22 @@
+# dependencies / build
+node_modules/
+dist/
+frontend/dist/
+backend/bin/
+*.exe
+
+# env & secrets
+.env
+*.pem
+*.key
+
+# data
+data/
+uploads/
+*.tgz
+
+# editor/os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
