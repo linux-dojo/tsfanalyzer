@@ -8,6 +8,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"pan-ts-analyzer/internal/parser"
 )
 
 var ErrNotFound = errors.New("file not found")
@@ -17,6 +19,7 @@ type TechSupportFile struct {
 	Filename   string    `json:"filename"`
 	SizeBytes  int64     `json:"size_bytes"`
 	Status     string    `json:"status"` // uploaded | parsing | parsed | failed
+	Error      string    `json:"error,omitempty"` // why parsing failed
 	UploadedAt time.Time `json:"uploaded_at"`
 	StoragePath string   `json:"-"`
 }
@@ -26,15 +29,37 @@ type Store interface {
 	List() ([]TechSupportFile, error)
 	Get(id string) (TechSupportFile, error)
 	Delete(id string) error
+	SetStatus(id, status, errMsg string) error
+	SaveSystemInfo(fileID string, info []parser.KV) error
+	SystemInfo(fileID string) ([]parser.KV, error)
+	SaveArchiveIndex(fileID string, entries []parser.ArchiveEntry) error
+	ArchiveIndex(fileID string) ([]parser.ArchiveEntry, error)
+	SaveCounters(fileID string, samples []parser.CounterSample) error
+	CounterNames(fileID string) ([]CounterMeta, error)
+	CounterSeries(fileID string, names []string, from, to time.Time) (map[string][]parser.CounterSample, error)
+}
+
+// CounterMeta describes one available counter series.
+type CounterMeta struct {
+	Name   string `json:"name"`
+	Points int    `json:"points"`
 }
 
 type Memory struct {
-	mu    sync.RWMutex
-	files map[string]TechSupportFile
+	mu       sync.RWMutex
+	files    map[string]TechSupportFile
+	sysinfo  map[string][]parser.KV
+	archive  map[string][]parser.ArchiveEntry
+	counters map[string]map[string][]parser.CounterSample
 }
 
 func NewMemory() *Memory {
-	return &Memory{files: make(map[string]TechSupportFile)}
+	return &Memory{
+		files:    make(map[string]TechSupportFile),
+		sysinfo:  make(map[string][]parser.KV),
+		archive:  make(map[string][]parser.ArchiveEntry),
+		counters: make(map[string]map[string][]parser.CounterSample),
+	}
 }
 
 func (m *Memory) Create(f TechSupportFile) error {
@@ -72,5 +97,119 @@ func (m *Memory) Delete(id string) error {
 		return ErrNotFound
 	}
 	delete(m.files, id)
+	delete(m.sysinfo, id) // cascade: extracted data goes with the file
+	delete(m.archive, id)
+	delete(m.counters, id)
 	return nil
+}
+
+func (m *Memory) SaveCounters(fileID string, samples []parser.CounterSample) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.files[fileID]; !ok {
+		return ErrNotFound
+	}
+	byName := make(map[string][]parser.CounterSample)
+	for _, s := range samples {
+		byName[s.Name] = append(byName[s.Name], s)
+	}
+	for name := range byName {
+		ss := byName[name]
+		sort.Slice(ss, func(i, j int) bool { return ss[i].Ts.Before(ss[j].Ts) })
+		byName[name] = ss
+	}
+	m.counters[fileID] = byName
+	return nil
+}
+
+func (m *Memory) CounterNames(fileID string) ([]CounterMeta, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	byName, ok := m.counters[fileID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	out := make([]CounterMeta, 0, len(byName))
+	for name, ss := range byName {
+		out = append(out, CounterMeta{Name: name, Points: len(ss)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (m *Memory) CounterSeries(fileID string, names []string, from, to time.Time) (map[string][]parser.CounterSample, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	byName, ok := m.counters[fileID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	out := make(map[string][]parser.CounterSample, len(names))
+	for _, name := range names {
+		var sel []parser.CounterSample
+		for _, s := range byName[name] {
+			if !from.IsZero() && s.Ts.Before(from) {
+				continue
+			}
+			if !to.IsZero() && s.Ts.After(to) {
+				continue
+			}
+			sel = append(sel, s)
+		}
+		out[name] = sel
+	}
+	return out, nil
+}
+
+func (m *Memory) SaveArchiveIndex(fileID string, entries []parser.ArchiveEntry) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.files[fileID]; !ok {
+		return ErrNotFound
+	}
+	m.archive[fileID] = entries
+	return nil
+}
+
+func (m *Memory) ArchiveIndex(fileID string) ([]parser.ArchiveEntry, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	entries, ok := m.archive[fileID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return entries, nil
+}
+
+func (m *Memory) SetStatus(id, status, errMsg string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	f, ok := m.files[id]
+	if !ok {
+		return ErrNotFound
+	}
+	f.Status = status
+	f.Error = errMsg
+	m.files[id] = f
+	return nil
+}
+
+func (m *Memory) SaveSystemInfo(fileID string, info []parser.KV) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.files[fileID]; !ok {
+		return ErrNotFound
+	}
+	m.sysinfo[fileID] = info
+	return nil
+}
+
+func (m *Memory) SystemInfo(fileID string) ([]parser.KV, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	info, ok := m.sysinfo[fileID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return info, nil
 }

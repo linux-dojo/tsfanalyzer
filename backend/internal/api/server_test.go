@@ -1,15 +1,35 @@
 package api
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"pan-ts-analyzer/internal/parser"
 	"pan-ts-analyzer/internal/store"
 )
+
+// buildTechSupportTgz builds a minimal valid tech-support archive.
+func buildTechSupportTgz(t *testing.T) []byte {
+	t.Helper()
+	content := " > show system info\n\nhostname: PA-TEST\nserial: 007\nsw-version: 10.2.4\nuptime: 1 day\ndevice-certificate-status: None\n"
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "tmp/cli/techsupport.txt", Mode: 0o644, Size: int64(len(content))}); err != nil {
+		t.Fatal(err)
+	}
+	tw.Write([]byte(content))
+	tw.Close()
+	gz.Close()
+	return buf.Bytes()
+}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
@@ -32,7 +52,7 @@ func TestUploadListDelete(t *testing.T) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	fw, _ := mw.CreateFormFile("file", "techsupport.tgz")
-	fw.Write([]byte("fake-tgz-content"))
+	fw.Write(buildTechSupportTgz(t))
 	mw.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/files", &buf)
@@ -44,6 +64,39 @@ func TestUploadListDelete(t *testing.T) {
 	}
 	var created store.TechSupportFile
 	json.Unmarshal(rec.Body.Bytes(), &created)
+	if created.Status != "parsing" {
+		t.Fatalf("status = %q, want parsing", created.Status)
+	}
+
+	// parsing happens async; wait for it to finish
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rec = httptest.NewRecorder()
+		srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/files/"+created.ID, nil))
+		var f store.TechSupportFile
+		json.Unmarshal(rec.Body.Bytes(), &f)
+		if f.Status == "parsed" {
+			break
+		}
+		if f.Status == "failed" || time.Now().After(deadline) {
+			t.Fatalf("file never reached parsed state (status=%q)", f.Status)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// system info extracted on upload
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/files/"+created.ID+"/system-info", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("system-info: got %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var si struct {
+		Info []parser.KV `json:"info"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &si)
+	if len(si.Info) != 5 || si.Info[0].Key != "hostname" || si.Info[0].Value != "PA-TEST" {
+		t.Fatalf("system-info payload: %+v", si.Info)
+	}
 
 	// list
 	rec = httptest.NewRecorder()
