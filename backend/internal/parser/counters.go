@@ -92,6 +92,24 @@ var (
 
 	// "--- netstat_detail" block: "<pid>/<program>"
 	nsProgRe = regexp.MustCompile(`^(\d+)/([\w.-]+)`)
+
+	// "--- netstat_stats" block (netstat -s style)
+	nsSectionRe  = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9]*):$`)
+	nsColonRe    = regexp.MustCompile(`^(.+?):\s+(-?\d+)\s*$`)
+	nsNumFirstRe = regexp.MustCompile(`^(-?\d+)\s+(.+?)\s*$`)
+
+	// "--- filesystem" block
+	fsRowRe = regexp.MustCompile(`^(\S+)\s+(\d+)\s+(\d+)\s*$`)
+
+	// pool tables: Mem-Pool-Type / Software Pools / Pow Atomic / shared pool
+	mempoolHdrRe    = regexp.MustCompile(`^:Mem-Pool-Type\b`)
+	mempoolRowRe    = regexp.MustCompile(`^:([A-Za-z][A-Za-z0-9_]*)\s+(.+)$`)
+	softpoolHdrRe   = regexp.MustCompile(`^:Software Pools\b`)
+	softpoolRowRe   = regexp.MustCompile(`^:\[\s*\d+\]\s+(.+?)\s+\(\s*\d+\):\s+(\d+)/(\d+)`)
+	powpoolHdrRe    = regexp.MustCompile(`^Pow Atomic Memory Pools\b`)
+	powpoolRowRe    = regexp.MustCompile(`^:\[\s*\d+\]\s+(.+?)\s+:\s+(\d+)/(\d+)`)
+	sharedpoolHdrRe = regexp.MustCompile(`^:User\s+Quota\b`)
+	sharedpoolRowRe = regexp.MustCompile(`^:([A-Za-z][A-Za-z0-9_]*)\s+(.+)$`)
 )
 
 /* ---------- monitor log state machine ---------- */
@@ -119,6 +137,8 @@ type counterCollector struct {
 
 	nsAcc map[string]float64 // netstat_detail: per proto+program queue sums
 	nsTs  time.Time
+
+	nsSection string // netstat_stats: current section (ip/tcp/...)
 
 	out []CounterSample
 }
@@ -186,6 +206,7 @@ func (c *counterCollector) line(raw string) {
 		c.coreIDs = nil
 		c.curIface, c.rxtxDir = "", ""
 		c.lrDone = false
+		c.nsSection = ""
 		if c.block == "netstat_detail" {
 			c.nsAcc = make(map[string]float64)
 			c.nsTs = c.ts
@@ -210,6 +231,15 @@ func (c *counterCollector) line(raw string) {
 	case "netstat_detail":
 		c.netstatLine(trimmed)
 		return
+	case "netstat_stats":
+		c.netstatStatsLine(trimmed)
+		return
+	case "processes":
+		c.processesLine(trimmed)
+		return
+	case "filesystem":
+		c.filesystemLine(trimmed)
+		return
 	}
 
 	// section transitions (inside panio and friends)
@@ -231,6 +261,18 @@ func (c *counterCollector) line(raw string) {
 	case perTaskSecRe.MatchString(trimmed):
 		c.mode = "pertask"
 		c.taskCols = nil
+		return
+	case mempoolHdrRe.MatchString(trimmed):
+		c.mode = "mempool"
+		return
+	case softpoolHdrRe.MatchString(trimmed):
+		c.mode = "softpool"
+		return
+	case powpoolHdrRe.MatchString(trimmed):
+		c.mode = "powpool"
+		return
+	case sharedpoolHdrRe.MatchString(trimmed):
+		c.mode = "sharedpool"
 		return
 	}
 
@@ -304,6 +346,14 @@ func (c *counterCollector) line(raw string) {
 			c.emit(base+"_insert_failure", atofu(m[6]))
 			// Mem-Pool-Type (m[7]) intentionally not tracked
 		}
+	case "mempool":
+		c.mempoolRow(trimmed)
+	case "softpool":
+		c.softpoolRow(trimmed)
+	case "powpool":
+		c.powpoolRow(trimmed)
+	case "sharedpool":
+		c.sharedpoolRow(trimmed)
 	}
 }
 
@@ -433,4 +483,158 @@ func (c *counterCollector) netstatLine(trimmed string) {
 func atofu(s string) float64 {
 	f, _ := strconv.ParseFloat(strings.TrimSpace(s), 64)
 	return f
+}
+
+// mempoolCols is the positional field list of the global :Mem-Pool-Type table.
+var mempoolCols = []string{
+	"max_sz_b", "threshold", "min_sz_b", "cur_sz_b",
+	"max_alloc", "cur_alloc", "total_alloc",
+	"fail_thresh", "fail_nomem", "local_reuse",
+}
+
+// sharedPoolCols is the positional field list of the :User ... shared pool
+// table; the trailing Data(Pool)-SZ column is intentionally excluded.
+var sharedPoolCols = []string{
+	"quota", "threshold", "min_alloc", "cur_alloc", "max_alloc",
+	"total_alloc", "fail_thresh", "fail_nomem", "local_reuse",
+}
+
+// leadNum parses the leading number of a field, ignoring a trailing
+// parenthetical such as the "(0)" in a Local-Reuse "0(0)" value.
+func leadNum(s string) float64 {
+	if i := strings.IndexByte(s, '('); i >= 0 {
+		s = s[:i]
+	}
+	return atofu(s)
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// netstatStatsLine handles "--- netstat_stats" (netstat -s style output).
+// Section headers like "Ip:" / "TcpExt:" set the current section; stat lines
+// come in two shapes: "Label: <n>" and "<n> free-text label".
+func (c *counterCollector) netstatStatsLine(trimmed string) {
+	if trimmed == "" {
+		return
+	}
+	if m := nsSectionRe.FindStringSubmatch(trimmed); m != nil {
+		c.nsSection = sanitizeCounter(m[1])
+		return
+	}
+	if c.nsSection == "" {
+		return
+	}
+	if m := nsColonRe.FindStringSubmatch(trimmed); m != nil {
+		c.emit(c.plane+"__nsstats__"+c.nsSection+"_"+sanitizeCounter(m[1]), atofu(m[2]))
+		return
+	}
+	if m := nsNumFirstRe.FindStringSubmatch(trimmed); m != nil {
+		c.emit(c.plane+"__nsstats__"+c.nsSection+"_"+sanitizeCounter(m[2]), atofu(m[1]))
+	}
+}
+
+// processesLine handles "--- processes": one row per process. Columns are
+// Name PID CPU% FDs-Open Virt-Mem Res+Swap State Res+Swap-Lazy; State is
+// non-numeric and skipped. Counters are keyed by process name and PID.
+func (c *counterCollector) processesLine(trimmed string) {
+	f := strings.Fields(trimmed)
+	if len(f) < 6 || !isAllDigits(f[1]) {
+		return // header row, "Total num processes", or malformed
+	}
+	base := c.plane + "__processes__" + sanitizeCounter(f[0]) + "_" + f[1]
+	c.emit(base+"_cpu", atofu(f[2]))
+	c.emit(base+"_fds_open", atofu(f[3]))
+	c.emit(base+"_virt_mem", atofu(f[4]))
+	c.emit(base+"_res_swap", atofu(f[5]))
+	if len(f) >= 8 {
+		c.emit(base+"_res_swap_lazy", atofu(f[len(f)-1]))
+	}
+}
+
+// filesystemLine handles "--- filesystem": "Mount  Used(%)  Used(kB)" rows.
+func (c *counterCollector) filesystemLine(trimmed string) {
+	m := fsRowRe.FindStringSubmatch(trimmed)
+	if m == nil {
+		return
+	}
+	base := c.plane + "__filesystem__" + fsMountName(m[1])
+	c.emit(base+"_pct", atofu(m[2]))
+	c.emit(base+"_used_kb", atofu(m[3]))
+}
+
+// fsMountName turns a mount path into a counter-safe name ("/" -> "root").
+func fsMountName(p string) string {
+	if p == "/" {
+		return "root"
+	}
+	return sanitizeCounter(p)
+}
+
+// mempoolRow emits one row of the global :Mem-Pool-Type table. Rows may be
+// short (trailing columns omitted); only the columns present are emitted.
+func (c *counterCollector) mempoolRow(trimmed string) {
+	m := mempoolRowRe.FindStringSubmatch(trimmed)
+	if m == nil {
+		return
+	}
+	base := c.plane + "__pool__mempool__" + sanitizeCounter(m[1])
+	for i, f := range strings.Fields(m[2]) {
+		if i >= len(mempoolCols) {
+			break
+		}
+		c.emit(base+"_"+mempoolCols[i], leadNum(f))
+	}
+}
+
+// sharedpoolRow emits one row of the :User ... shared pool table.
+func (c *counterCollector) sharedpoolRow(trimmed string) {
+	m := sharedpoolRowRe.FindStringSubmatch(trimmed)
+	if m == nil {
+		return
+	}
+	base := c.plane + "__pool__sharedpool__" + sanitizeCounter(m[1])
+	fields := strings.Fields(m[2])
+	for i := 0; i < len(fields) && i < len(sharedPoolCols); i++ {
+		c.emit(base+"_"+sharedPoolCols[i], leadNum(fields[i]))
+	}
+}
+
+// softpoolRow emits the free value and free/total ratio for one
+// :Software Pools row.
+func (c *counterCollector) softpoolRow(trimmed string) {
+	m := softpoolRowRe.FindStringSubmatch(trimmed)
+	if m == nil {
+		return
+	}
+	base := c.plane + "__pool__softpool__" + sanitizeCounter(m[1])
+	free, total := atofu(m[2]), atofu(m[3])
+	c.emit(base, free)
+	if total != 0 {
+		c.emit(base+"_pct", free/total)
+	}
+}
+
+// powpoolRow emits the free value and free/total ratio for one Pow Atomic
+// Memory Pools row.
+func (c *counterCollector) powpoolRow(trimmed string) {
+	m := powpoolRowRe.FindStringSubmatch(trimmed)
+	if m == nil {
+		return
+	}
+	base := c.plane + "__pool__powpool__" + sanitizeCounter(m[1])
+	free, total := atofu(m[2]), atofu(m[3])
+	c.emit(base, free)
+	if total != 0 {
+		c.emit(base+"_pct", free/total)
+	}
 }

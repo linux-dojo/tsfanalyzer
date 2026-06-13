@@ -297,3 +297,159 @@ func TestMpPrefix(t *testing.T) {
 		t.Fatal("mp prefix not applied")
 	}
 }
+
+const sampleDpExtra = `2026-06-09 13:00:00.000 -0700  --- netstat_stats
+Ip:
+    Forwarding: 2
+    11080749 total packets received
+    0 forwarded
+    0 incoming packets discarded
+    11064314 incoming packets delivered
+    10973710 requests sent out
+Tcp:
+    203928 active connection openings
+    175430 passive connection openings
+TcpExt:
+    173188 TCP sockets finished time wait in fast timer
+    2473 time wait sockets recycled by time stamp
+IpExt:
+    InECT0Pkts: 506
+2026-06-09 13:08:37.779 -0700  --- processes
+Total num processes: 0
+Name                   PID      CPU%  FDs Open   Virt Mem     Res+Swap     State      Res+Swap-Lazy
+envoy                  8641     6     40         2281204      20040        S 231028
+2026-06-09 14:23:45.233 -0700  --- filesystem
+Mount            Used (%)   Used (kB)
+/                51         5875792
+/dev             0          0
+/dev/shm         53         2522168
+2026-06-09 15:00:00.000 -0700  --- panio
+:Mem-Pool-Type    MaxSz(KB) Threshold MinSz(KB)  CurSz(B) Max.Alloc   Cur.Alloc Total-Alloc Fail-Thresh  Fail-Nomem Local-Reuse(cache)
+:ctd_dlp_buf           1016     52480       508         0         0         0           0           0           0           0(0)
+:proxy                25600         0         0   3053760   3114864     81673       95234           0           0           0(0)
+:clientless_vpn        3399         0         0         0         0         0           0           0           0
+:Software Pools
+:Id   Name                      Length         Free/Total      HighWm/Populated  Used/Total  DataRange                  CacheSz
+:[ 0] memseg_common             (2097152):       86/88              2/88            1/1      0xd001400000-0xd00c400000
+:[ 1] Shared Pool 24            (     24):   443976/444000        784/87376         1/6      0xd00c800080-0xd00ca00000* 408
+Pow Atomic Memory Pools
+:[ 0] Work Queue Entries        :    25166/25206    0xd0146f8d00
+:[ 1] Packet Buffers            :    30076/31141    0x10181f6c0
+:User                     Quota     Threshold Min.Alloc Cur.Alloc Max.Alloc Total-Alloc Fail-Thresh Fail-Nomem  Local-Reuse Data(Pool)-SZ
+:fptcp_seg                25000     0         0         0         25        3802        0           0           3795        16 (24)
+`
+
+func wantValues(t *testing.T, got map[string][]CounterSample, want map[string]float64) {
+	t.Helper()
+	for name, v := range want {
+		ss, ok := got[name]
+		if !ok {
+			t.Errorf("missing %s", name)
+			continue
+		}
+		if ss[0].Value != v {
+			t.Errorf("%s = %v, want %v", name, ss[0].Value, v)
+		}
+	}
+}
+
+func TestNetstatStats(t *testing.T) {
+	got := collectFromString(t, sampleDpExtra, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__nsstats__ip_forwarding":                 2,
+		"dp__nsstats__ip_total_packets_received":     11080749,
+		"dp__nsstats__ip_forwarded":                  0,
+		"dp__nsstats__ip_incoming_packets_discarded": 0,
+		"dp__nsstats__ip_incoming_packets_delivered": 11064314,
+		"dp__nsstats__ip_requests_sent_out":          10973710,
+		"dp__nsstats__tcp_active_connection_openings":                       203928,
+		"dp__nsstats__tcp_passive_connection_openings":                      175430,
+		"dp__nsstats__tcpext_tcp_sockets_finished_time_wait_in_fast_timer":  173188,
+		"dp__nsstats__tcpext_time_wait_sockets_recycled_by_time_stamp":      2473,
+		"dp__nsstats__ipext_inect0pkts":                                     506,
+	})
+}
+
+func TestProcesses(t *testing.T) {
+	got := collectFromString(t, sampleDpExtra, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__processes__envoy_8641_cpu":           6,
+		"dp__processes__envoy_8641_fds_open":      40,
+		"dp__processes__envoy_8641_virt_mem":      2281204,
+		"dp__processes__envoy_8641_res_swap":      20040,
+		"dp__processes__envoy_8641_res_swap_lazy": 231028,
+	})
+	for name := range got {
+		if name == "dp__processes__name_pid_cpu" {
+			t.Error("header row was parsed as a process")
+		}
+	}
+}
+
+func TestFilesystem(t *testing.T) {
+	got := collectFromString(t, sampleDpExtra, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__filesystem__root_pct":         51,
+		"dp__filesystem__root_used_kb":     5875792,
+		"dp__filesystem__dev_pct":          0,
+		"dp__filesystem__dev_used_kb":      0,
+		"dp__filesystem__dev_shm_pct":      53,
+		"dp__filesystem__dev_shm_used_kb":  2522168,
+	})
+}
+
+func TestMemPool(t *testing.T) {
+	got := collectFromString(t, sampleDpExtra, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__pool__mempool__ctd_dlp_buf_max_sz_b":   1016,
+		"dp__pool__mempool__ctd_dlp_buf_threshold":  52480,
+		"dp__pool__mempool__ctd_dlp_buf_min_sz_b":   508,
+		"dp__pool__mempool__proxy_cur_sz_b":         3053760,
+		"dp__pool__mempool__proxy_max_alloc":        3114864,
+		"dp__pool__mempool__proxy_cur_alloc":        81673,
+		"dp__pool__mempool__proxy_total_alloc":      95234,
+		"dp__pool__mempool__proxy_local_reuse":      0,
+		"dp__pool__mempool__clientless_vpn_max_sz_b": 3399,
+	})
+	// short row: clientless_vpn has no Local-Reuse column
+	if _, ok := got["dp__pool__mempool__clientless_vpn_local_reuse"]; ok {
+		t.Error("short row should not emit a missing trailing column")
+	}
+}
+
+func TestSoftPool(t *testing.T) {
+	got := collectFromString(t, sampleDpExtra, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__pool__softpool__memseg_common":  86,
+		"dp__pool__softpool__shared_pool_24": 443976,
+	})
+	if v := got["dp__pool__softpool__memseg_common_pct"]; len(v) != 1 || v[0].Value != 86.0/88.0 {
+		t.Fatalf("memseg_common_pct = %+v, want %v", v, 86.0/88.0)
+	}
+}
+
+func TestPowPool(t *testing.T) {
+	got := collectFromString(t, sampleDpExtra, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__pool__powpool__work_queue_entries": 25166,
+		"dp__pool__powpool__packet_buffers":     30076,
+	})
+	if v := got["dp__pool__powpool__packet_buffers_pct"]; len(v) != 1 || v[0].Value != 30076.0/31141.0 {
+		t.Fatalf("packet_buffers_pct = %+v, want %v", v, 30076.0/31141.0)
+	}
+}
+
+func TestSharedPool(t *testing.T) {
+	got := collectFromString(t, sampleDpExtra, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__pool__sharedpool__fptcp_seg_quota":       25000,
+		"dp__pool__sharedpool__fptcp_seg_threshold":   0,
+		"dp__pool__sharedpool__fptcp_seg_max_alloc":   25,
+		"dp__pool__sharedpool__fptcp_seg_total_alloc": 3802,
+		"dp__pool__sharedpool__fptcp_seg_local_reuse": 3795,
+	})
+	// Data(Pool)-SZ must not be emitted
+	if _, ok := got["dp__pool__sharedpool__fptcp_seg_data_pool_sz"]; ok {
+		t.Error("Data(Pool)-SZ column should be excluded")
+	}
+}
