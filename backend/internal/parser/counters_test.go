@@ -453,3 +453,136 @@ func TestSharedPool(t *testing.T) {
 		t.Error("Data(Pool)-SZ column should be excluded")
 	}
 }
+
+const sampleDpProc = `2026-06-09 16:00:00.000 -0700  --- panio
+:func                                  max-us   avg-us        count     total-us  ac-max-us  ac-avg-us         ac-count      ac-total-us
+:dfa_match                                114      1.1        24302        27413      84049        4.6           175978           811293
+:ldl_mlc2_http_ort_load                     0      0.0            0            0          0        0.0                0                0
+:group                                 max-us   avg-us        count     total-us  ac-max-us  ac-avg-us         ac-count      ac-total-us
+:aho_result                                 0      0.0            0            0          0        0.0                0                0
+:flow_fastpath (group)
+:col    avg-ticks   avg-us        count     total-us
+: 10         1792        0            1            0
+:dfa_match (func)
+:col    avg-ticks   avg-us        count     total-us
+:  9          929        0           36           15
+:Resource utilization (%) during last 15 minutes:
+:session (average):
+:  0   0   0   0   0   0   0   0   0   0   0   0   0   0   0
+:session (maximum):
+:  0   0   0   0   1   0   0   0   0   0   0   0   0   0   0
+:packet buffer (average):
+:  3   3   3   3   3   3   3   3   3   3   3   3   3   3   3
+:sw tags descriptor (maximum):
+:  6   6   5   5   5   5   5   5   6   6   5   5   6   6   5
+:Number of sessions supported:                    65536
+:Number of allocated sessions:                    21
+:Number of active TCP sessions:                   8
+:Number of active SCTP associations:              0
+:Session table utilization:                       0%
+:Number of sessions created since bootup:         68946
+:Packet rate:                                     194/s
+:Throughput:                                      1271 kbps
+:New connection establish rate:                   4 cps
+:  TCP default timeout:                           3600 secs
+:  Session timeout in discard state:
+:    TCP: 90 secs, UDP: 60 secs, SCTP: 30 secs, other IP protocols: 60 secs
+:Session accelerated aging:                       True
+:  Hardware session offloading:                   False
+:  ICMP Unreachable Packet Rate:                  200 pps
+:Pcap token bucket rate                         : 10485760
+2026-06-09 16:05:00.000 -0700  --- top
+top - 14:17:34 up 15:02,  0 users,  load average: 0.84, 1.07, 1.19
+Tasks: 272 total,   1 running, 271 sleeping,   0 stopped,   0 zombie
+%Cpu(s): 13.3 us,  5.9 sy,  0.5 ni, 76.8 id,  0.0 wa,  3.0 hi,  0.5 si,  0.0 st
+MiB Mem :   7921.8 total,    517.1 free,   5983.0 used,   3971.3 buff/cache
+MiB Swap:   4000.0 total,   3024.2 free,    975.8 used.   1938.9 avail Mem
+`
+
+func TestProcusTables(t *testing.T) {
+	got := collectFromString(t, sampleDpProc, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__procus__func__dfa_match_max_us":      114,
+		"dp__procus__func__dfa_match_avg_us":      1.1,
+		"dp__procus__func__dfa_match_ac_total_us": 811293,
+		"dp__procus__group__aho_result_max_us":    0,
+	})
+}
+
+func TestProcusdTables(t *testing.T) {
+	got := collectFromString(t, sampleDpProc, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__procusd__group__flow_fastpath_c10_avg_ticks": 1792,
+		"dp__procusd__group__flow_fastpath_c10_count":     1,
+		"dp__procusd__func__dfa_match_c9_avg_ticks":       929,
+		"dp__procusd__func__dfa_match_c9_total_us":        15,
+	})
+}
+
+func TestResourceUtil(t *testing.T) {
+	got := collectFromString(t, sampleDpProc, "dp")
+	if v := got["dp__ru__session_avg"]; len(v) != 15 {
+		t.Fatalf("session_avg = %d samples, want 15", len(v))
+	}
+	if v := got["dp__ru__pktbuf_avg"]; len(v) != 15 || v[0].Value != 3 {
+		t.Fatalf("pktbuf_avg = %+v", v)
+	}
+	if v := got["dp__ru__swtags_max"]; len(v) != 15 || v[0].Value != 6 {
+		t.Fatalf("swtags_max = %+v", v)
+	}
+	// newest-first: the "1" is column 5 -> 4 minutes before the block ts
+	blockTs, _ := time.Parse("2006-01-02 15:04:05", "2026-06-09 16:00:00")
+	smax := got["dp__ru__session_max"]
+	var hit bool
+	for _, s := range smax {
+		if s.Value == 1 && s.Ts.Equal(blockTs.Add(-4*time.Minute)) {
+			hit = true
+		}
+	}
+	if !hit {
+		t.Fatalf("session_max: expected value 1 at ts-4m; got %+v", smax)
+	}
+}
+
+func TestSessionInfo(t *testing.T) {
+	got := collectFromString(t, sampleDpProc, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__si__sessions_supported":            65536,
+		"dp__si__sessions_allocated":            21,
+		"dp__si__sessions_tcp":                  8,
+		"dp__si__associations_sctp":             0,
+		"dp__si__session_table_utelization_pct": 0,
+		"dp__si__sesscrsboot":                   68946,
+		"dp__si__pktrate":                       194,
+		"dp__si__throughput_kbps":               1271,
+		"dp__si__newconn":                       4,
+		"dp__si__timeout_tcp_default":           3600,
+		"dp__si__timeout_discard_tcp":           90,
+		"dp__si__timeout_discard_other_ip":      60,
+		"dp__si__accel_aging":                   1,
+		"dp__si__hw_offload":                    -1,
+		"dp__si__setup_icmp_unreachable_rate":   200,
+		"dp__si__pcap_token_bucket_rate":        10485760,
+	})
+}
+
+func TestTop(t *testing.T) {
+	got := collectFromString(t, sampleDpProc, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__top__load_avg_1":        0.84,
+		"dp__top__load_avg_5":        1.07,
+		"dp__top__load_avg_15":       1.19,
+		"dp__top__uptime_minutes":    902,
+		"dp__top__user_sess":         0,
+		"dp__top__tasks_total":       272,
+		"dp__top__tasks_running":     1,
+		"dp__top__tasks_zombie":      0,
+		"dp__top__cpu__user_pct":     13.3,
+		"dp__top__cpu__idle_pct":     76.8,
+		"dp__top__cpu__st_pct":       0,
+		"dp__top__mem_total":         7921.8,
+		"dp__top__mem_buffcache":     3971.3,
+		"dp__top__swap_used":         975.8,
+		"dp__top__avail_mem":         1938.9,
+	})
+}

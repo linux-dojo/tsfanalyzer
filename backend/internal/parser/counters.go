@@ -110,6 +110,32 @@ var (
 	powpoolRowRe    = regexp.MustCompile(`^:?\s*\[\s*\d+\]\s+(.+?)\s+:\s+(\d+)/(\d+)`)
 	sharedpoolHdrRe = regexp.MustCompile(`^:User\s+Quota\b`)
 	sharedpoolRowRe = regexp.MustCompile(`^:([A-Za-z][A-Za-z0-9_]*)\s+(.+)$`)
+
+	// "--- top" block
+	topUptimeRe = regexp.MustCompile(`up\s+(.+?),\s+\d+\s+users?`)
+	topUsersRe  = regexp.MustCompile(`,\s+(\d+)\s+users?`)
+	topLoadRe   = regexp.MustCompile(`load average:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)`)
+	upDaysRe    = regexp.MustCompile(`(\d+)\s+day`)
+	upHMRe      = regexp.MustCompile(`(\d+):(\d+)`)
+	upMinRe     = regexp.MustCompile(`(\d+)\s+min`)
+	numWordRe   = regexp.MustCompile(`([\d.]+)\s+([A-Za-z/]+)`)
+
+	// processing-time tables (:func / :group summaries, and per-col detail)
+	procusFuncHdrRe  = regexp.MustCompile(`^:func\s+max-us`)
+	procusGroupHdrRe = regexp.MustCompile(`^:group\s+max-us`)
+	procusRowRe      = regexp.MustCompile(`^:([a-z][a-z0-9_]*)\s+(.+)$`)
+	procusdHdrRe     = regexp.MustCompile(`^:(\S+)\s+\((func|group)\)\s*$`)
+	procusdRowRe     = regexp.MustCompile(`^:\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)`)
+
+	// resource utilization (%) during last 15 minutes
+	ruSecRe   = regexp.MustCompile(`^:Resource utilization \(%\) during last 15 minutes:`)
+	ruLabelRe = regexp.MustCompile(`^:(.+?)\s+\((average|maximum)\):`)
+	ruRowRe   = regexp.MustCompile(`^:\s+(\d+(?:\s+\d+)*)\s*$`)
+
+	// session info block
+	siStartRe   = regexp.MustCompile(`^:Number of sessions supported`)
+	siDiscardRe = regexp.MustCompile(`TCP:\s*(\d+)\s*secs.*UDP:\s*(\d+).*SCTP:\s*(\d+).*other IP protocols:\s*(\d+)`)
+	firstNumRe  = regexp.MustCompile(`-?\d+(?:\.\d+)?`)
 )
 
 /* ---------- monitor log state machine ---------- */
@@ -139,6 +165,10 @@ type counterCollector struct {
 	nsTs  time.Time
 
 	nsSection string // netstat_stats: current section (ip/tcp/...)
+
+	detKind string // procusd: "func"/"group"
+	detName string // procusd: current detailed table name
+	ruLabel string // ru: current "<name>_avg|_max"
 
 	out []CounterSample
 }
@@ -207,6 +237,7 @@ func (c *counterCollector) line(raw string) {
 		c.curIface, c.rxtxDir = "", ""
 		c.lrDone = false
 		c.nsSection = ""
+		c.detKind, c.detName, c.ruLabel = "", "", ""
 		if c.block == "netstat_detail" {
 			c.nsAcc = make(map[string]float64)
 			c.nsTs = c.ts
@@ -239,6 +270,9 @@ func (c *counterCollector) line(raw string) {
 		return
 	case "filesystem":
 		c.filesystemLine(trimmed)
+		return
+	case "top":
+		c.topLine(trimmed)
 		return
 	}
 
@@ -273,6 +307,23 @@ func (c *counterCollector) line(raw string) {
 		return
 	case sharedpoolHdrRe.MatchString(trimmed):
 		c.mode = "sharedpool"
+		return
+	case procusFuncHdrRe.MatchString(trimmed):
+		c.mode = "procus_func"
+		return
+	case procusGroupHdrRe.MatchString(trimmed):
+		c.mode = "procus_group"
+		return
+	case procusdHdrRe.MatchString(trimmed):
+		m := procusdHdrRe.FindStringSubmatch(trimmed)
+		c.mode, c.detName, c.detKind = "procusd", sanitizeCounter(m[1]), m[2]
+		return
+	case ruSecRe.MatchString(trimmed):
+		c.mode, c.ruLabel = "ru", ""
+		return
+	case siStartRe.MatchString(trimmed):
+		c.mode = "si"
+		c.siLine(trimmed)
 		return
 	}
 
@@ -354,6 +405,16 @@ func (c *counterCollector) line(raw string) {
 		c.powpoolRow(trimmed)
 	case "sharedpool":
 		c.sharedpoolRow(trimmed)
+	case "procus_func":
+		c.procusRow(trimmed, "func")
+	case "procus_group":
+		c.procusRow(trimmed, "group")
+	case "procusd":
+		c.procusdRow(trimmed)
+	case "ru":
+		c.ruLine(trimmed)
+	case "si":
+		c.siLine(trimmed)
 	}
 }
 
@@ -636,5 +697,241 @@ func (c *counterCollector) powpoolRow(trimmed string) {
 	c.emit(base, free)
 	if total != 0 {
 		c.emit(base+"_pct", free/total)
+	}
+}
+
+/* ---------- processing-time tables ---------- */
+
+var procusCols = []string{
+	"max_us", "avg_us", "count", "total_us",
+	"ac_max_us", "ac_avg_us", "ac_count", "ac_total_us",
+}
+
+var procusdCols = []string{"avg_ticks", "avg_us", "count", "total_us"}
+
+// procusRow emits one row of a :func or :group processing-time summary.
+func (c *counterCollector) procusRow(trimmed, kind string) {
+	m := procusRowRe.FindStringSubmatch(trimmed)
+	if m == nil {
+		return
+	}
+	base := c.plane + "__procus__" + kind + "__" + sanitizeCounter(m[1])
+	for i, f := range strings.Fields(m[2]) {
+		if i >= len(procusCols) {
+			break
+		}
+		c.emit(base+"_"+procusCols[i], atofu(f))
+	}
+}
+
+// procusdRow emits one per-column row of a "<name> (func|group)" detail table.
+func (c *counterCollector) procusdRow(trimmed string) {
+	if c.detName == "" {
+		return
+	}
+	m := procusdRowRe.FindStringSubmatch(trimmed)
+	if m == nil {
+		return
+	}
+	base := c.plane + "__procusd__" + c.detKind + "__" + c.detName + "_c" + m[1]
+	for i, v := range []string{m[2], m[3], m[4], m[5]} {
+		c.emit(base+"_"+procusdCols[i], atofu(v))
+	}
+}
+
+/* ---------- resource utilization (%) during last 15 minutes ---------- */
+
+var ruNames = map[string]string{
+	"session":            "session",
+	"packet buffer":      "pktbuf",
+	"packet descriptor":  "pktdesc",
+	"sw tags descriptor": "swtags",
+}
+
+// ruLine tracks the current "<thing> (average|maximum)" label and, on the
+// value row that follows, emits the 15 per-minute samples newest-first
+// (column 1 = current minute).
+func (c *counterCollector) ruLine(trimmed string) {
+	if m := ruLabelRe.FindStringSubmatch(trimmed); m != nil {
+		name, ok := ruNames[strings.TrimSpace(m[1])]
+		if !ok {
+			name = sanitizeCounter(m[1])
+		}
+		suf := "_avg"
+		if m[2] == "maximum" {
+			suf = "_max"
+		}
+		c.ruLabel = name + suf
+		return
+	}
+	if c.ruLabel == "" {
+		return
+	}
+	if m := ruRowRe.FindStringSubmatch(trimmed); m != nil {
+		for i, f := range strings.Fields(m[1]) {
+			c.emitAt(c.ts.Add(-time.Duration(i)*time.Minute), c.plane+"__ru__"+c.ruLabel, atofu(f))
+		}
+		c.ruLabel = "" // exactly one value row per label
+	}
+}
+
+/* ---------- session info ---------- */
+
+// siMap maps a session-info label (text before its colon) to a counter suffix.
+var siMap = map[string]string{
+	"Number of sessions supported":               "sessions_supported",
+	"Number of allocated sessions":               "sessions_allocated",
+	"Number of active TCP sessions":              "sessions_tcp",
+	"Number of active UDP sessions":              "sessions_udp",
+	"Number of active ICMP sessions":             "sessions_icmp",
+	"Number of active GTPc sessions":             "sessions_gtpc",
+	"Number of active HTTP2-5gc sessions":        "sessions_http2_5gc",
+	"Number of active GTPu sessions":             "sessions_gtpu",
+	"Number of pending GTPu sessions":            "sessions_pending_gtpu",
+	"Number of active BCAST sessions":            "sessions_bcast",
+	"Number of active MCAST sessions":            "sessions_mcast",
+	"Number of active predict sessions":          "sessions_predict",
+	"Number of active SCTP sessions":             "sessions_sctp",
+	"Number of active SCTP associations":         "associations_sctp",
+	"Number of active PFCP sessions":             "sessions_pfcp",
+	"Number of active IMSI sessions":             "sessions_imsi",
+	"Session table utilization":                  "session_table_utelization_pct",
+	"Number of sessions created since bootup":    "sesscrsboot",
+	"Packet rate":                                "pktrate",
+	"Throughput":                                 "throughput_kbps",
+	"New connection establish rate":              "newconn",
+	"TCP default timeout":                        "timeout_tcp_default",
+	"TCP session timeout before SYN-ACK received":   "timeout_tcp_before_syn_ack",
+	"TCP session timeout before 3-way handshaking":  "timeout_tcp_before_3way",
+	"TCP half-closed session timeout":            "timeout_tcp_half_closed",
+	"TCP session timeout in TIME_WAIT":           "timeout_tcp_time_wait",
+	"TCP session delayed ack timeout":            "timeout_tcp_delayed_ack",
+	"TCP session timeout for unverified RST":     "timeout_tcp_unverified_rst",
+	"UDP default timeout":                        "timeout_udp_default",
+	"ICMP default timeout":                       "timeout_icmp_default",
+	"SCTP default timeout":                       "timeout_sctp_default",
+	"SCTP timeout before INIT-ACK received":      "timeout_sctp_before_init_ack",
+	"SCTP timeout before COOKIE received":        "timeout_sctp_before_cookie",
+	"SCTP timeout before SHUTDOWN received":      "timeout_sctp_before_shutdown",
+	"5GC delete timeout":                         "timeout_5gc_delete",
+	"other IP default timeout":                   "timeout_other_ip_default",
+	"Captive Portal session timeout":             "timeout_captive_portal",
+	"Session accelerated aging":                  "accel_aging",
+	"Accelerated aging threshold":                "accel_aging_threshold_pct",
+	"Scaling factor":                             "accel_aging_scaling_factor",
+	"TCP - reject non-SYN first packet":          "setup_reject_non_syn_first",
+	"Hardware session offloading":                "hw_offload",
+	"Software Cut Through":                        "setup_sw_cut_through",
+	"Run-to-completion mode":                      "setup_run_to_completion",
+	"Tunnel acceleration":                        "setup_tunnel_accel",
+	"IPv6 firewalling":                           "setup_ipv6_firewalling",
+	"Strict TCP/IP checksum":                     "setup_strict_tcpip_checksum",
+	"Strict TCP RST sequence":                    "setup_strict_tcp_rst_seq",
+	"Reject TCP small initial window":            "setup_reject_tcp_small_initial_window",
+	"Reject TCP SYN with different seq/options":  "setup_reject_tcp_syn_diff_seq",
+	"Teardown session if forward zone changes":   "setup_teardown_on_fwd_zone_change",
+	"Do not refresh discard sessions":            "setup_no_refresh_discard",
+	"ICMP Unreachable Packet Rate":               "setup_icmp_unreachable_rate",
+	"Timeout to determine application trickling":  "trickling_timeout",
+	"Resource utilization threshold to start scan": "trickling_ru_threshold_pct",
+	"Scan scaling factor over regular aging":     "trickling_scan_scaling_factor",
+	"Pcap token bucket rate":                     "pcap_token_bucket_rate",
+	"Max pending queued mcast packets per session": "max_pending_mcast_pkts",
+}
+
+// siLine parses one session-info line. Booleans map True->1, False->-1;
+// otherwise the first number in the value is used (units stripped).
+func (c *counterCollector) siLine(trimmed string) {
+	s := strings.TrimSpace(strings.TrimPrefix(trimmed, ":"))
+	if m := siDiscardRe.FindStringSubmatch(s); m != nil {
+		c.emit(c.plane+"__si__timeout_discard_tcp", atofu(m[1]))
+		c.emit(c.plane+"__si__timeout_discard_udp", atofu(m[2]))
+		c.emit(c.plane+"__si__timeout_discard_sctp", atofu(m[3]))
+		c.emit(c.plane+"__si__timeout_discard_other_ip", atofu(m[4]))
+		return
+	}
+	i := strings.IndexByte(s, ':')
+	if i < 0 {
+		return
+	}
+	suf, ok := siMap[strings.TrimSpace(s[:i])]
+	if !ok {
+		return
+	}
+	val := s[i+1:]
+	base := c.plane + "__si__" + suf
+	switch {
+	case strings.Contains(val, "True"):
+		c.emit(base, 1)
+	case strings.Contains(val, "False"):
+		c.emit(base, -1)
+	default:
+		if num := firstNumRe.FindString(val); num != "" {
+			c.emit(base, atofu(num))
+		}
+	}
+}
+
+/* ---------- top ---------- */
+
+// parseUptime converts the "up ..." field to total minutes. Handles
+// "HH:MM", "N days, HH:MM", "N day, HH:MM" and "N min".
+func parseUptime(s string) int {
+	mins := 0
+	if m := upDaysRe.FindStringSubmatch(s); m != nil {
+		d, _ := strconv.Atoi(m[1])
+		mins += d * 1440
+	}
+	if m := upHMRe.FindStringSubmatch(s); m != nil {
+		h, _ := strconv.Atoi(m[1])
+		mm, _ := strconv.Atoi(m[2])
+		mins += h*60 + mm
+	} else if m := upMinRe.FindStringSubmatch(s); m != nil {
+		mm, _ := strconv.Atoi(m[1])
+		mins += mm
+	}
+	return mins
+}
+
+// topLine parses one line of the "--- top" block.
+func (c *counterCollector) topLine(trimmed string) {
+	if strings.HasPrefix(trimmed, "top -") {
+		if m := topUptimeRe.FindStringSubmatch(trimmed); m != nil {
+			c.emit(c.plane+"__top__uptime_minutes", float64(parseUptime(m[1])))
+		}
+		if m := topUsersRe.FindStringSubmatch(trimmed); m != nil {
+			c.emit(c.plane+"__top__user_sess", atofu(m[1]))
+		}
+		if m := topLoadRe.FindStringSubmatch(trimmed); m != nil {
+			c.emit(c.plane+"__top__load_avg_1", atofu(m[1]))
+			c.emit(c.plane+"__top__load_avg_5", atofu(m[2]))
+			c.emit(c.plane+"__top__load_avg_15", atofu(m[3]))
+		}
+		return
+	}
+	pairs := map[string]float64{}
+	for _, mm := range numWordRe.FindAllStringSubmatch(trimmed, -1) {
+		pairs[mm[2]] = atofu(mm[1])
+	}
+	emit := func(set map[string]string, prefix, suffix string) {
+		for k, n := range set {
+			if v, ok := pairs[k]; ok {
+				c.emit(c.plane+"__top__"+prefix+n+suffix, v)
+			}
+		}
+	}
+	switch {
+	case strings.HasPrefix(trimmed, "Tasks:"):
+		emit(map[string]string{"total": "tasks_total", "running": "tasks_running",
+			"sleeping": "tasks_sleeping", "stopped": "tasks_stopped", "zombie": "tasks_zombie"}, "", "")
+	case strings.HasPrefix(trimmed, "%Cpu"):
+		emit(map[string]string{"us": "user", "sy": "system", "ni": "nice", "id": "idle",
+			"wa": "iowait", "hi": "hinterrupt", "si": "sinterrupt", "st": "st"}, "cpu__", "_pct")
+	case strings.HasPrefix(trimmed, "MiB Mem"):
+		emit(map[string]string{"total": "mem_total", "free": "mem_free",
+			"used": "mem_used", "buff/cache": "mem_buffcache"}, "", "")
+	case strings.HasPrefix(trimmed, "MiB Swap"):
+		emit(map[string]string{"total": "swap_total", "free": "swap_free",
+			"used": "swap_used", "avail": "avail_mem"}, "", "")
 	}
 }
