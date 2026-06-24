@@ -136,6 +136,15 @@ var (
 	siStartRe   = regexp.MustCompile(`^:Number of sessions supported`)
 	siDiscardRe = regexp.MustCompile(`TCP:\s*(\d+)\s*secs.*UDP:\s*(\d+).*SCTP:\s*(\d+).*other IP protocols:\s*(\d+)`)
 	firstNumRe  = regexp.MustCompile(`-?\d+(?:\.\d+)?`)
+
+	// "--- pow" thread statistics
+	vmpowStartRe     = regexp.MustCompile(`^:pow parameters:`)
+	vmpowThreadNumRe = regexp.MustCompile(`^:thread (\d+)`)
+	vmpowThreadRe    = regexp.MustCompile(`^:thread (\d+) (rcv_tot|deq|null|submit|desubmit|sel to|sel ok|pow_wait) (\d+)`)
+	vmpowIoWqeRe     = regexp.MustCompile(`^:io: wqe alloc (\d+) wqe null (\d+)`)
+	vmpowInflightRe  = regexp.MustCompile(`^:Total inflight wqe (\d+)`)
+	vmpowUsedWqeRe   = regexp.MustCompile(`^:used wqe (\d+) total wqe (\d+)\s+(\d+)% used`)
+	vmpowRcvThreshRe = regexp.MustCompile(`^:rcv_thresh\s*:\s*(\d+)`)
 )
 
 /* ---------- monitor log state machine ---------- */
@@ -169,6 +178,8 @@ type counterCollector struct {
 	detKind string // procusd: "func"/"group"
 	detName string // procusd: current detailed table name
 	ruLabel string // ru: current "<name>_avg|_max"
+
+	powThread int // vmpow: current thread context (for io lines)
 
 	out []CounterSample
 }
@@ -238,6 +249,7 @@ func (c *counterCollector) line(raw string) {
 		c.lrDone = false
 		c.nsSection = ""
 		c.detKind, c.detName, c.ruLabel = "", "", ""
+		c.powThread = 0
 		if c.block == "netstat_detail" {
 			c.nsAcc = make(map[string]float64)
 			c.nsTs = c.ts
@@ -324,6 +336,9 @@ func (c *counterCollector) line(raw string) {
 	case siStartRe.MatchString(trimmed):
 		c.mode = "si"
 		c.siLine(trimmed)
+		return
+	case vmpowStartRe.MatchString(trimmed):
+		c.mode, c.powThread = "vmpow", 0
 		return
 	}
 
@@ -415,6 +430,8 @@ func (c *counterCollector) line(raw string) {
 		c.ruLine(trimmed)
 	case "si":
 		c.siLine(trimmed)
+	case "vmpow":
+		c.vmpowLine(trimmed)
 	}
 }
 
@@ -609,6 +626,20 @@ func (c *counterCollector) netstatStatsLine(trimmed string) {
 // non-numeric and skipped. Counters are keyed by process name and PID.
 func (c *counterCollector) processesLine(trimmed string) {
 	f := strings.Fields(trimmed)
+	if strings.HasPrefix(trimmed, "Total num processes") {
+		if n := firstNumRe.FindString(trimmed); n != "" {
+			c.emit(c.plane+"__total__processes", atofu(n))
+		}
+		return
+	}
+	if strings.HasPrefix(trimmed, "Totals") && len(f) >= 6 {
+		c.emit(c.plane+"__total__cpu_pct", atofu(f[1]))
+		c.emit(c.plane+"__total__fds", atofu(f[2]))
+		c.emit(c.plane+"__total__virt_mem", atofu(f[3]))
+		c.emit(c.plane+"__total__res_mem", atofu(f[4]))
+		c.emit(c.plane+"__total__res_mem_sub_lazy", atofu(f[5]))
+		return
+	}
 	if len(f) < 6 || !isAllDigits(f[1]) {
 		return // header row, "Total num processes", or malformed
 	}
@@ -895,6 +926,10 @@ func parseUptime(s string) int {
 
 // topLine parses one line of the "--- top" block.
 func (c *counterCollector) topLine(trimmed string) {
+	if pf := strings.Fields(trimmed); len(pf) >= 12 && isAllDigits(pf[0]) {
+		c.topProcessRow(pf)
+		return
+	}
 	if strings.HasPrefix(trimmed, "top -") {
 		if m := topUptimeRe.FindStringSubmatch(trimmed); m != nil {
 			c.emit(c.plane+"__top__uptime_minutes", float64(parseUptime(m[1])))
@@ -933,5 +968,89 @@ func (c *counterCollector) topLine(trimmed string) {
 	case strings.HasPrefix(trimmed, "MiB Swap"):
 		emit(map[string]string{"total": "swap_total", "free": "swap_free",
 			"used": "swap_used", "avail": "avail_mem"}, "", "")
+	}
+}
+
+/* ---------- top per-process table ---------- */
+
+// parseTopSize converts a top SIZE field to bytes. A k/m/g/t suffix scales
+// accordingly; a bare number is KiB (top's default unit).
+func parseTopSize(s string) float64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	mult := 1024.0 // bare = KiB
+	switch s[len(s)-1] {
+	case 'k', 'K':
+		mult, s = 1024, s[:len(s)-1]
+	case 'm', 'M':
+		mult, s = 1024*1024, s[:len(s)-1]
+	case 'g', 'G':
+		mult, s = 1024*1024*1024, s[:len(s)-1]
+	case 't', 'T':
+		mult, s = 1024*1024*1024*1024, s[:len(s)-1]
+	}
+	return atofu(s) * mult
+}
+
+// parseTopTime converts a top TIME+ field (MM:SS.ss or HH:MM:SS) to seconds.
+func parseTopTime(s string) float64 {
+	var total float64
+	for _, p := range strings.Split(strings.TrimSpace(s), ":") {
+		total = total*60 + atofu(p)
+	}
+	return total
+}
+
+// topProcessRow emits one row of the top per-process table. Columns:
+// PID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ COMMAND (USER/PR/S skipped).
+func (c *counterCollector) topProcessRow(f []string) {
+	base := c.plane + "__topprocess__" + sanitizeCounter(f[11]) + "_" + f[0] + "__"
+	c.emit(base+"cpu", atofu(f[8]))
+	c.emit(base+"mem_pct", atofu(f[9]))
+	c.emit(base+"nice", atofu(f[3]))
+	c.emit(base+"virt_mem", parseTopSize(f[4]))
+	c.emit(base+"res_mem", parseTopSize(f[5]))
+	c.emit(base+"shr_mem", parseTopSize(f[6]))
+	c.emit(base+"time", parseTopTime(f[10]))
+}
+
+/* ---------- pow thread statistics ---------- */
+
+var vmpowFields = map[string]string{
+	"rcv_tot": "rcv_tot", "deq": "deq", "null": "null", "submit": "submit",
+	"desubmit": "desubmit", "sel to": "sel_to", "sel ok": "sel_ok", "pow_wait": "pow_wait",
+}
+
+// vmpowLine parses the pow thread-statistics block. Per-thread metrics carry
+// their thread number inline; the "io:" lines inherit the most recent thread.
+func (c *counterCollector) vmpowLine(trimmed string) {
+	if m := vmpowThreadNumRe.FindStringSubmatch(trimmed); m != nil {
+		c.powThread, _ = strconv.Atoi(m[1])
+	}
+	if m := vmpowThreadRe.FindStringSubmatch(trimmed); m != nil {
+		if field := vmpowFields[m[2]]; field != "" {
+			c.emit(fmt.Sprintf("%s__vmpow__thread%02d__%s", c.plane, c.powThread, field), atofu(m[3]))
+		}
+		return
+	}
+	if m := vmpowIoWqeRe.FindStringSubmatch(trimmed); m != nil {
+		c.emit(fmt.Sprintf("%s__vmpow__thread%02d__io_wqe_alloc", c.plane, c.powThread), atofu(m[1]))
+		c.emit(fmt.Sprintf("%s__vmpow__thread%02d__io_wqe_null", c.plane, c.powThread), atofu(m[2]))
+		return
+	}
+	if m := vmpowInflightRe.FindStringSubmatch(trimmed); m != nil {
+		c.emit(c.plane+"__vmpow__total_inflight_wqe", atofu(m[1]))
+		return
+	}
+	if m := vmpowUsedWqeRe.FindStringSubmatch(trimmed); m != nil {
+		c.emit(c.plane+"__vmpow__used_wqe", atofu(m[1]))
+		c.emit(c.plane+"__vmpow__used_wqe_total", atofu(m[2]))
+		c.emit(c.plane+"__vmpow__used_wqe_pct", atofu(m[3]))
+		return
+	}
+	if m := vmpowRcvThreshRe.FindStringSubmatch(trimmed); m != nil {
+		c.emit(c.plane+"__vmpow__rcv_thresh", atofu(m[1]))
 	}
 }

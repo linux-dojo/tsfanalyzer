@@ -586,3 +586,100 @@ func TestTop(t *testing.T) {
 		"dp__top__avail_mem":         1938.9,
 	})
 }
+
+const sampleDpFinal = `2026-06-09 14:17:34.176 -0700  --- top
+top - 14:17:34 up 15:02,  0 users,  load average: 0.84, 1.07, 1.19
+Tasks: 272 total,   1 running, 271 sleeping,   0 stopped,   0 zombie
+%Cpu(s): 13.3 us,  5.9 sy,  0.5 ni, 76.8 id,  0.0 wa,  3.0 hi,  0.5 si,  0.0 st
+MiB Mem :   7921.8 total,    517.1 free,   5983.0 used,   3971.3 buff/cache
+MiB Swap:   4000.0 total,   3024.2 free,    975.8 used.   1938.9 avail Mem
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   4276 root      20   0   66.4g   2.1g   2.1g S  28.8  27.4 266:21.10 pan_task
+   4281 root      20   0 2683036 264516  73184 S   3.8   3.3  29:19.24 wifclie+
+2026-06-09 14:11:38.375 -0700  --- processes
+Total num processes: 0
+Name                   PID      CPU%  FDs Open   Virt Mem     Res+Swap     State      Res+Swap-Lazy
+httpd                  15639    6     16         593768       29896        S          29896
+Totals                         6     133        211250024    6649272                 6649272
+2026-06-09 14:20:00.000 -0700  --- pow
+:pow parameters:
+:rcv_thresh       :1792
+:thread 2 rcv_tot 54087791 avg 0K/s
+:thread 2 rcv 4663457 avg 0K/s
+:thread 2 deq 55063979 avg 1K/s
+:thread 2 null 5196465189 avg 92K/s
+:thread 2 submit 1671779 avg 0K/s
+:thread 2 desubmit 49424334 avg 0K/s
+:thread 2 sel to 441960066 avg 8071/s
+:thread 2 sel ok 1678424 avg 1/s
+:thread 2 pow_wait 100 usec
+:io: wqe alloc 4663457 wqe null 0 fail ratio 0%
+:Total inflight wqe 0
+:used wqe 50 total wqe 25206 0% used
+`
+
+func approx(t *testing.T, got map[string][]CounterSample, name string, want float64) {
+	t.Helper()
+	v, ok := got[name]
+	if !ok {
+		t.Errorf("missing %s", name)
+		return
+	}
+	d := v[0].Value - want
+	if d < 0 {
+		d = -d
+	}
+	if d > 1 {
+		t.Errorf("%s = %v, want ~%v", name, v[0].Value, want)
+	}
+}
+
+func TestTopProcess(t *testing.T) {
+	got := collectFromString(t, sampleDpFinal, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__topprocess__pan_task_4276__cpu":     28.8,
+		"dp__topprocess__pan_task_4276__mem_pct": 27.4,
+		"dp__topprocess__pan_task_4276__nice":    0,
+		"dp__topprocess__wifclie_4281__cpu":      3.8,
+	})
+	approx(t, got, "dp__topprocess__pan_task_4276__virt_mem", 66.4*1073741824)
+	approx(t, got, "dp__topprocess__pan_task_4276__res_mem", 2.1*1073741824)
+	approx(t, got, "dp__topprocess__pan_task_4276__time", 15981.1)
+	approx(t, got, "dp__topprocess__wifclie_4281__virt_mem", 2683036*1024)
+	approx(t, got, "dp__topprocess__wifclie_4281__res_mem", 264516*1024)
+}
+
+func TestProcessesTotals(t *testing.T) {
+	got := collectFromString(t, sampleDpFinal, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__total__processes":         0,
+		"dp__total__cpu_pct":           6,
+		"dp__total__fds":               133,
+		"dp__total__virt_mem":          211250024,
+		"dp__total__res_mem":           6649272,
+		"dp__total__res_mem_sub_lazy":  6649272,
+		// keep-both: per-process counters still emitted
+		"dp__processes__httpd_15639_cpu": 6,
+	})
+}
+
+func TestVmpow(t *testing.T) {
+	got := collectFromString(t, sampleDpFinal, "dp")
+	wantValues(t, got, map[string]float64{
+		"dp__vmpow__thread02__rcv_tot":      54087791,
+		"dp__vmpow__thread02__deq":          55063979,
+		"dp__vmpow__thread02__null":         5196465189,
+		"dp__vmpow__thread02__submit":       1671779,
+		"dp__vmpow__thread02__desubmit":     49424334,
+		"dp__vmpow__thread02__sel_to":       441960066,
+		"dp__vmpow__thread02__sel_ok":       1678424,
+		"dp__vmpow__thread02__pow_wait":     100,
+		"dp__vmpow__thread02__io_wqe_alloc": 4663457,
+		"dp__vmpow__thread02__io_wqe_null":  0,
+		"dp__vmpow__total_inflight_wqe":     0,
+		"dp__vmpow__used_wqe":               50,
+		"dp__vmpow__used_wqe_total":         25206,
+		"dp__vmpow__used_wqe_pct":           0,
+		"dp__vmpow__rcv_thresh":             1792,
+	})
+}
