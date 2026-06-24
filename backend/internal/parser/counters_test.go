@@ -332,7 +332,7 @@ Mount            Used (%)   Used (kB)
 :Id   Name                      Length         Free/Total      HighWm/Populated  Used/Total  DataRange                  CacheSz
 :[ 0] memseg_common             (2097152):       86/88              2/88            1/1      0xd001400000-0xd00c400000
 :[ 1] Shared Pool 24            (     24):   443976/444000        784/87376         1/6      0xd00c800080-0xd00ca00000* 408
-Pow Atomic Memory Pools
+:Pow Atomic Memory Pools
 :[ 0] Work Queue Entries        :    25166/25206    0xd0146f8d00
 :[ 1] Packet Buffers            :    30076/31141    0x10181f6c0
 :User                     Quota     Threshold Min.Alloc Cur.Alloc Max.Alloc Total-Alloc Fail-Thresh Fail-Nomem  Local-Reuse Data(Pool)-SZ
