@@ -20,3 +20,7 @@ uploads/
 .idea/
 .DS_Store
 Thumbs.db
+
+# local go test/vet capture
+test_output.txt
+vet_output.txt
