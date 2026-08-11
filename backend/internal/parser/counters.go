@@ -565,7 +565,7 @@ func atofu(s string) float64 {
 
 // mempoolCols is the positional field list of the global :Mem-Pool-Type table.
 var mempoolCols = []string{
-	"max_sz_b", "threshold", "min_sz_b", "cur_sz_b",
+	"max_sz_kb", "threshold", "min_sz_kb", "cur_sz_b",
 	"max_alloc", "cur_alloc", "total_alloc",
 	"fail_thresh", "fail_nomem", "local_reuse",
 }
@@ -613,11 +613,11 @@ func (c *counterCollector) netstatStatsLine(trimmed string) {
 		return
 	}
 	if m := nsColonRe.FindStringSubmatch(trimmed); m != nil {
-		c.emit(c.plane+"__nsstats__"+c.nsSection+"_"+sanitizeCounter(m[1]), atofu(m[2]))
+		c.emit(c.plane+"__nsstats__"+c.nsSection+"__"+sanitizeCounter(m[1]), atofu(m[2]))
 		return
 	}
 	if m := nsNumFirstRe.FindStringSubmatch(trimmed); m != nil {
-		c.emit(c.plane+"__nsstats__"+c.nsSection+"_"+sanitizeCounter(m[2]), atofu(m[1]))
+		c.emit(c.plane+"__nsstats__"+c.nsSection+"__"+sanitizeCounter(m[2]), atofu(m[1]))
 	}
 }
 
@@ -649,7 +649,7 @@ func (c *counterCollector) processesLine(trimmed string) {
 	c.emit(base+"_virt_mem", atofu(f[4]))
 	c.emit(base+"_res_swap", atofu(f[5]))
 	if len(f) >= 8 {
-		c.emit(base+"_res_swap_lazy", atofu(f[len(f)-1]))
+		c.emit(base+"_res_swap_sub_lazy", atofu(f[len(f)-1]))
 	}
 }
 

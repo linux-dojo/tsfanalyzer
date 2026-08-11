@@ -34,31 +34,42 @@ type Store interface {
 	SystemInfo(fileID string) ([]parser.KV, error)
 	SaveArchiveIndex(fileID string, entries []parser.ArchiveEntry) error
 	ArchiveIndex(fileID string) ([]parser.ArchiveEntry, error)
+	SaveConfig(fileID string, cfg *parser.ConfigNode) error
+	Config(fileID string) (*parser.ConfigNode, error)
+	SaveAnomalies(fileID string, groups []parser.AnomalyGroup) error
+	Anomalies(fileID string) ([]parser.AnomalyGroup, error)
 	SaveCounters(fileID string, samples []parser.CounterSample) error
 	CounterNames(fileID string) ([]CounterMeta, error)
 	CounterSeries(fileID string, names []string, from, to time.Time) (map[string][]parser.CounterSample, error)
 }
 
-// CounterMeta describes one available counter series.
+// CounterMeta describes one available counter series, including its value
+// range so the UI can filter counters by value (e.g. "v > 10000").
 type CounterMeta struct {
-	Name   string `json:"name"`
-	Points int    `json:"points"`
+	Name   string  `json:"name"`
+	Points int     `json:"points"`
+	Min    float64 `json:"min"`
+	Max    float64 `json:"max"`
 }
 
 type Memory struct {
-	mu       sync.RWMutex
-	files    map[string]TechSupportFile
-	sysinfo  map[string][]parser.KV
-	archive  map[string][]parser.ArchiveEntry
-	counters map[string]map[string][]parser.CounterSample
+	mu        sync.RWMutex
+	files     map[string]TechSupportFile
+	sysinfo   map[string][]parser.KV
+	archive   map[string][]parser.ArchiveEntry
+	config    map[string]*parser.ConfigNode
+	anomalies map[string][]parser.AnomalyGroup
+	counters  map[string]map[string][]parser.CounterSample
 }
 
 func NewMemory() *Memory {
 	return &Memory{
-		files:    make(map[string]TechSupportFile),
-		sysinfo:  make(map[string][]parser.KV),
-		archive:  make(map[string][]parser.ArchiveEntry),
-		counters: make(map[string]map[string][]parser.CounterSample),
+		files:     make(map[string]TechSupportFile),
+		sysinfo:   make(map[string][]parser.KV),
+		archive:   make(map[string][]parser.ArchiveEntry),
+		config:    make(map[string]*parser.ConfigNode),
+		anomalies: make(map[string][]parser.AnomalyGroup),
+		counters:  make(map[string]map[string][]parser.CounterSample),
 	}
 }
 
@@ -99,8 +110,50 @@ func (m *Memory) Delete(id string) error {
 	delete(m.files, id)
 	delete(m.sysinfo, id) // cascade: extracted data goes with the file
 	delete(m.archive, id)
+	delete(m.config, id)
+	delete(m.anomalies, id)
 	delete(m.counters, id)
 	return nil
+}
+
+func (m *Memory) SaveAnomalies(fileID string, groups []parser.AnomalyGroup) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.files[fileID]; !ok {
+		return ErrNotFound
+	}
+	m.anomalies[fileID] = groups
+	return nil
+}
+
+func (m *Memory) Anomalies(fileID string) ([]parser.AnomalyGroup, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	groups, ok := m.anomalies[fileID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return groups, nil
+}
+
+func (m *Memory) SaveConfig(fileID string, cfg *parser.ConfigNode) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.files[fileID]; !ok {
+		return ErrNotFound
+	}
+	m.config[fileID] = cfg
+	return nil
+}
+
+func (m *Memory) Config(fileID string) (*parser.ConfigNode, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cfg, ok := m.config[fileID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return cfg, nil
 }
 
 func (m *Memory) SaveCounters(fileID string, samples []parser.CounterSample) error {
@@ -131,7 +184,16 @@ func (m *Memory) CounterNames(fileID string) ([]CounterMeta, error) {
 	}
 	out := make([]CounterMeta, 0, len(byName))
 	for name, ss := range byName {
-		out = append(out, CounterMeta{Name: name, Points: len(ss)})
+		meta := CounterMeta{Name: name, Points: len(ss)}
+		for i, s := range ss {
+			if i == 0 || s.Value < meta.Min {
+				meta.Min = s.Value
+			}
+			if i == 0 || s.Value > meta.Max {
+				meta.Max = s.Value
+			}
+		}
+		out = append(out, meta)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil

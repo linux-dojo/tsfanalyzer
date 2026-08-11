@@ -34,6 +34,8 @@ func NewServer(st store.Store, uploadDir string) *Server {
 	s.mux.HandleFunc("GET /api/v1/files/{id}", s.handleGet)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/system-info", s.handleSystemInfo)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/archive", s.handleArchive)
+	s.mux.HandleFunc("GET /api/v1/files/{id}/config", s.handleConfig)
+	s.mux.HandleFunc("GET /api/v1/files/{id}/anomalies", s.handleAnomalies)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/content", s.handleContent)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/search", s.handleSearch)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/counters", s.handleCounters)
@@ -163,6 +165,34 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 				log.Printf("parse %s: counters: %v", rec.ID, cerr)
 			}
 			f3.Close()
+		}
+	}
+
+	// pass 4: PAN-OS running config (best-effort — powers the Config tab)
+	if status == "parsed" {
+		f4, err := os.Open(rec.StoragePath)
+		if err == nil {
+			if cfg, cerr := parser.ExtractConfig(f4); cerr == nil {
+				_ = s.store.SaveConfig(rec.ID, cfg)
+				log.Printf("parse %s: config extracted (root <%s>, %d top-level children)", rec.ID, cfg.Tag, len(cfg.Children))
+			} else {
+				log.Printf("parse %s: config: %v", rec.ID, cerr)
+			}
+			f4.Close()
+		}
+	}
+
+	// pass 5: system log anomalies (best-effort — powers the Graphs > Anomalies tab)
+	if status == "parsed" {
+		f5, err := os.Open(rec.StoragePath)
+		if err == nil {
+			if groups, aerr := parser.ExtractAnomalies(f5); aerr == nil {
+				_ = s.store.SaveAnomalies(rec.ID, groups)
+				log.Printf("parse %s: %d recurring anomaly groups extracted", rec.ID, len(groups))
+			} else {
+				log.Printf("parse %s: anomalies: %v", rec.ID, aerr)
+			}
+			f5.Close()
 		}
 	}
 
@@ -320,6 +350,26 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"query": q, "results": results})
+}
+
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	cfg, err := s.store.Config(id)
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "no config extracted for this file")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"file_id": id, "config": cfg})
+}
+
+func (s *Server) handleAnomalies(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	groups, err := s.store.Anomalies(id)
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "no anomalies extracted for this file")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"file_id": id, "anomalies": groups})
 }
 
 func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {

@@ -356,17 +356,17 @@ func wantValues(t *testing.T, got map[string][]CounterSample, want map[string]fl
 func TestNetstatStats(t *testing.T) {
 	got := collectFromString(t, sampleDpExtra, "dp")
 	wantValues(t, got, map[string]float64{
-		"dp__nsstats__ip_forwarding":                 2,
-		"dp__nsstats__ip_total_packets_received":     11080749,
-		"dp__nsstats__ip_forwarded":                  0,
-		"dp__nsstats__ip_incoming_packets_discarded": 0,
-		"dp__nsstats__ip_incoming_packets_delivered": 11064314,
-		"dp__nsstats__ip_requests_sent_out":          10973710,
-		"dp__nsstats__tcp_active_connection_openings":                       203928,
-		"dp__nsstats__tcp_passive_connection_openings":                      175430,
-		"dp__nsstats__tcpext_tcp_sockets_finished_time_wait_in_fast_timer":  173188,
-		"dp__nsstats__tcpext_time_wait_sockets_recycled_by_time_stamp":      2473,
-		"dp__nsstats__ipext_inect0pkts":                                     506,
+		"dp__nsstats__ip__forwarding":                 2,
+		"dp__nsstats__ip__total_packets_received":     11080749,
+		"dp__nsstats__ip__forwarded":                  0,
+		"dp__nsstats__ip__incoming_packets_discarded": 0,
+		"dp__nsstats__ip__incoming_packets_delivered": 11064314,
+		"dp__nsstats__ip__requests_sent_out":          10973710,
+		"dp__nsstats__tcp__active_connection_openings":                       203928,
+		"dp__nsstats__tcp__passive_connection_openings":                      175430,
+		"dp__nsstats__tcpext__tcp_sockets_finished_time_wait_in_fast_timer":  173188,
+		"dp__nsstats__tcpext__time_wait_sockets_recycled_by_time_stamp":      2473,
+		"dp__nsstats__ipext__inect0pkts":                                     506,
 	})
 }
 
@@ -376,8 +376,8 @@ func TestProcesses(t *testing.T) {
 		"dp__processes__envoy_8641_cpu":           6,
 		"dp__processes__envoy_8641_fds_open":      40,
 		"dp__processes__envoy_8641_virt_mem":      2281204,
-		"dp__processes__envoy_8641_res_swap":      20040,
-		"dp__processes__envoy_8641_res_swap_lazy": 231028,
+		"dp__processes__envoy_8641_res_swap":          20040,
+		"dp__processes__envoy_8641_res_swap_sub_lazy": 231028,
 	})
 	for name := range got {
 		if name == "dp__processes__name_pid_cpu" {
@@ -401,15 +401,15 @@ func TestFilesystem(t *testing.T) {
 func TestMemPool(t *testing.T) {
 	got := collectFromString(t, sampleDpExtra, "dp")
 	wantValues(t, got, map[string]float64{
-		"dp__pool__mempool__ctd_dlp_buf_max_sz_b":   1016,
+		"dp__pool__mempool__ctd_dlp_buf_max_sz_kb":  1016,
 		"dp__pool__mempool__ctd_dlp_buf_threshold":  52480,
-		"dp__pool__mempool__ctd_dlp_buf_min_sz_b":   508,
+		"dp__pool__mempool__ctd_dlp_buf_min_sz_kb":  508,
 		"dp__pool__mempool__proxy_cur_sz_b":         3053760,
 		"dp__pool__mempool__proxy_max_alloc":        3114864,
 		"dp__pool__mempool__proxy_cur_alloc":        81673,
 		"dp__pool__mempool__proxy_total_alloc":      95234,
 		"dp__pool__mempool__proxy_local_reuse":      0,
-		"dp__pool__mempool__clientless_vpn_max_sz_b": 3399,
+		"dp__pool__mempool__clientless_vpn_max_sz_kb": 3399,
 	})
 	// short row: clientless_vpn has no Local-Reuse column
 	if _, ok := got["dp__pool__mempool__clientless_vpn_local_reuse"]; ok {
