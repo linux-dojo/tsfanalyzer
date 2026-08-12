@@ -663,6 +663,61 @@ func TestProcessesTotals(t *testing.T) {
 	})
 }
 
+const sampleMemDetail = `2026-06-09 17:00:00.000 -0700  --- memory_detail
+MemTotal:        8111956 kB
+MemFree:          429592 kB
+MemAvailable:    1881560 kB
+Buffers:           12345 kB
+Cached:          2345678 kB
+Slab:             512000 kB
+SReclaimable:     112000 kB
+SUnreclaim:       400000 kB
+KernelStack:       16384 kB
+PageTables:        45000 kB
+Committed_AS:    9876543 kB
+HugePages_Total:       0
+2026-06-09 17:05:00.000 -0700  --- slabinfo
+slabinfo - version: 2.1
+# name            <active_objs> <num_objs> <objsize> <objperslab> <pagesperslab> : tunables <limit> <batchcount> <sharedfactor> : slabdata <active_slabs> <num_slabs> <sharedavail>
+kmalloc-96         81920  82530     96   42    1 : tunables    0    0    0 : slabdata   1965   1965      0
+kmalloc-1k          2048   2048   1024   32    8 : tunables    0    0    0 : slabdata     64     64      0
+dentry            145530 145530    192   21    1 : tunables    0    0    0 : slabdata   6930   6930      0
+`
+
+func TestMemoryDetail(t *testing.T) {
+	got := collectFromString(t, sampleMemDetail, "mp")
+	wantValues(t, got, map[string]float64{
+		"mp__memorydetail__memtotal":     8111956,
+		"mp__memorydetail__memfree":      429592,
+		"mp__memorydetail__memavailable": 1881560,
+		"mp__memorydetail__slab":         512000,
+		"mp__memorydetail__sreclaimable": 112000,
+		"mp__memorydetail__sunreclaim":   400000,
+		"mp__memorydetail__committed_as": 9876543,
+		// no "kB" suffix on this one; must still parse
+		"mp__memorydetail__hugepages_total": 0,
+	})
+}
+
+func TestSlabinfo(t *testing.T) {
+	got := collectFromString(t, sampleMemDetail, "mp")
+	wantValues(t, got, map[string]float64{
+		"mp__slabinfo__kmalloc_96_activeobjs": 81920,
+		"mp__slabinfo__kmalloc_96_numobjs":    82530,
+		"mp__slabinfo__kmalloc_96_objsize":    96,
+		// derived: active_objs * objsize, so cache growth reads in bytes
+		"mp__slabinfo__kmalloc_96_totalactsize": 81920 * 96,
+		"mp__slabinfo__kmalloc_1k_totalactsize": 2048 * 1024,
+		"mp__slabinfo__dentry_totalactsize":     145530 * 192,
+	})
+	// the header/comment lines must not become counters
+	for name := range got {
+		if strings.Contains(name, "slabinfo__name") || strings.Contains(name, "slabinfo__version") {
+			t.Errorf("header line parsed as a slab cache: %s", name)
+		}
+	}
+}
+
 func TestVmpow(t *testing.T) {
 	got := collectFromString(t, sampleDpFinal, "dp")
 	wantValues(t, got, map[string]float64{

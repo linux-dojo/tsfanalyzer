@@ -87,6 +87,18 @@ var (
 	memRowRe  = regexp.MustCompile(`^Mem\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)`)
 	swapRowRe = regexp.MustCompile(`^Swap\s+(\d+)\s+(\d+)\s+(\d+)`)
 
+	// "--- memory_detail" block: /proc/meminfo style "Key:  <n> kB" lines.
+	// SUnreclaim (unreclaimable slab) is the key signal for kernel-side
+	// growth that no user-space process accounts for.
+	memDetailRe = regexp.MustCompile(`^([A-Za-z_()][A-Za-z0-9_()]*):\s+(-?\d+)(?:\s+kB)?\s*$`)
+
+	// "--- slabinfo" block: the /proc/slabinfo table. Columns after the
+	// name are: active_objs num_objs objsize objperslab pagesperslab,
+	// then tunables/slabdata sections. Total active size is derived as
+	// active_objs * objsize, which is what makes a growing cache like
+	// kmalloc-96 visible in bytes rather than object counts alone.
+	slabRowRe = regexp.MustCompile(`^(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*:`)
+
 	// "--- logrcvr_statistics" block: "Label name:   123/sec"
 	lrLineRe = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9 ()/_-]*?):\s+([\d.]+)(?:/sec)?\s*$`)
 
@@ -267,6 +279,12 @@ func (c *counterCollector) line(raw string) {
 		return
 	case "memory":
 		c.memoryLine(trimmed)
+		return
+	case "memory_detail":
+		c.memoryDetailLine(trimmed)
+		return
+	case "slabinfo":
+		c.slabinfoLine(trimmed)
 		return
 	case "logrcvr_statistics":
 		c.logrcvrLine(trimmed)
@@ -514,6 +532,38 @@ func (c *counterCollector) memoryLine(trimmed string) {
 		c.emit(c.plane+"__memory__swap_min", atofu(m[2]))
 		c.emit(c.plane+"__memory__swap_total", atofu(m[3]))
 	}
+}
+
+// memoryDetailLine handles "--- memory_detail", the /proc/meminfo dump.
+// Every "Key: <n> kB" line becomes <plane>__memorydetail__<key>, values
+// kept in kB as printed. From PAN-OS 10.2 this block is the authoritative
+// place to read available memory, and its SUnreclaim/Slab counters are how
+// kernel-side growth is distinguished from a user-space process leak.
+func (c *counterCollector) memoryDetailLine(trimmed string) {
+	m := memDetailRe.FindStringSubmatch(trimmed)
+	if m == nil {
+		return
+	}
+	c.emit(c.plane+"__memorydetail__"+sanitizeCounter(m[1]), atofu(m[2]))
+}
+
+// slabinfoLine handles "--- slabinfo" rows, emitting per-cache object
+// counts plus a derived total active size in bytes so growth in a specific
+// cache (e.g. kmalloc-96) can be graphed against available memory.
+func (c *counterCollector) slabinfoLine(trimmed string) {
+	if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "slabinfo") {
+		return
+	}
+	m := slabRowRe.FindStringSubmatch(trimmed)
+	if m == nil {
+		return
+	}
+	base := c.plane + "__slabinfo__" + sanitizeCounter(m[1])
+	activeObjs, numObjs, objSize := atofu(m[2]), atofu(m[3]), atofu(m[4])
+	c.emit(base+"_activeobjs", activeObjs)
+	c.emit(base+"_numobjs", numObjs)
+	c.emit(base+"_objsize", objSize)
+	c.emit(base+"_totalactsize", activeObjs*objSize)
 }
 
 // logrcvrLine handles "--- logrcvr_statistics": "Label:  N[/sec]" lines up to

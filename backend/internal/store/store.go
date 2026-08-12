@@ -34,13 +34,23 @@ type Store interface {
 	SystemInfo(fileID string) ([]parser.KV, error)
 	SaveArchiveIndex(fileID string, entries []parser.ArchiveEntry) error
 	ArchiveIndex(fileID string) ([]parser.ArchiveEntry, error)
-	SaveConfig(fileID string, cfg *parser.ConfigNode) error
-	Config(fileID string) (*parser.ConfigNode, error)
+	SaveConfig(fileID string, cfg *parser.ConfigDoc) error
+	Config(fileID string) (*parser.ConfigDoc, error)
 	SaveAnomalies(fileID string, groups []parser.AnomalyGroup) error
 	Anomalies(fileID string) ([]parser.AnomalyGroup, error)
+	SaveMemory(fileID string, m MemoryReport) error
+	MemoryFor(fileID string) (MemoryReport, error)
 	SaveCounters(fileID string, samples []parser.CounterSample) error
 	CounterNames(fileID string) ([]CounterMeta, error)
 	CounterSeries(fileID string, names []string, from, to time.Time) (map[string][]parser.CounterSample, error)
+}
+
+// MemoryReport is the memory/OOM verdict for a file: one analysis per
+// plane, plus config-size findings that apply to the device as a whole.
+type MemoryReport struct {
+	MP     parser.MemoryAnalysis `json:"mp"`
+	DP     parser.MemoryAnalysis `json:"dp"`
+	Config []parser.Finding      `json:"config"`
 }
 
 // CounterMeta describes one available counter series, including its value
@@ -57,8 +67,9 @@ type Memory struct {
 	files     map[string]TechSupportFile
 	sysinfo   map[string][]parser.KV
 	archive   map[string][]parser.ArchiveEntry
-	config    map[string]*parser.ConfigNode
+	config    map[string]*parser.ConfigDoc
 	anomalies map[string][]parser.AnomalyGroup
+	memory    map[string]MemoryReport
 	counters  map[string]map[string][]parser.CounterSample
 }
 
@@ -67,8 +78,9 @@ func NewMemory() *Memory {
 		files:     make(map[string]TechSupportFile),
 		sysinfo:   make(map[string][]parser.KV),
 		archive:   make(map[string][]parser.ArchiveEntry),
-		config:    make(map[string]*parser.ConfigNode),
+		config:    make(map[string]*parser.ConfigDoc),
 		anomalies: make(map[string][]parser.AnomalyGroup),
+		memory:    make(map[string]MemoryReport),
 		counters:  make(map[string]map[string][]parser.CounterSample),
 	}
 }
@@ -112,8 +124,29 @@ func (m *Memory) Delete(id string) error {
 	delete(m.archive, id)
 	delete(m.config, id)
 	delete(m.anomalies, id)
+	delete(m.memory, id)
 	delete(m.counters, id)
 	return nil
+}
+
+func (m *Memory) SaveMemory(fileID string, rep MemoryReport) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.files[fileID]; !ok {
+		return ErrNotFound
+	}
+	m.memory[fileID] = rep
+	return nil
+}
+
+func (m *Memory) MemoryFor(fileID string) (MemoryReport, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	rep, ok := m.memory[fileID]
+	if !ok {
+		return MemoryReport{}, ErrNotFound
+	}
+	return rep, nil
 }
 
 func (m *Memory) SaveAnomalies(fileID string, groups []parser.AnomalyGroup) error {
@@ -136,7 +169,7 @@ func (m *Memory) Anomalies(fileID string) ([]parser.AnomalyGroup, error) {
 	return groups, nil
 }
 
-func (m *Memory) SaveConfig(fileID string, cfg *parser.ConfigNode) error {
+func (m *Memory) SaveConfig(fileID string, cfg *parser.ConfigDoc) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.files[fileID]; !ok {
@@ -146,7 +179,7 @@ func (m *Memory) SaveConfig(fileID string, cfg *parser.ConfigNode) error {
 	return nil
 }
 
-func (m *Memory) Config(fileID string) (*parser.ConfigNode, error) {
+func (m *Memory) Config(fileID string) (*parser.ConfigDoc, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	cfg, ok := m.config[fileID]

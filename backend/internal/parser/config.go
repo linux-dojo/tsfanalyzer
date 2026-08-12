@@ -1,5 +1,5 @@
-// Package parser: config.go extracts the running (or candidate) PAN-OS
-// configuration from a tech-support archive as a generic XML tree.
+// Package parser: config.go extracts the PAN-OS configuration from a
+// tech-support archive as a generic XML tree.
 //
 // The PAN-OS config schema is deeply nested but very regular: almost
 // everything is a repeated <entry name="..."> list under a section tag
@@ -9,6 +9,14 @@
 // Objects / Network / Device), this keeps the full tree generic and lets
 // the frontend walk it the same way a user would click through the
 // firewall's own tabs.
+//
+// Finding the file is not as simple as looking for "running-config.xml".
+// A Panorama-managed device keeps several configs side by side under
+// /opt/pancfg/mgmt (the local running config, the pushed shared policy,
+// the merged config, dated snapshots), and which one is present varies by
+// platform and PAN-OS version. So every .xml under that directory is
+// considered, largest first, on the reasoning that the biggest file is the
+// most complete view of what the device is actually running.
 package parser
 
 import (
@@ -18,6 +26,7 @@ import (
 	"errors"
 	"io"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -32,92 +41,220 @@ type ConfigNode struct {
 	Children []*ConfigNode     `json:"children,omitempty"`
 }
 
+// ConfigCandidate is one XML file that could hold the configuration.
+// Reported back so the UI can explain itself when nothing usable is found.
+type ConfigCandidate struct {
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	Picked bool   `json:"picked"`
+	Reason string `json:"reason,omitempty"` // why it was rejected
+}
+
+// ConfigDoc is the chosen configuration plus where it came from.
+type ConfigDoc struct {
+	Root *ConfigNode `json:"root"`
+	Path string      `json:"path"`
+	Size int64       `json:"size"`
+	// PanoramaManaged is set when the config carries Panorama fingerprints:
+	// pre/post rulebases, device groups or templates.
+	PanoramaManaged bool              `json:"panorama_managed"`
+	Markers         []string          `json:"markers,omitempty"` // which fingerprints were seen
+	Candidates      []ConfigCandidate `json:"candidates"`
+}
+
 var ErrNoConfig = errors.New("no PAN-OS config XML found in archive")
 
-// configNameRe matches the well-known config file names PAN-OS
-// tech-support bundles use ("running-config.xml", "candidate-config.xml",
-// and similar), wherever in the archive they live.
-var configNameRe = regexp.MustCompile(`(?i)(running|candidate)[-_]?config.*\.xml$`)
-
-const (
-	sniffBytes    = 4096     // enough to reach past any XML decl/comment to the root tag
-	maxConfigSize = 96 << 20 // ignore implausibly large "config" candidates
+var (
+	// the directory a PAN-OS device keeps its configurations in
+	mgmtDirRe = regexp.MustCompile(`(?i)(^|/)opt/pancfg/mgmt/`)
+	// well-known names, used to break ties and as a fallback outside the mgmt dir
+	configNameRe = regexp.MustCompile(`(?i)(running|candidate|merged|pushed|panorama)[-_]?.*config.*\.xml$|mergesp\.xml$`)
 )
 
-// ExtractConfig scans the archive for the PAN-OS configuration and returns
-// it as a generic node tree rooted at <config>. Files named like
-// "running-config.xml" are preferred (favoring one with "running" in the
-// name over "candidate"); if none are found by name, any .xml file whose
-// root element is literally "config" is used as a fallback, since some
-// platforms/versions place the file at a different path.
-func ExtractConfig(r io.ReadSeeker) (*ConfigNode, error) {
+const (
+	sniffBytes    = 4096      // enough to reach past any XML decl/comment to the root tag
+	maxConfigSize = 192 << 20 // ignore implausibly large "config" candidates
+	maxTries      = 8         // bound the work when an archive has many XML files
+)
+
+// ExtractConfig locates the device configuration and returns it as a
+// generic node tree. Candidates are ranked: XML under /opt/pancfg/mgmt
+// largest-first, then well-known config names elsewhere, then anything
+// else whose root element is <config>. The first candidate that parses
+// into a <config> tree wins.
+func ExtractConfig(r io.ReadSeeker) (*ConfigDoc, error) {
+	all, err := listXMLCandidates(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(all) == 0 {
+		return nil, ErrNoConfig
+	}
+
+	ranked := rankConfigCandidates(all)
+
+	doc := &ConfigDoc{Candidates: make([]ConfigCandidate, 0, len(ranked))}
+	tried := 0
+	for i := range ranked {
+		c := ranked[i]
+		if c.Size <= 0 || c.Size > maxConfigSize {
+			c.Reason = "size out of range"
+			doc.Candidates = append(doc.Candidates, c)
+			continue
+		}
+		if tried >= maxTries {
+			c.Reason = "not attempted"
+			doc.Candidates = append(doc.Candidates, c)
+			continue
+		}
+		tried++
+
+		data, rerr := readEntry(r, c.Path)
+		if rerr != nil {
+			c.Reason = "unreadable: " + rerr.Error()
+			doc.Candidates = append(doc.Candidates, c)
+			continue
+		}
+		if root := sniffRootTag(data); root != "config" {
+			c.Reason = "root element is <" + root + ">, not <config>"
+			doc.Candidates = append(doc.Candidates, c)
+			continue
+		}
+		node, perr := parseConfigXML(data)
+		if perr != nil {
+			c.Reason = "parse error: " + perr.Error()
+			doc.Candidates = append(doc.Candidates, c)
+			continue
+		}
+
+		c.Picked = true
+		doc.Candidates = append(doc.Candidates, c)
+		doc.Root, doc.Path, doc.Size = node, c.Path, c.Size
+		doc.Markers = panoramaMarkers(node)
+		doc.PanoramaManaged = len(doc.Markers) > 0
+		// record the rest as unattempted, for diagnostics
+		for j := i + 1; j < len(ranked); j++ {
+			rest := ranked[j]
+			rest.Reason = "not needed"
+			doc.Candidates = append(doc.Candidates, rest)
+		}
+		return doc, nil
+	}
+	return nil, ErrNoConfig
+}
+
+// listXMLCandidates walks the archive once and notes every .xml file.
+func listXMLCandidates(r io.ReadSeeker) ([]ConfigCandidate, error) {
 	tr, err := openTar(r)
 	if err != nil {
 		return nil, err
 	}
-
-	var byName []byte
-	var byNamePreferred bool // true once byName came from a "*running*" file
-	var byRoot []byte
-
+	var out []ConfigCandidate
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			break // tolerate trailing corruption; use whatever we already found
+			break // tolerate trailing corruption; use what we have
 		}
 		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
-		name := normalizePath(hdr.Name)
-		if !strings.HasSuffix(strings.ToLower(name), ".xml") {
+		p := normalizePath(hdr.Name)
+		if !strings.HasSuffix(strings.ToLower(p), ".xml") {
 			continue
 		}
-		if hdr.Size <= 0 || hdr.Size > maxConfigSize {
-			continue
-		}
-
-		nameMatch := configNameRe.MatchString(name)
-		if !nameMatch && byRoot != nil {
-			// Already have a root-tag fallback; skip reading files that
-			// don't look like a config by name since we no longer need one.
-			continue
-		}
-
-		data, rerr := io.ReadAll(tr)
-		if rerr != nil {
-			continue
-		}
-
-		if nameMatch {
-			preferred := strings.Contains(strings.ToLower(name), "running")
-			if byName == nil || (preferred && !byNamePreferred) {
-				byName, byNamePreferred = data, preferred
-			}
-			continue
-		}
-
-		if byRoot == nil && sniffRootTag(data) == "config" {
-			byRoot = data
-		}
+		out = append(out, ConfigCandidate{Path: p, Size: hdr.Size})
 	}
-
-	data := byName
-	if data == nil {
-		data = byRoot
-	}
-	if data == nil {
-		return nil, ErrNoConfig
-	}
-	return parseConfigXML(data)
+	return out, nil
 }
 
+// rankConfigCandidates orders candidates by how likely they are to be the
+// device configuration: inside /opt/pancfg/mgmt first (largest first, since
+// the biggest file is the most complete config), then recognizable config
+// names elsewhere, then everything else largest-first.
+func rankConfigCandidates(in []ConfigCandidate) []ConfigCandidate {
+	tier := func(c ConfigCandidate) int {
+		switch {
+		case mgmtDirRe.MatchString(c.Path):
+			return 0
+		case configNameRe.MatchString(c.Path):
+			return 1
+		default:
+			return 2
+		}
+	}
+	out := make([]ConfigCandidate, len(in))
+	copy(out, in)
+	sort.SliceStable(out, func(i, j int) bool {
+		ti, tj := tier(out[i]), tier(out[j])
+		if ti != tj {
+			return ti < tj
+		}
+		if out[i].Size != out[j].Size {
+			return out[i].Size > out[j].Size // largest first
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out
+}
+
+// readEntry pulls one file's bytes out of the archive.
+func readEntry(r io.ReadSeeker, path string) ([]byte, error) {
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	entry, err := EntryReader(r, path)
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(entry)
+}
+
+/* ---------- Panorama fingerprints ---------- */
+
+// panoramaMarkerTags are elements that only appear once a device is managed
+// by Panorama: pushed policy lands in pre/post rulebases, and device-group
+// or template metadata comes down with it.
+var panoramaMarkerTags = []string{
+	"pre-rulebase", "post-rulebase", "device-group", "template-stack", "template", "panorama",
+}
+
+// panoramaMarkers reports which Panorama fingerprints the config contains.
+func panoramaMarkers(root *ConfigNode) []string {
+	present := map[string]bool{}
+	var walk func(n *ConfigNode)
+	walk = func(n *ConfigNode) {
+		if n == nil {
+			return
+		}
+		for _, t := range panoramaMarkerTags {
+			if n.Tag == t {
+				present[t] = true
+			}
+		}
+		for _, c := range n.Children {
+			walk(c)
+		}
+	}
+	walk(root)
+	if len(present) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(present))
+	for t := range present {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}
+
+/* ---------- XML decoding ---------- */
+
 // sniffRootTag returns the local name of the first start element found in
-// data, or "" if none is found. Used to identify config files that weren't
-// named like one, without paying for a full tree decode on every XML file
-// in the archive.
+// data, or "" if none is found. Used to identify config files without
+// paying for a full tree decode on every XML file in the archive.
 func sniffRootTag(data []byte) string {
 	limit := data
 	if len(limit) > sniffBytes {

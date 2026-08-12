@@ -320,7 +320,16 @@ interface CounterPoint {
   value: number;
 }
 
-const MAX_PLOT = 8;
+/* With ~30k counters in an archive, capping a panel at 8 series was the wrong
+   trade-off. The only remaining limit is a high guard against plotting so
+   many series that the browser stalls. */
+const MAX_PLOT = 400;
+// counters requested per API call (the endpoint accepts a bounded list)
+const COUNTER_FETCH_BATCH = 25;
+// rows rendered in the lookup list; the filter narrows things down first
+const LOOKUP_LIST_MAX = 500;
+// most matches that may be added in one click, and only when a filter is set
+const BULK_ADD_MAX = 50;
 
 // shadcn-style chart palette
 const CHART_COLORS = [
@@ -354,6 +363,107 @@ const fmtReadoutTs = (t: number) =>
 const fmtReadoutVal = (v: number) =>
   v.toLocaleString(undefined, { maximumFractionDigits: 3 });
 
+/* ---------- shared chart behaviour ----------
+   Used by every chart so panning, edge padding and resize-on-reveal work the
+   same way whether you're looking at counters, anomalies or memory. */
+
+// Inset the plotted data from the axes by this many pixels, so points at the
+// very start and end of the window aren't half-clipped against the edge and
+// are still clickable.
+const CHART_X_PAD = 14;
+
+// One pan step, as a fraction of the visible window.
+const PAN_STEP = 0.25;
+
+// Shifts [lo,hi] left or right by PAN_STEP, clamped so the window can't be
+// dragged far off the end of the data (a little overshoot is allowed so the
+// last point isn't pinned to the edge).
+function pannedWindow(
+  lo: number,
+  hi: number,
+  dir: -1 | 1,
+  dataMin: number,
+  dataMax: number
+): [number, number] {
+  const span = hi - lo;
+  if (!(span > 0)) return [lo, hi];
+  const pad = span * 0.05;
+  let nlo = lo + span * PAN_STEP * dir;
+  let nhi = nlo + span;
+  if (nlo < dataMin - pad) {
+    nlo = dataMin - pad;
+    nhi = nlo + span;
+  }
+  if (nhi > dataMax + pad) {
+    nhi = dataMax + pad;
+    nlo = nhi - span;
+  }
+  return [nlo, nhi];
+}
+
+/* Container plumbing shared by every chart.
+
+   dygraphs fixes its pixel width when it is constructed. All three Graphs
+   sub-tabs stay mounted so their state survives switching, which means a
+   chart can be built inside a display:none pane — measuring zero width and
+   rendering into a sliver.
+
+   Each chart therefore takes a `visible` prop from the pane that owns it and
+   only builds while that is true. Deriving visibility from this observer was
+   tried and did not hold: ResizeObserver does not dependably report a
+   display:none transition, so a chart could keep a stale width with no
+   notification to correct it. This hook now only handles genuine layout
+   changes — window resizes and collapsing the left nav. */
+function useChartContainer(chart: { current: Dygraph | null }) {
+  const [el, setEl] = useState<HTMLDivElement | null>(null);
+
+  // Only used to follow ordinary layout changes (window resize, collapsing
+  // the left nav). Visibility is NOT inferred from here: ResizeObserver does
+  // not reliably report a display:none transition, so a chart could stay laid
+  // out against a stale width. Panes pass their visibility down explicitly.
+  useEffect(() => {
+    if (!el) return;
+    const resize = () => {
+      if (el.clientWidth > 0) chart.current?.resize();
+    };
+    window.addEventListener("resize", resize);
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(resize);
+      ro.observe(el);
+    }
+    return () => {
+      window.removeEventListener("resize", resize);
+      ro?.disconnect();
+    };
+  }, [el, chart]);
+
+  return { el, setEl };
+}
+
+// Left / right pan buttons, rendered next to Reset zoom on every chart.
+function PanControls({
+  onPan,
+  onReset,
+}: {
+  onPan: (dir: -1 | 1) => void;
+  onReset: () => void;
+}) {
+  return (
+    <span className="pan-controls">
+      <button className="btn-outline" onClick={() => onPan(-1)} title="Pan left (earlier)">
+        ‹
+      </button>
+      <button className="btn-outline" onClick={() => onPan(1)} title="Pan right (later)">
+        ›
+      </button>
+      <button className="btn-outline" onClick={onReset} title="Show the whole time range">
+        Reset zoom
+      </button>
+    </span>
+  );
+}
+
 type SeriesMode = "val" | "del" | "rate";
 
 interface SelEntry {
@@ -362,6 +472,49 @@ interface SelEntry {
 }
 
 const selKey = (s: SelEntry) => (s.mode === "val" ? s.name : `${s.name} (${s.mode})`);
+
+/* ---------- per-file graph state ----------
+   Switching the left-hand nav (System Info / Log Files / Config) unmounts the
+   Graphs tab, which would otherwise discard everything the user had plotted.
+   Selections are kept in a module-level cache keyed by tech-support file, so
+   they survive navigating around one file and are dropped only when a
+   different file is opened. Series data is not cached — it is refetched for
+   whatever is selected, which keeps memory bounded. */
+interface PanelState {
+  filter: string;
+  sel: SelEntry[];
+  hidden: string[];
+}
+
+interface GraphsState {
+  view: "counters" | "anomalies" | "memory";
+  panels: PanelState[];
+  marks: Mark[];
+}
+
+const graphStateCache = new Map<string, GraphsState>();
+const GRAPH_CACHE_MAX_FILES = 3;
+
+function emptyPanel(): PanelState {
+  return { filter: "", sel: [], hidden: [] };
+}
+
+function graphStateFor(fileId: string): GraphsState {
+  let st = graphStateCache.get(fileId);
+  if (!st) {
+    st = { view: "counters", panels: [emptyPanel(), emptyPanel()], marks: [] };
+    graphStateCache.set(fileId, st);
+    while (graphStateCache.size > GRAPH_CACHE_MAX_FILES) {
+      const oldest = graphStateCache.keys().next().value;
+      if (oldest === undefined || oldest === fileId) break;
+      graphStateCache.delete(oldest);
+    }
+  }
+  // tolerate a cache entry written by an older build
+  if (!st.panels || st.panels.length < 2) st.panels = [emptyPanel(), emptyPanel()];
+  if (!st.marks) st.marks = [];
+  return st;
+}
 
 // del = difference between consecutive samples; rate = del per second
 function transformSeries(pts: CounterPoint[], mode: SeriesMode): CounterPoint[] {
@@ -410,7 +563,25 @@ interface AnomalyMark {
 }
 
 function Graphs({ fileId }: { fileId: string }) {
-  const [view, setView] = useState<"counters" | "anomalies">("counters");
+  const cached = graphStateFor(fileId);
+  const [view, setViewState] = useState<"counters" | "anomalies" | "memory">(cached.view);
+  const setView = (v: "counters" | "anomalies" | "memory") => {
+    graphStateFor(fileId).view = v; // remembered across left-nav navigation
+    setViewState(v);
+  };
+
+  // All three panes stay mounted and are hidden with CSS rather than
+  // unmounted, so selected counters, marks, filters and zoom survive
+  // switching tabs. dygraphs measures its container at creation time, so a
+  // chart built while hidden has zero width — nudging a resize after the
+  // switch makes it lay out correctly.
+  useEffect(() => {
+    const id = requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
+    return () => cancelAnimationFrame(id);
+  }, [view]);
+
+  const pane = (k: typeof view) => ({ display: view === k ? "block" : "none" } as const);
+
   return (
     <section>
       <h2>Graphs</h2>
@@ -421,18 +592,443 @@ function Graphs({ fileId }: { fileId: string }) {
         <button className={view === "anomalies" ? "active" : ""} onClick={() => setView("anomalies")}>
           Anomalies
         </button>
+        <button className={view === "memory" ? "active" : ""} onClick={() => setView("memory")}>
+          Memory / OOM
+        </button>
       </div>
-      {view === "counters" ? <CounterGraphs fileId={fileId} /> : <AnomaliesView fileId={fileId} />}
+      <div style={pane("counters")}>
+        <CounterGraphs fileId={fileId} visible={view === "counters"} />
+      </div>
+      <div style={pane("anomalies")}>
+        <AnomaliesView fileId={fileId} visible={view === "anomalies"} />
+      </div>
+      <div style={pane("memory")}>
+        <MemoryView fileId={fileId} visible={view === "memory"} />
+      </div>
     </section>
   );
 }
 
-function CounterGraphs({ fileId }: { fileId: string }) {
+/* ---------- Memory / OOM sub-tab ----------
+   Renders the backend's memory verdict. The ordering of what's shown
+   mirrors how the investigation actually goes: what the OOM log said (and
+   why it doesn't name a culprit), then the available-memory trend, then
+   which process's growth accounts for that decline, and only if none does,
+   the kernel slab counters. */
+
+interface OOMEvent {
+  ts: string;
+  invoked_by: string;
+  killed: string;
+  killed_pid: string;
+  score?: string;
+  source: string;
+  raw: string;
+}
+
+interface MemSuspect {
+  name: string;
+  counter: string;
+  counters?: string[]; // every PID's series, so a restart can be plotted end to end
+  pids?: string[];
+  start_kb: number;
+  end_kb: number;
+  peak_kb: number;
+  growth_kb: number;
+  pct_of_drop: number;
+  restarted: boolean;
+  post_restart_kb?: number;
+  reclaimed_kb?: number;
+}
+
+interface MemTrend {
+  counter: string;
+  start_kb: number;
+  end_kb: number;
+  min_kb: number;
+  drop_kb: number;
+  from: string;
+  to: string;
+  points: number;
+  span_days: number;
+}
+
+interface Finding {
+  severity: string;
+  title: string;
+  detail: string;
+}
+
+interface MemoryAnalysis {
+  oom_events: OOMEvent[];
+  first_oom?: OOMEvent;
+  trend?: MemTrend;
+  suspects: MemSuspect[];
+  kernel_suspects: MemSuspect[];
+  kernel_likely: boolean;
+  explained_pct: number;
+  duplicates: string[];
+  findings: Finding[];
+}
+
+interface MemoryReport {
+  mp: MemoryAnalysis;
+  dp: MemoryAnalysis;
+  config: Finding[];
+}
+
+const fmtKB = (kb: number | null | undefined) => {
+  if (kb === null || kb === undefined || !Number.isFinite(kb)) return "—";
+  const abs = Math.abs(kb);
+  if (abs >= 1024 * 1024) return (kb / 1024 / 1024).toFixed(2) + " GB";
+  if (abs >= 1024) return (kb / 1024).toFixed(1) + " MB";
+  return Math.round(kb).toLocaleString() + " kB";
+};
+
+const fmtPct = (v: number | null | undefined, digits = 1) =>
+  v === null || v === undefined || !Number.isFinite(v) ? "—" : v.toFixed(digits) + "%";
+
+/* Go marshals nil slices as JSON null, so an archive with (say) no OOM
+   events arrives as `oom_events: null`. Normalizing once on receipt keeps
+   every render path below free of null checks. */
+function normalizeAnalysis(a: Partial<MemoryAnalysis> | null | undefined): MemoryAnalysis {
+  return {
+    oom_events: a?.oom_events ?? [],
+    first_oom: a?.first_oom,
+    trend: a?.trend,
+    suspects: a?.suspects ?? [],
+    kernel_suspects: a?.kernel_suspects ?? [],
+    kernel_likely: a?.kernel_likely ?? false,
+    explained_pct: a?.explained_pct ?? 0,
+    duplicates: a?.duplicates ?? [],
+    findings: a?.findings ?? [],
+  };
+}
+
+function normalizeReport(r: Partial<MemoryReport> | null | undefined): MemoryReport {
+  return {
+    mp: normalizeAnalysis(r?.mp),
+    dp: normalizeAnalysis(r?.dp),
+    config: r?.config ?? [],
+  };
+}
+
+function MemoryView({ fileId, visible }: { fileId: string; visible: boolean }) {
+  const [rep, setRep] = useState<MemoryReport | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [plane, setPlane] = useState<"mp" | "dp">("mp");
+
+  useEffect(() => {
+    fetch(`/api/v1/files/${fileId}/memory`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((d) => setRep(normalizeReport(d.memory)))
+      .catch(() => setErr("No memory analysis for this file — counters and logs may not have parsed."));
+  }, [fileId]);
+
+  if (err) return <p className="error">{err}</p>;
+  if (!rep) return <p className="muted">Loading…</p>;
+
+  const a = plane === "mp" ? rep.mp : rep.dp;
+  // every PID of each top suspect, so a restart shows as a continuous story
+  // on the chart rather than a series that just stops
+  const plotSuspects = a.suspects.slice(0, 3);
+
+  return (
+    <div className="mem-wrap">
+      <div className="cfg-subtabs">
+        <button className={plane === "mp" ? "active" : ""} onClick={() => setPlane("mp")}>
+          Management plane
+        </button>
+        <button className={plane === "dp" ? "active" : ""} onClick={() => setPlane("dp")}>
+          Dataplane
+        </button>
+      </div>
+
+      {a.oom_events.length > 0 ? (
+        <div className="mem-card">
+          <h3>
+            OOM events ({a.oom_events.length})
+            {a.oom_events.length > 1 && <span className="mem-sub muted">first event highlighted</span>}
+          </h3>
+          <div className="cfg-table-wrap">
+            <table className="cfg-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th title="The process that asked for memory next — not the cause">Requested by</th>
+                  <th title="Chosen by OOM score — usually not the cause either">Killed</th>
+                  <th>Score</th>
+                  <th>Source</th>
+                </tr>
+              </thead>
+              <tbody>
+                {a.oom_events.map((e, i) => (
+                  <tr key={i} className={i === 0 ? "mem-first-oom" : ""}>
+                    <td>{e.ts && !e.ts.startsWith("0001") ? new Date(e.ts).toLocaleString() : "—"}</td>
+                    <td>{e.invoked_by || "—"}</td>
+                    <td>{e.killed ? `${e.killed}${e.killed_pid ? ` (${e.killed_pid})` : ""}` : "—"}</td>
+                    <td>{e.score || "—"}</td>
+                    <td className="mem-src" title={e.raw}>{e.source}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : (
+        <div className="mem-card">
+          <h3>OOM events</h3>
+          <p className="muted">None found in this archive.</p>
+        </div>
+      )}
+
+      {a.trend && (
+        <div className="mem-card">
+          <h3>
+            Available memory
+            <span className="mem-sub muted">{a.trend.counter}</span>
+          </h3>
+          <div className="mem-stats">
+            <Stat label="Start" value={fmtKB(a.trend.start_kb)} />
+            <Stat label="End" value={fmtKB(a.trend.end_kb)} />
+            <Stat label="Low point" value={fmtKB(a.trend.min_kb)} />
+            <Stat
+              label="Net change"
+              value={(a.trend.drop_kb > 0 ? "−" : "+") + fmtKB(Math.abs(a.trend.drop_kb))}
+              bad={a.trend.drop_kb > 0}
+            />
+            <Stat label="Window" value={(a.trend.span_days ?? 0).toFixed(1) + " days"} />
+          </div>
+          <MemoryTrendChart
+            fileId={fileId}
+            trendCounter={a.trend.counter}
+            suspects={plotSuspects}
+            visible={visible}
+          />
+        </div>
+      )}
+
+      <div className="mem-card">
+        <h3>
+          Suspect processes
+          <span className="mem-sub muted">
+            by growth and memory reclaimed at restart · user-space explains {fmtPct(a.explained_pct)} of the decline
+          </span>
+        </h3>
+        <SuspectTable
+          suspects={a.suspects}
+          showRestart
+          empty="No process shows growth that accounts for the decline."
+        />
+      </div>
+
+      {(a.kernel_likely || a.kernel_suspects.length > 0) && (
+        <div className="mem-card">
+          <h3>
+            Kernel memory
+            {a.kernel_likely && <span className="sev sev-high">likely source</span>}
+          </h3>
+          <SuspectTable suspects={a.kernel_suspects} empty="No kernel-side growth measured." />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Stat({ label, value, bad }: { label: string; value: string; bad?: boolean }) {
+  return (
+    <div className="mem-stat">
+      <span className="mem-stat-label">{label}</span>
+      <span className={"mem-stat-value" + (bad ? " mem-stat-bad" : "")}>{value}</span>
+    </div>
+  );
+}
+
+function SuspectTable({
+  suspects,
+  empty,
+  showRestart,
+}: {
+  suspects: MemSuspect[];
+  empty: string;
+  showRestart?: boolean;
+}) {
+  if (suspects.length === 0) return <p className="muted">{empty}</p>;
+  const maxGrowth = Math.max(...suspects.map((s) => Math.abs(s.growth_kb)), 1);
+  return (
+    <div className="cfg-table-wrap">
+      <table className="cfg-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th title="Growth, or memory handed back at restart — whichever is larger">Leak evidence</th>
+            <th>Share of decline</th>
+            <th>Peak</th>
+            {showRestart && (
+              <>
+                <th title="Level it settled at after its last restart">After restart</th>
+                <th title="Peak minus the post-restart level: memory it was holding but did not need">Reclaimed</th>
+              </>
+            )}
+            <th>Start → End</th>
+            {showRestart && <th title="All PIDs seen for this process in the window">PIDs</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {suspects.map((s, i) => {
+            // optional under strictNullChecks: coalesce before comparing
+            const reclaimed = s.restarted ? s.reclaimed_kb ?? 0 : 0;
+            return (
+            <tr key={s.counter + i}>
+              <td className="cfg-name">
+                {s.name}
+                {s.restarted && (
+                  <span className="mem-restart" title="PID changed or resident memory fell sharply mid-window">
+                    restarted
+                  </span>
+                )}
+              </td>
+              <td className="mem-growth">
+                <span className="mem-bar" style={{ width: `${(Math.abs(s.growth_kb) / maxGrowth) * 100}%` }} />
+                <span className="mem-growth-val">+{fmtKB(s.growth_kb)}</span>
+              </td>
+              <td>{s.pct_of_drop > 0 ? fmtPct(s.pct_of_drop) : "—"}</td>
+              <td>{fmtKB(s.peak_kb)}</td>
+              {showRestart && (
+                <>
+                  <td>{s.restarted ? fmtKB(s.post_restart_kb) : "—"}</td>
+                  <td className={reclaimed > 0 ? "mem-reclaimed" : ""}>
+                    {reclaimed > 0 ? fmtKB(reclaimed) : "—"}
+                  </td>
+                </>
+              )}
+              <td className="muted">
+                {fmtKB(s.start_kb)} → {fmtKB(s.end_kb)}
+              </td>
+              {showRestart && (
+                <td className="mem-src" title={(s.counters ?? []).join("\n")}>
+                  {(s.pids ?? []).join(", ") || "—"}
+                </td>
+              )}
+            </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* Overlays available memory with the top suspect processes on one chart —
+   the comparison that shows whether a process's growth really tracks the
+   decline. Reuses the counters-tab chart so zoom and marking behave the same. */
+function MemoryTrendChart({
+  fileId,
+  trendCounter,
+  suspects,
+  visible,
+}: {
+  fileId: string;
+  trendCounter: string;
+  suspects: MemSuspect[];
+  visible: boolean;
+}) {
+  const [series, setSeries] = useState<Record<string, CounterPoint[]>>({});
+  const [hidden, setHidden] = useState<string[]>([]);
+  const [xRange, setXRange] = useState<[number, number] | null>(null);
+  // Alt/Option+click marks: this was previously wired to a no-op, so the
+  // shortcut silently did nothing on this tab
+  const [marks, setMarks] = useState<Mark[]>([]);
+
+  const addMark = (t: number, rows: MarkRow[]) =>
+    setMarks((m) => {
+      const ts = fmtReadoutTs(t);
+      const idx = m.findIndex((x) => x.ts === ts);
+      if (idx < 0) return [...m, { ts, rows }];
+      const merged = [...m];
+      const seen = new Set(merged[idx].rows.map((r) => r.name));
+      merged[idx] = {
+        ...merged[idx],
+        rows: [...merged[idx].rows, ...rows.filter((r) => !seen.has(r.name))],
+      };
+      return merged;
+    });
+
+  // Every PID's series for each suspect, not just one: a restart starts a
+  // new counter series, so plotting a single PID cuts the timeline exactly
+  // where the before/after comparison matters. The API caps a request at 12
+  // series.
+  const names = useMemo(() => {
+    const all = [trendCounter];
+    for (const s of suspects) {
+      for (const c of s.counters ?? [s.counter]) {
+        if (!all.includes(c)) all.push(c);
+      }
+    }
+    return all.slice(0, 12);
+  }, [trendCounter, suspects]);
+
+  useEffect(() => {
+    if (names.length === 0) return;
+    const q = names.map(encodeURIComponent).join("|");
+    fetch(`/api/v1/files/${fileId}/counters/data?names=${q}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((d) => setSeries(d.series ?? {}))
+      .catch(() => setSeries({}));
+  }, [fileId, names]);
+
+  if (Object.keys(series).length === 0) return <p className="muted">Loading chart…</p>;
+
+  return (
+    <>
+      <GraphChart
+        series={series}
+        hidden={hidden}
+        onToggle={(k) => setHidden((h) => (h.includes(k) ? h.filter((x) => x !== k) : [...h, k]))}
+        onMark={addMark}
+        xRange={xRange}
+        onXRange={setXRange}
+        visible={visible}
+      />
+      <div className="anom-marks">
+        <div className="anom-marks-head">
+          <span>Noted points ({marks.length})</span>
+          <button className="btn-outline" onClick={() => setMarks([])} disabled={marks.length === 0}>
+            Clear
+          </button>
+        </div>
+        {marks.length === 0 && (
+          <p className="muted">
+            Hold <kbd>Alt</kbd> (<kbd>Option</kbd> on Mac) and click the chart to record a point here.
+          </p>
+        )}
+        {marks.map((m) => (
+          <div key={m.ts} className="anom-mark-entry">
+            <div className="mark-ts">{m.ts}</div>
+            {m.rows.map((r) => (
+              <div key={r.name} className="mark-line">
+                <span className="mark-name">{r.name}</span>
+                <span className="mark-val">{r.value === null ? "—" : fmtReadoutVal(r.value)}</span>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function CounterGraphs({ fileId, visible }: { fileId: string; visible: boolean }) {
   const [counters, setCounters] = useState<CounterMeta[]>([]);
   const [err, setErr] = useState<string | null>(null);
-  const [marks, setMarks] = useState<Mark[]>([]);
+  const [marks, setMarks] = useState<Mark[]>(() => graphStateFor(fileId).marks);
   // shared x-axis window: zooming one panel zooms both
   const [xRange, setXRange] = useState<[number, number] | null>(null);
+
+  // marks outlive left-nav navigation too
+  useEffect(() => {
+    graphStateFor(fileId).marks = marks;
+  }, [fileId, marks]);
 
   useEffect(() => {
     fetch(`/api/v1/files/${fileId}/counters`)
@@ -460,8 +1056,24 @@ function CounterGraphs({ fileId }: { fileId: string }) {
   return (
     <>
       {err && <p className="error">{err}</p>}
-      <GraphPanel fileId={fileId} counters={counters} onMark={addMark} xRange={xRange} onXRange={setXRange} />
-      <GraphPanel fileId={fileId} counters={counters} onMark={addMark} xRange={xRange} onXRange={setXRange} />
+      <GraphPanel
+        fileId={fileId}
+        panelIdx={0}
+        counters={counters}
+        onMark={addMark}
+        xRange={xRange}
+        onXRange={setXRange}
+        visible={visible}
+      />
+      <GraphPanel
+        fileId={fileId}
+        panelIdx={1}
+        counters={counters}
+        onMark={addMark}
+        xRange={xRange}
+        onXRange={setXRange}
+        visible={visible}
+      />
       <div className="marks-card">
         <div className="marks-head">
           <span>
@@ -515,10 +1127,141 @@ function severityRank(s: string): number {
   }
 }
 
-function AnomaliesView({ fileId }: { fileId: string }) {
+/* ---------- anomaly search: AND / OR / NOT boolean queries ----------
+   Supports: bare words, "quoted phrases", AND / OR / NOT (and && || !),
+   parentheses, and implicit AND between adjacent terms — so
+     ospf AND down
+     ospf down                 (same thing)
+     tunnel OR ipsec
+     telemetry AND NOT "1-hr"
+     (ospf OR bgp) AND down
+   all work. Precedence is the conventional NOT > AND > OR. */
+
+type QueryNode =
+  | { t: "term"; v: string }
+  | { t: "not"; a: QueryNode }
+  | { t: "and"; a: QueryNode; b: QueryNode }
+  | { t: "or"; a: QueryNode; b: QueryNode };
+
+type QToken = { k: "and" | "or" | "not" | "(" | ")" } | { k: "term"; v: string };
+
+function tokenizeQuery(q: string): QToken[] {
+  const out: QToken[] = [];
+  let i = 0;
+  while (i < q.length) {
+    const c = q[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === "(" || c === ")") { out.push({ k: c }); i++; continue; }
+    if (c === "!") { out.push({ k: "not" }); i++; continue; }
+    if (c === "&") { i += q[i + 1] === "&" ? 2 : 1; out.push({ k: "and" }); continue; }
+    if (c === "|") { i += q[i + 1] === "|" ? 2 : 1; out.push({ k: "or" }); continue; }
+    if (c === '"' || c === "'") {
+      const end = q.indexOf(c, i + 1);
+      const v = end < 0 ? q.slice(i + 1) : q.slice(i + 1, end);
+      if (v) out.push({ k: "term", v: v.toLowerCase() });
+      i = end < 0 ? q.length : end + 1;
+      continue;
+    }
+    let j = i;
+    while (j < q.length && !/[\s()!&|]/.test(q[j])) j++;
+    const w = q.slice(i, j);
+    const up = w.toUpperCase();
+    if (up === "AND") out.push({ k: "and" });
+    else if (up === "OR") out.push({ k: "or" });
+    else if (up === "NOT") out.push({ k: "not" });
+    else out.push({ k: "term", v: w.toLowerCase() });
+    i = j;
+  }
+  return out;
+}
+
+// recursive descent: or := and (OR and)* ; and := not (AND? not)* ; not := NOT not | primary
+function parseQuery(q: string): QueryNode | null {
+  const toks = tokenizeQuery(q);
+  let p = 0;
+  const peek = () => toks[p];
+
+  const parseOr = (): QueryNode | null => {
+    let left = parseAnd();
+    if (!left) return null;
+    while (peek()?.k === "or") {
+      p++;
+      const right = parseAnd();
+      if (!right) return left;
+      left = { t: "or", a: left, b: right };
+    }
+    return left;
+  };
+
+  const parseAnd = (): QueryNode | null => {
+    let left = parseNot();
+    if (!left) return null;
+    for (;;) {
+      const tk = peek();
+      if (!tk || tk.k === "or" || tk.k === ")") break;
+      if (tk.k === "and") p++; // explicit AND; otherwise implicit
+      const right = parseNot();
+      if (!right) break;
+      left = { t: "and", a: left, b: right };
+    }
+    return left;
+  };
+
+  const parseNot = (): QueryNode | null => {
+    if (peek()?.k === "not") {
+      p++;
+      const a = parseNot();
+      return a ? { t: "not", a } : null;
+    }
+    const tk = peek();
+    if (!tk) return null;
+    if (tk.k === "(") {
+      p++;
+      const inner = parseOr();
+      if (peek()?.k === ")") p++;
+      return inner;
+    }
+    if (tk.k === "term") { p++; return { t: "term", v: tk.v }; }
+    p++; // stray operator: skip it
+    return parseNot();
+  };
+
+  const node = parseOr();
+  return node;
+}
+
+function evalQuery(n: QueryNode, haystack: string): boolean {
+  switch (n.t) {
+    case "term": return haystack.includes(n.v);
+    case "not": return !evalQuery(n.a, haystack);
+    case "and": return evalQuery(n.a, haystack) && evalQuery(n.b, haystack);
+    case "or": return evalQuery(n.a, haystack) || evalQuery(n.b, haystack);
+    default: return true; // unreachable; keeps the return type total
+  }
+}
+
+// everything a query can match against: the group label, its category and
+// severity, and every raw occurrence message (so searching an IP, filename
+// or tunnel name finds the group that contains it)
+function anomalyHaystack(g: AnomalyGroup): string {
+  return [
+    g.label,
+    g.subtype,
+    g.severity,
+    g.sample,
+    ...(g.occurrences ?? []).map((o) => o.description),
+  ]
+    .join("   ")
+    .toLowerCase();
+}
+
+function AnomaliesView({ fileId, visible }: { fileId: string; visible: boolean }) {
   const [groups, setGroups] = useState<AnomalyGroup[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [selected, setSelected] = useState<number | null>(null);
+  // keyed by label, not row index, so filtering the list doesn't silently
+  // change which event is open
+  const [selectedLabel, setSelectedLabel] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
   // notes live here, not in the chart, so they survive switching between events
   const [marks, setMarks] = useState<AnomalyMark[]>([]);
 
@@ -538,7 +1281,7 @@ function AnomaliesView({ fileId }: { fileId: string }) {
 
   // the backend already orders these; re-sorting here keeps the critical-first
   // ordering guaranteed on the screen regardless of API version
-  const ordered = useMemo(() => {
+  const sorted = useMemo(() => {
     if (!groups) return null;
     return [...groups].sort((a, b) => {
       const d = severityRank(b.severity) - severityRank(a.severity);
@@ -546,13 +1289,54 @@ function AnomaliesView({ fileId }: { fileId: string }) {
     });
   }, [groups]);
 
-  const active = selected !== null ? ordered?.[selected] ?? null : null;
+  const ordered = useMemo(() => {
+    if (!sorted) return null;
+    const q = query.trim();
+    if (!q) return sorted;
+    const ast = parseQuery(q);
+    // unparseable query (e.g. mid-typing): fall back to a plain substring match
+    if (!ast) {
+      const lc = q.toLowerCase();
+      return sorted.filter((g) => anomalyHaystack(g).includes(lc));
+    }
+    return sorted.filter((g) => evalQuery(ast, anomalyHaystack(g)));
+  }, [sorted, query]);
+
+  const active = ordered?.find((g) => g.label === selectedLabel) ?? null;
 
   return (
     <div className="anom-wrap">
       {err && <p className="error">{err}</p>}
       {!ordered && !err && <p className="muted">Loading…</p>}
-      {ordered && ordered.length === 0 && <p className="muted">No recurring events found in the system log.</p>}
+      {sorted && sorted.length > 0 && (
+        <div className="anom-search">
+          <input
+            className="search-input"
+            type="search"
+            placeholder='Search events…  e.g.  ospf AND down   ·   tunnel OR ipsec   ·   telemetry AND NOT "1-hr"'
+            title={
+              'Boolean search over the event name, category, severity and every raw log message.\n\n' +
+              'AND / OR / NOT (also && || !), parentheses, and "quoted phrases".\n' +
+              'Adjacent words are ANDed implicitly, so `ospf down` == `ospf AND down`.\n\n' +
+              'Examples:\n' +
+              '  ospf AND down\n' +
+              '  tunnel OR ipsec OR lacp\n' +
+              '  telemetry AND NOT "1-hr"\n' +
+              '  (ospf OR bgp) AND down\n' +
+              '  10.10.10.2'
+            }
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          {query.trim() !== "" && (
+            <span className="anom-search-count muted">
+              {ordered?.length ?? 0} of {sorted.length} events
+              {(ordered?.length ?? 0) > 0 ? "" : " — no matches"}
+            </span>
+          )}
+        </div>
+      )}
+      {sorted && sorted.length === 0 && <p className="muted">No recurring events found in the system log.</p>}
       {ordered && ordered.length > 0 && (
         <div className="anom-layout">
           <div className="anom-table-wrap">
@@ -570,8 +1354,8 @@ function AnomaliesView({ fileId }: { fileId: string }) {
                 {ordered.map((g, i) => (
                   <tr
                     key={g.label + i}
-                    className={"anom-row" + (i === selected ? " active" : "")}
-                    onClick={() => setSelected(i)}
+                    className={"anom-row" + (g.label === selectedLabel ? " active" : "")}
+                    onClick={() => setSelectedLabel(g.label)}
                   >
                     <td className="anom-label" title={g.sample}>{g.label}</td>
                     <td>{g.subtype}</td>
@@ -580,7 +1364,7 @@ function AnomaliesView({ fileId }: { fileId: string }) {
                     </td>
                     <td>{g.count}</td>
                     <td>
-                      {g.occurrences.length
+                      {(g.occurrences ?? []).length
                         ? new Date(g.occurrences[g.occurrences.length - 1].ts).toLocaleString()
                         : "—"}
                     </td>
@@ -595,6 +1379,7 @@ function AnomaliesView({ fileId }: { fileId: string }) {
               <AnomalyChart
                 group={active}
                 onMark={(ts, lines) => addMark(active.label, ts, lines)}
+                visible={visible}
               />
               <div className="anom-marks">
                 <div className="anom-marks-head">
@@ -631,59 +1416,133 @@ function AnomaliesView({ fileId }: { fileId: string }) {
    per occurrence at its exact log timestamp (y = how many fired at that
    same second), so an anomaly's timing can be read — and zoomed — the
    same way as a counter series rather than being smeared into buckets. */
+/* Bucket width as a function of the visible time span. Zoomed out, events
+   inside half an hour of each other are one dot; as the window narrows the
+   buckets shrink and clumps split apart, until each event is its own dot. */
+const MIN_30 = 30 * 60_000;
+const MIN_15 = 15 * 60_000;
+const MIN_10 = 10 * 60_000;
+const MIN_5 = 5 * 60_000;
+
+// Stepped so each zoom level splits clumps a little further rather than
+// jumping from 30 minutes straight to individual events.
+function bucketForSpan(spanMs: number): number {
+  if (spanMs > 12 * 3600_000) return MIN_30; // more than half a day on screen
+  if (spanMs > 6 * 3600_000) return MIN_15;
+  if (spanMs > 2 * 3600_000) return MIN_10;
+  if (spanMs > 45 * 60_000) return MIN_5;
+  return 0; // no clustering: every occurrence plotted where it happened
+}
+
+function bucketLabel(bucketMs: number): string {
+  if (bucketMs >= MIN_30) return "grouped per 30 min";
+  if (bucketMs >= MIN_15) return "grouped per 15 min";
+  if (bucketMs >= MIN_10) return "grouped per 10 min";
+  if (bucketMs >= MIN_5) return "grouped per 5 min";
+  return "every event shown individually";
+}
+
+interface AnomBucket {
+  ts: number; // representative time (first occurrence in the bucket)
+  count: number;
+  lines: string[];
+}
+
 function AnomalyChart({
   group,
   onMark,
+  visible = true,
 }: {
   group: AnomalyGroup;
   onMark: (ts: string, lines: string[]) => void;
+  visible?: boolean;
 }) {
-  const chartRef = useRef<HTMLDivElement | null>(null);
   const chartInst = useRef<Dygraph | null>(null);
+  const { el: chartEl, setEl: setChartEl } = useChartContainer(chartInst);
   const [hoverTs, setHoverTs] = useState<number | null>(null);
   const [picked, setPicked] = useState<number | null>(null);
+  const [bucketMs, setBucketMs] = useState<number>(MIN_30);
+  // the zoom window is preserved across the rebuild that a bucket-size
+  // change forces, and guards against feedback between the two
+  const winRef = useRef<[number, number] | null>(null);
+  const bucketRef = useRef(bucketMs);
+  bucketRef.current = bucketMs;
+  const rebuildingRef = useRef(false);
 
-  // collapse duplicate timestamps into one point carrying the occurrence
-  // count, so simultaneous events show as a taller dot instead of
-  // overplotting invisibly at y=1; keep every raw message per timestamp so
-  // a click can show exactly which file/neighbor/tunnel it was about
-  const { rows, byTs } = useMemo(() => {
-    const m = new Map<number, string[]>();
-    for (const o of group.occurrences ?? []) {
-      const ms = Date.parse(o.ts);
-      if (Number.isNaN(ms)) continue;
-      const list = m.get(ms);
-      if (list) list.push(o.description);
-      else m.set(ms, [o.description]);
-    }
-    const sorted = Array.from(m.entries()).sort((a, b) => a[0] - b[0]);
-    return {
-      rows: sorted.map(([ms, list]) => [new Date(ms), list.length]),
-      byTs: m,
-    };
+  // occurrences sorted once; bucketing is derived from this
+  const occ = useMemo(() => {
+    const list = (group.occurrences ?? [])
+      .map((o) => ({ ms: Date.parse(o.ts), description: o.description }))
+      .filter((o) => !Number.isNaN(o.ms));
+    list.sort((a, b) => a.ms - b.ms);
+    return list;
   }, [group]);
 
-  // reset the pinned message when switching to a different event
-  useEffect(() => setPicked(null), [group]);
+  // pick the initial bucket size from the full data span
+  useEffect(() => {
+    winRef.current = null;
+    setPicked(null);
+    if (occ.length > 1) {
+      setBucketMs(bucketForSpan(occ[occ.length - 1].ms - occ[0].ms));
+    } else {
+      setBucketMs(0);
+    }
+  }, [occ]);
 
-  // nearest plotted timestamp to the crosshair, so a click near a dot still
-  // resolves to that dot
-  const nearestTs = (t: number): number | null => {
-    let best: number | null = null;
+  // group occurrences into buckets; y is the number of events in the bucket
+  // so a busier period is both taller and (via drawPointCallback) a bigger dot
+  const buckets: AnomBucket[] = useMemo(() => {
+    if (occ.length === 0) return [];
+    if (bucketMs <= 0) {
+      const m = new Map<number, AnomBucket>();
+      for (const o of occ) {
+        const b = m.get(o.ms);
+        if (b) {
+          b.count++;
+          b.lines.push(o.description);
+        } else {
+          m.set(o.ms, { ts: o.ms, count: 1, lines: [o.description] });
+        }
+      }
+      return Array.from(m.values()).sort((a, b) => a.ts - b.ts);
+    }
+    const out: AnomBucket[] = [];
+    for (const o of occ) {
+      const last = out[out.length - 1];
+      if (last && o.ms - last.ts < bucketMs) {
+        last.count++;
+        last.lines.push(o.description);
+      } else {
+        out.push({ ts: o.ms, count: 1, lines: [o.description] });
+      }
+    }
+    return out;
+  }, [occ, bucketMs]);
+
+  // drawPointCallback indexes into this, so it must track the current buckets
+  const bucketsRef = useRef(buckets);
+  bucketsRef.current = buckets;
+
+  const rows = useMemo(() => buckets.map((b) => [new Date(b.ts), b.count]), [buckets]);
+
+  const nearestBucket = (t: number): AnomBucket | null => {
+    let best: AnomBucket | null = null;
     let bestD = Infinity;
-    for (const ms of byTs.keys()) {
-      const d = Math.abs(ms - t);
+    for (const b of buckets) {
+      const d = Math.abs(b.ts - t);
       if (d < bestD) {
         bestD = d;
-        best = ms;
+        best = b;
       }
     }
     return best;
   };
 
   useEffect(() => {
-    const el = chartRef.current;
-    if (!el || rows.length === 0) return;
+    const el = chartEl;
+    // built only while the pane is actually on screen: dygraphs fixes its
+    // width at construction, and a hidden container measures zero
+    if (!el || !visible || el.clientWidth === 0 || rows.length === 0) return;
 
     const D = Dygraph as unknown as {
       startZoom: (e: MouseEvent, g: Dygraph, ctx: unknown) => void;
@@ -711,9 +1570,9 @@ function AnomalyChart({
       },
     };
 
-    const maxY = Math.max(...rows.map((r) => r[1] as number));
+    const maxY = Math.max(...rows.map((r) => r[1] as number), 1);
     const g = new Dygraph(el, rows as unknown as number[][], {
-      labels: ["time", "Occurrences"],
+      labels: ["time", "Events"],
       colors: ["#dc2626"],
       labelsUTC: true,
       legend: "never",
@@ -721,41 +1580,98 @@ function AnomalyChart({
       // a continuous series that doesn't exist
       strokeWidth: 0,
       drawPoints: true,
-      pointSize: 3.5,
-      highlightCircleSize: 5,
+      pointSize: 3,
+      highlightCircleSize: 6,
       includeZero: true,
       valueRange: [0, maxY + 1],
       axisLineColor: "#d4d4d8",
       gridLineColor: "#ececef",
       axisLabelFontSize: 11,
+      // dots at the extremes stay inside the plot area and clickable
+      xRangePad: CHART_X_PAD,
+      dateWindow: winRef.current ?? undefined,
       interactionModel: interactionModel as unknown as Record<string, unknown>,
+      // Dot radius grows with how many events the bucket holds, so a busy
+      // period reads as a big dot rather than a taller one you have to squint
+      // at. dygraphs 2.x passes the row index as an 8th argument, but
+      // @types/dygraphs only declares 7 parameters, so this is written as a
+      // variadic function and the index read positionally — annotating the
+      // 8th parameter makes the options object unassignable to Options.
+      drawPointCallback: (...args: unknown[]) => {
+        const ctx = args[2] as CanvasRenderingContext2D;
+        const cx = args[3] as number;
+        const cy = args[4] as number;
+        const color = args[5] as string;
+        const idx = typeof args[7] === "number" ? (args[7] as number) : -1;
+        const b = idx >= 0 ? bucketsRef.current[idx] : undefined;
+        const n = b ? b.count : 1;
+        const radius = Math.min(14, 3 + Math.sqrt(n) * 2.2);
+        ctx.beginPath();
+        ctx.fillStyle = color;
+        ctx.globalAlpha = n > 1 ? 0.75 : 1;
+        ctx.arc(cx, cy, radius, 0, 2 * Math.PI, false);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      },
       highlightCallback: (_e, x) => setHoverTs(x),
       unhighlightCallback: () => setHoverTs(null),
+      // re-bucket as the zoom level changes: wide window = coarse buckets,
+      // narrow window = individual events
+      drawCallback: (gg: Dygraph, isInitial: boolean) => {
+        if (rebuildingRef.current) return;
+        const r = gg.xAxisRange();
+        if (!r || !Number.isFinite(r[0]) || !Number.isFinite(r[1])) return;
+        winRef.current = gg.isZoomed("x") ? [r[0], r[1]] : null;
+        if (isInitial) return;
+        const want = bucketForSpan(r[1] - r[0]);
+        if (want !== bucketRef.current) {
+          rebuildingRef.current = true;
+          setBucketMs(want);
+          // cleared once the rebuild effect has run
+          setTimeout(() => {
+            rebuildingRef.current = false;
+          }, 0);
+        }
+      },
     } as ConstructorParameters<typeof Dygraph>[2]);
     chartInst.current = g;
 
-    const onResize = () => g.resize();
-    window.addEventListener("resize", onResize);
     return () => {
-      window.removeEventListener("resize", onResize);
       g.destroy();
       chartInst.current = null;
     };
-  }, [rows]);
+  }, [rows, chartEl, visible]);
 
   if (rows.length === 0) return <p className="muted">No timestamps to plot.</p>;
 
-  const pickedLines = picked !== null ? byTs.get(picked) ?? [] : [];
+  const pickedBucket = picked !== null ? buckets.find((b) => b.ts === picked) ?? null : null;
+  const pickedLines = pickedBucket?.lines ?? [];
 
   const handleClick = (e: ReactMouseEvent) => {
     if (hoverTs === null) return;
-    const ts = nearestTs(hoverTs);
-    if (ts === null) return;
+    const b = nearestBucket(hoverTs);
+    if (!b) return;
     if (e.altKey) {
-      onMark(new Date(ts).toISOString(), byTs.get(ts) ?? []);
+      onMark(new Date(b.ts).toISOString(), b.lines);
       return;
     }
-    setPicked(ts);
+    setPicked(b.ts);
+  };
+
+  const resetZoom = () => {
+    winRef.current = null;
+    chartInst.current?.resetZoom();
+    if (occ.length > 1) setBucketMs(bucketForSpan(occ[occ.length - 1].ms - occ[0].ms));
+  };
+
+  const pan = (dir: -1 | 1) => {
+    const g = chartInst.current;
+    if (!g || occ.length === 0) return;
+    const r = g.xAxisRange();
+    if (!r || !Number.isFinite(r[0]) || !Number.isFinite(r[1])) return;
+    const next = pannedWindow(r[0], r[1], dir, occ[0].ms, occ[occ.length - 1].ms);
+    winRef.current = next;
+    g.updateOptions({ dateWindow: next });
   };
 
   return (
@@ -763,29 +1679,38 @@ function AnomalyChart({
       {/* the clicked incident's original log text sits above the graph */}
       <div className={"anom-picked" + (picked === null ? " anom-picked-empty" : "")}>
         {picked === null ? (
-          <span className="muted">Click a point to see its original system-log message.</span>
+          <span className="muted">Click a dot to see the original system-log messages behind it.</span>
         ) : (
           <>
-            <div className="anom-picked-ts">{new Date(picked).toLocaleString()}</div>
-            {pickedLines.map((l, i) => (
+            <div className="anom-picked-ts">
+              {new Date(picked).toLocaleString()}
+              {pickedLines.length > 1 && (
+                <span className="anom-picked-count">{pickedLines.length} events in this group</span>
+              )}
+            </div>
+            {pickedLines.slice(0, 40).map((l, i) => (
               <div key={i} className="anom-picked-msg">{l}</div>
             ))}
+            {pickedLines.length > 40 && (
+              <div className="muted">…and {pickedLines.length - 40} more — zoom in to split this group.</div>
+            )}
           </>
         )}
       </div>
       <div className="anom-chart-head">
-        <span className="muted">{group.count} occurrences</span>
+        <span className="muted">
+          {group.count} events · {bucketLabel(bucketMs)} · dot size = events in that group
+        </span>
         <span className="graph-hover-ts">{hoverTs !== null ? fmtReadoutTs(hoverTs) : ""}</span>
-        <button className="btn-outline" onClick={() => chartInst.current?.resetZoom()}>
-          Reset zoom
-        </button>
+        <PanControls onPan={pan} onReset={resetZoom} />
       </div>
       <div onClick={handleClick}>
-        <div ref={chartRef} className="anom-chart-canvas" />
+        <div ref={setChartEl} className="anom-chart-canvas" />
       </div>
       <div className="graph-hint">
-        Click a point for its log message · <kbd>Shift</kbd> + drag to zoom · double-click to reset ·{" "}
-        <kbd>Alt</kbd>/<kbd>Option</kbd> + click to note it
+        Click a dot for the underlying log messages · <kbd>Shift</kbd> + drag to zoom in (clumps split apart as
+        you go) · <kbd>‹</kbd> <kbd>›</kbd> to pan · double-click to reset · <kbd>Alt</kbd>/<kbd>Option</kbd> +
+        click to note it
       </div>
     </div>
   );
@@ -794,27 +1719,67 @@ function AnomalyChart({
 /* one lookup → selected → plot row, monparse-style */
 function GraphPanel({
   fileId,
+  panelIdx,
   counters,
   onMark,
   xRange,
   onXRange,
+  visible,
 }: {
   fileId: string;
+  panelIdx: number;
   counters: CounterMeta[];
   onMark: (t: number, rows: MarkRow[]) => void;
   xRange: [number, number] | null;
   onXRange: (r: [number, number] | null) => void;
+  visible: boolean;
 }) {
-  const [filter, setFilter] = useState("");
-  const [sel, setSel] = useState<SelEntry[]>([]);
+  const saved = graphStateFor(fileId).panels[panelIdx];
+  const [filter, setFilter] = useState(saved.filter);
+  const [sel, setSel] = useState<SelEntry[]>(saved.sel);
   const [data, setData] = useState<Record<string, CounterPoint[]>>({});
-  const [hidden, setHidden] = useState<string[]>([]);
+  const [hidden, setHidden] = useState<string[]>(saved.hidden);
   const [err, setErr] = useState<string | null>(null);
+
+  // persist the picks for this file so they survive leaving the Graphs tab
+  useEffect(() => {
+    const st = graphStateFor(fileId).panels[panelIdx];
+    st.filter = filter;
+    st.sel = sel;
+    st.hidden = hidden;
+  }, [fileId, panelIdx, filter, sel, hidden]);
+
+  // Fetch whatever is selected but not yet loaded. This covers both adding a
+  // counter and coming back to a restored selection, and batches so a large
+  // selection doesn't turn into hundreds of requests.
+  useEffect(() => {
+    const missing = Array.from(new Set(sel.map((e) => e.name))).filter((n) => !data[n]);
+    if (missing.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      for (let i = 0; i < missing.length; i += COUNTER_FETCH_BATCH) {
+        const batch = missing.slice(i, i + COUNTER_FETCH_BATCH);
+        try {
+          const q = batch.map(encodeURIComponent).join("|");
+          const r = await fetch(`/api/v1/files/${fileId}/counters/data?names=${q}`);
+          if (!r.ok) throw new Error(String(r.status));
+          const d = await r.json();
+          if (cancelled) return;
+          setData((prev) => ({ ...prev, ...(d.series ?? {}) }));
+        } catch {
+          if (!cancelled) setErr(`Could not load ${batch.length} counter(s)`);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [fileId, sel, data]);
 
   const shown = useMemo(() => {
     const f = filter.trim();
     const list = f ? counters.filter(parseLookup(f).matches) : counters;
-    return list.slice(0, 300);
+    return list.slice(0, LOOKUP_LIST_MAX);
   }, [counters, filter]);
 
   const add = (name: string, mode: SeriesMode) => {
@@ -823,12 +1788,32 @@ function GraphPanel({
       if (s.length >= MAX_PLOT || s.some((e) => e.name === name && e.mode === mode)) return s;
       return [...s, { name, mode }];
     });
-    if (!data[name]) {
-      fetch(`/api/v1/files/${fileId}/counters/data?names=${encodeURIComponent(name)}`)
-        .then((r) => (r.ok ? r.json() : Promise.reject()))
-        .then((d) => setData((prev) => ({ ...prev, ...(d.series ?? {}) })))
-        .catch(() => setErr(`Could not load ${name}`));
-    }
+  };
+
+  // Bulk add is only offered once a filter has narrowed things to a set small
+  // enough to plot. Unfiltered, "add all" would mean tens of thousands of
+  // series and a dead browser tab.
+  const filtered = filter.trim() !== "";
+  const bulkAllowed = filtered && shown.length > 1 && shown.length <= BULK_ADD_MAX;
+  const bulkWhy = !filtered
+    ? "Add a filter first — without one this would add every counter in the archive"
+    : shown.length > BULK_ADD_MAX
+      ? `${shown.length} matches is too many to add at once; narrow the filter to ${BULK_ADD_MAX} or fewer`
+      : shown.length <= 1
+        ? "Nothing to bulk-add"
+        : "";
+
+  const addAllShown = (mode: SeriesMode) => {
+    if (!bulkAllowed) return; // guard, in case the button is somehow reachable
+    setErr(null);
+    setSel((s) => {
+      const next = [...s];
+      for (const c of shown) {
+        if (next.length >= MAX_PLOT) break;
+        if (!next.some((e) => e.name === c.name && e.mode === mode)) next.push({ name: c.name, mode });
+      }
+      return next;
+    });
   };
 
   const remove = (key: string) => {
@@ -859,6 +1844,27 @@ function GraphPanel({
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
         />
+        {shown.length > 1 && (
+          <div className="lookup-bulk" title={bulkWhy}>
+            <span className="muted">
+              {shown.length}
+              {shown.length >= LOOKUP_LIST_MAX ? "+" : ""} match{shown.length === 1 ? "" : "es"}
+            </span>
+            <span className="lookup-actions">
+              {(["val", "del", "rate"] as SeriesMode[]).map((m) => (
+                <button
+                  key={m}
+                  disabled={!bulkAllowed}
+                  className={bulkAllowed ? "" : "bulk-off"}
+                  onClick={() => addAllShown(m)}
+                  title={bulkAllowed ? `Add all ${shown.length} matches as ${m}` : bulkWhy}
+                >
+                  + all {m}
+                </button>
+              ))}
+            </span>
+          </div>
+        )}
         <div className="lookup-list">
           {shown.map((c) => (
             <div key={c.name} className="lookup-row">
@@ -882,7 +1888,7 @@ function GraphPanel({
 
       <div className="selected-card">
         <div className="selected-head">
-          <span>Selected ({sel.length}/{MAX_PLOT})</span>
+          <span>Selected ({sel.length})</span>
           {sel.length > 0 && (
             <button className="link-btn" onClick={() => { setSel([]); setHidden([]); }}>
               Clear
@@ -920,6 +1926,7 @@ function GraphPanel({
           onMark={onMark}
           xRange={xRange}
           onXRange={onXRange}
+          visible={visible}
         />
       ) : (
         <div className="graph-area">
@@ -940,6 +1947,7 @@ function GraphChart({
   onMark,
   xRange,
   onXRange,
+  visible = true,
 }: {
   series: Record<string, CounterPoint[]>;
   hidden: string[];
@@ -947,10 +1955,11 @@ function GraphChart({
   onMark: (t: number, rows: MarkRow[]) => void;
   xRange: [number, number] | null;
   onXRange: (r: [number, number] | null) => void;
+  visible?: boolean;
 }) {
   const [hoverTs, setHoverTs] = useState<number | null>(null);
-  const chartRef = useRef<HTMLDivElement | null>(null);
   const chartInst = useRef<Dygraph | null>(null);
+  const { el: chartEl, setEl: setChartEl } = useChartContainer(chartInst);
   const applyingRef = useRef(false); // true while applying a remote x-range
   const onXRangeRef = useRef(onXRange);
   onXRangeRef.current = onXRange;
@@ -998,8 +2007,9 @@ function GraphChart({
   }, [series]);
 
   useEffect(() => {
-    const el = chartRef.current;
-    if (!el || dyData.rows.length === 0) return;
+    const el = chartEl;
+    // built only while the pane is actually on screen (see AnomalyChart)
+    if (!el || !visible || el.clientWidth === 0 || dyData.rows.length === 0) return;
 
     // dygraphs' default model is drag=zoom / shift-drag=pan; ours is
     // shift-drag=zoom and everything else inert (no accidental zooms/pans)
@@ -1041,6 +2051,8 @@ function GraphChart({
       axisLineColor: "#d4d4d8",
       gridLineColor: "#ececef",
       axisLabelFontSize: 11,
+      // keep the first/last points off the axes so they stay clickable
+      xRangePad: CHART_X_PAD,
       interactionModel: interactionModel as unknown as Record<string, unknown>,
       highlightCallback: (_e, x) => setHoverTs(x),
       unhighlightCallback: () => setHoverTs(null),
@@ -1057,14 +2069,11 @@ function GraphChart({
     } as ConstructorParameters<typeof Dygraph>[2]);
     chartInst.current = g;
 
-    const onResize = () => g.resize();
-    window.addEventListener("resize", onResize);
     return () => {
-      window.removeEventListener("resize", onResize);
       g.destroy();
       chartInst.current = null;
     };
-  }, [dyData]);
+  }, [dyData, chartEl, visible]);
 
   // hide/show without rebuilding the chart
   useEffect(() => {
@@ -1092,6 +2101,23 @@ function GraphChart({
 
   const resetZoom = () => chartInst.current?.resetZoom();
 
+  // full extent of the plotted data, used to clamp panning
+  const dataBounds = useMemo<[number, number] | null>(() => {
+    const rows = dyData.rows;
+    if (rows.length === 0) return null;
+    const first = rows[0][0] as Date;
+    const last = rows[rows.length - 1][0] as Date;
+    return [first.getTime(), last.getTime()];
+  }, [dyData]);
+
+  const pan = (dir: -1 | 1) => {
+    const g = chartInst.current;
+    if (!g || !dataBounds) return;
+    const r = g.xAxisRange();
+    if (!r || !Number.isFinite(r[0]) || !Number.isFinite(r[1])) return;
+    g.updateOptions({ dateWindow: pannedWindow(r[0], r[1], dir, dataBounds[0], dataBounds[1]) });
+  };
+
   return (
     <div className="graph-area">
       <div className="graph-toolbar">
@@ -1115,9 +2141,7 @@ function GraphChart({
           <span className="graph-hover-ts">
             {hoverTs !== null ? fmtReadoutTs(hoverTs) : ""}
           </span>
-          <button className="btn-outline" onClick={resetZoom}>
-            Reset zoom
-          </button>
+          <PanControls onPan={pan} onReset={resetZoom} />
         </div>
       </div>
       <div
@@ -1132,10 +2156,11 @@ function GraphChart({
           }
         }}
       >
-        <div ref={chartRef} className="graph-canvas" />
+        <div ref={setChartEl} className="graph-canvas" />
       </div>
       <div className="graph-hint graph-hint-bottom">
-        Hold <kbd>Shift</kbd> + drag to zoom (both charts follow) · double-click to reset · <kbd>Alt</kbd>/<kbd>Option</kbd> + click records a time mark
+        Hold <kbd>Shift</kbd> + drag to zoom (both charts follow) · <kbd>‹</kbd> <kbd>›</kbd> to pan ·
+        double-click to reset · <kbd>Alt</kbd>/<kbd>Option</kbd> + click records a time mark
       </div>
     </div>
   );
@@ -1164,6 +2189,46 @@ interface ConfigNode {
   attrs?: Record<string, string>;
   text?: string;
   children?: ConfigNode[];
+}
+
+interface ConfigCandidate {
+  path: string;
+  size: number;
+  picked: boolean;
+  reason?: string;
+}
+
+interface ConfigDoc {
+  root: ConfigNode | null;
+  path: string;
+  size: number;
+  panorama_managed: boolean;
+  markers?: string[];
+  candidates: ConfigCandidate[];
+}
+
+/* Panorama pushes policy into pre- and post-rulebases that sit either side
+   of the device's own rules; only the middle one is locally defined. The
+   firewall's own UI shades the pushed rules to make that obvious, so rules
+   are tagged with their origin here too — without this, a Panorama-managed
+   device shows empty policy tables, because nothing lives under <rulebase>. */
+type RuleOrigin = "local" | "pre" | "post";
+
+const RULEBASE_PARENTS: { parent: string; origin: RuleOrigin }[] = [
+  { parent: "pre-rulebase", origin: "pre" },
+  { parent: "rulebase", origin: "local" },
+  { parent: "post-rulebase", origin: "post" },
+];
+
+const ORIGIN_LABEL: Record<RuleOrigin, string> = {
+  pre: "Panorama · pre",
+  local: "Local",
+  post: "Panorama · post",
+};
+
+interface EntryRow {
+  node: ConfigNode;
+  origin?: RuleOrigin;
 }
 
 function findAllByTag(root: ConfigNode | undefined, tag: string): ConfigNode[] {
@@ -1213,6 +2278,19 @@ function sectionEntries(root: ConfigNode | undefined, tag: string, parentTag?: s
     out.push(...direct, ...wrapped);
   }
   return Array.from(new Set(out));
+}
+
+// Collects a policy rulebase from all three parents, tagging each rule with
+// where it came from and keeping Panorama's evaluation order: pre-rules,
+// then the device's own rules, then post-rules.
+function policyEntries(root: ConfigNode | undefined, tag: string): EntryRow[] {
+  const out: EntryRow[] = [];
+  for (const { parent, origin } of RULEBASE_PARENTS) {
+    for (const node of sectionEntries(root, tag, parent)) {
+      out.push({ node, origin });
+    }
+  }
+  return out;
 }
 
 // Handles both list shapes PAN-OS uses for "many values under one field":
@@ -1546,29 +2624,61 @@ function flattenKv(n: ConfigNode, depth = 0): KvRow[] {
 }
 
 function ConfigTab({ fileId }: { fileId: string }) {
-  const [config, setConfig] = useState<ConfigNode | null>(null);
+  const [doc, setDoc] = useState<ConfigDoc | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [groupId, setGroupId] = useState("policies");
   const [sectionIdx, setSectionIdx] = useState(0);
+  const [showSources, setShowSources] = useState(false);
 
   useEffect(() => {
     fetch(`/api/v1/files/${fileId}/config`)
       .then((r) => (r.ok ? r.json() : Promise.reject()))
-      .then((d) => setConfig(d.config ?? null))
+      .then((d) => setDoc(d.config ?? null))
       .catch(() =>
-        setErr("No config extracted for this file — was a PAN-OS running-config.xml present in this archive?")
+        setErr("No config extracted for this file — no XML under /opt/pancfg/mgmt parsed as a PAN-OS <config>.")
       );
   }, [fileId]);
 
   const group = CONFIG_GROUPS.find((g) => g.id === groupId) ?? CONFIG_GROUPS[0];
   const section = group.sections[sectionIdx] ?? group.sections[0];
+  const config = doc?.root ?? null;
 
   return (
     <section>
       <h2>Config</h2>
-      <p className="muted cfg-hint">Read-only view of the parsed running config — browse it the way you would in the firewall's own UI.</p>
       {err && <p className="error">{err}</p>}
-      {!config && !err && <p className="muted">Loading…</p>}
+      {!doc && !err && <p className="muted">Loading…</p>}
+
+      {doc && (
+        <div className="cfg-source">
+          <span className="cfg-source-path" title={doc.path}>{doc.path || "—"}</span>
+          {doc.size > 0 && <span className="muted">{fmtSize(doc.size)}</span>}
+          {doc.panorama_managed ? (
+            <span className="cfg-pano-badge" title={"Panorama fingerprints: " + (doc.markers ?? []).join(", ")}>
+              Panorama-managed
+            </span>
+          ) : (
+            <span className="cfg-local-badge">Locally managed</span>
+          )}
+          {(doc.candidates ?? []).length > 1 && (
+            <button className="link-btn" onClick={() => setShowSources(!showSources)}>
+              {showSources ? "hide" : "show"} {doc.candidates.length} candidate files
+            </button>
+          )}
+        </div>
+      )}
+      {doc && showSources && (
+        <div className="cfg-candidates">
+          {doc.candidates.map((c, i) => (
+            <div key={i} className={"cfg-cand" + (c.picked ? " cfg-cand-picked" : "")}>
+              <span className="cfg-cand-path">{c.path}</span>
+              <span className="muted">{fmtSize(c.size)}</span>
+              <span className="muted">{c.picked ? "used" : c.reason ?? ""}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {config && (
         <div className="cfg-shell">
           <div className="cfg-groups">
@@ -1604,9 +2714,17 @@ function ConfigTab({ fileId }: { fileId: string }) {
 }
 
 function SectionView({ config, section }: { config: ConfigNode; section: SectionDef }) {
-  const entries = useMemo(() => sectionEntries(config, section.tag, section.parentTag), [config, section]);
-  const columns = useMemo(() => section.columns ?? genericColumns(entries), [section, entries]);
-  return <ConfigEntryTable entries={entries} columns={columns} root={config} expandable={section.expandable} />;
+  // policy rulebases are gathered from pre-/local/post- parents; everything
+  // else is a plain object list
+  const rows = useMemo<EntryRow[]>(() => {
+    if (section.parentTag === "rulebase") return policyEntries(config, section.tag);
+    return sectionEntries(config, section.tag, section.parentTag).map((node) => ({ node }));
+  }, [config, section]);
+  const columns = useMemo(
+    () => section.columns ?? genericColumns(rows.map((r) => r.node)),
+    [section, rows]
+  );
+  return <ConfigEntryTable rows={rows} columns={columns} root={config} expandable={section.expandable} />;
 }
 
 function InterfacesView({ config }: { config: ConfigNode }) {
@@ -1624,7 +2742,7 @@ function InterfacesView({ config }: { config: ConfigNode }) {
           </button>
         ))}
       </div>
-      <ConfigEntryTable entries={entries} columns={IFACE_COLUMNS} root={config} />
+      <ConfigEntryTable rows={entries.map((node) => ({ node }))} columns={IFACE_COLUMNS} root={config} />
     </div>
   );
 }
@@ -1651,25 +2769,29 @@ function ConfigKvView({ config, section }: { config: ConfigNode; section: Sectio
 }
 
 function ConfigEntryTable({
-  entries,
+  rows,
   columns,
   root,
   expandable,
 }: {
-  entries: ConfigNode[];
+  rows: EntryRow[];
   columns: ColumnSpec[];
   root?: ConfigNode;
   expandable?: boolean;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
-  if (entries.length === 0) {
+  if (rows.length === 0) {
     return <p className="muted">Not present in this config (or none configured).</p>;
   }
+  // only show the Origin column where it means something (policy rulebases)
+  const showOrigin = rows.some((r) => r.origin !== undefined);
+  const span = columns.length + 1 + (showOrigin ? 1 : 0);
   return (
     <div className="cfg-table-wrap">
       <table className="cfg-table">
         <thead>
           <tr>
+            {showOrigin && <th title="Panorama pushes pre- and post-rules around the device's own rules">Origin</th>}
             <th>Name</th>
             {columns.map((c) => (
               <th key={c.header}>{c.header}</th>
@@ -1677,33 +2799,46 @@ function ConfigEntryTable({
           </tr>
         </thead>
         <tbody>
-          {entries.map((e, i) => (
-            <Fragment key={(e.attrs?.name ?? "") + "_" + i}>
-              <tr
-                className={expandable ? "cfg-row-clickable" : ""}
-                onClick={expandable ? () => setExpanded(expanded === i ? null : i) : undefined}
-              >
-                <td className="cfg-name">{e.attrs?.name ?? "—"}</td>
-                {columns.map((c) => (
-                  <td key={c.header}>{c.get(e, root) || "—"}</td>
-                ))}
-              </tr>
-              {expandable && expanded === i && (
-                <tr>
-                  <td colSpan={columns.length + 1} className="cfg-expand-cell">
-                    <div className="cfg-kv">
-                      {flattenKv(e).map((r, k) => (
-                        <div key={k} className="cfg-kv-row" style={{ paddingLeft: r.depth * 16 }}>
-                          <span className="cfg-kv-key">{r.key}</span>
-                          <span className="cfg-kv-val">{r.value}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </td>
+          {rows.map((r, i) => {
+            const e = r.node;
+            const pano = r.origin === "pre" || r.origin === "post";
+            return (
+              <Fragment key={(e.attrs?.name ?? "") + "_" + i}>
+                <tr
+                  className={
+                    (expandable ? "cfg-row-clickable" : "") + (pano ? " cfg-row-pano" : "")
+                  }
+                  onClick={expandable ? () => setExpanded(expanded === i ? null : i) : undefined}
+                >
+                  {showOrigin && (
+                    <td>
+                      {r.origin && (
+                        <span className={"cfg-origin cfg-origin-" + r.origin}>{ORIGIN_LABEL[r.origin]}</span>
+                      )}
+                    </td>
+                  )}
+                  <td className="cfg-name">{e.attrs?.name ?? "—"}</td>
+                  {columns.map((c) => (
+                    <td key={c.header}>{c.get(e, root) || "—"}</td>
+                  ))}
                 </tr>
-              )}
-            </Fragment>
-          ))}
+                {expandable && expanded === i && (
+                  <tr>
+                    <td colSpan={span} className="cfg-expand-cell">
+                      <div className="cfg-kv">
+                        {flattenKv(e).map((kv, k) => (
+                          <div key={k} className="cfg-kv-row" style={{ paddingLeft: kv.depth * 16 }}>
+                            <span className="cfg-kv-key">{kv.key}</span>
+                            <span className="cfg-kv-val">{kv.value}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            );
+          })}
         </tbody>
       </table>
     </div>

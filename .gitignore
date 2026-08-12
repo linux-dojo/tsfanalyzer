@@ -20,6 +20,8 @@ uploads/
 .idea/
 .DS_Store
 Thumbs.db
+# stale handles left behind by editing files on a mounted/FUSE filesystem
+.fuse_hidden*
 
 # local go test/vet capture
 test_output.txt

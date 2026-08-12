@@ -36,6 +36,7 @@ func NewServer(st store.Store, uploadDir string) *Server {
 	s.mux.HandleFunc("GET /api/v1/files/{id}/archive", s.handleArchive)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/config", s.handleConfig)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/anomalies", s.handleAnomalies)
+	s.mux.HandleFunc("GET /api/v1/files/{id}/memory", s.handleMemory)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/content", s.handleContent)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/search", s.handleSearch)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/counters", s.handleCounters)
@@ -155,12 +156,14 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 	}
 
 	// pass 3: counter time series from dp-monitor / mp-monitor logs
+	var samples []parser.CounterSample
 	if status == "parsed" {
 		f3, err := os.Open(rec.StoragePath)
 		if err == nil {
-			if samples, cerr := parser.CollectAllCounters(f3); cerr == nil && len(samples) > 0 {
-				_ = s.store.SaveCounters(rec.ID, samples)
-				log.Printf("parse %s: collected %d counter samples", rec.ID, len(samples))
+			if got, cerr := parser.CollectAllCounters(f3); cerr == nil && len(got) > 0 {
+				samples = got
+				_ = s.store.SaveCounters(rec.ID, got)
+				log.Printf("parse %s: collected %d counter samples", rec.ID, len(got))
 			} else if cerr != nil {
 				log.Printf("parse %s: counters: %v", rec.ID, cerr)
 			}
@@ -172,9 +175,10 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 	if status == "parsed" {
 		f4, err := os.Open(rec.StoragePath)
 		if err == nil {
-			if cfg, cerr := parser.ExtractConfig(f4); cerr == nil {
-				_ = s.store.SaveConfig(rec.ID, cfg)
-				log.Printf("parse %s: config extracted (root <%s>, %d top-level children)", rec.ID, cfg.Tag, len(cfg.Children))
+			if doc, cerr := parser.ExtractConfig(f4); cerr == nil {
+				_ = s.store.SaveConfig(rec.ID, doc)
+				log.Printf("parse %s: config from %s (%d bytes, panorama=%v, %d candidates)",
+					rec.ID, doc.Path, doc.Size, doc.PanoramaManaged, len(doc.Candidates))
 			} else {
 				log.Printf("parse %s: config: %v", rec.ID, cerr)
 			}
@@ -182,17 +186,52 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 		}
 	}
 
-	// pass 5: system log anomalies (best-effort — powers the Graphs > Anomalies tab)
+	// pass 5: anomalies — recurring system-log events plus counter threshold
+	// breaches and trends, merged into one list (best-effort)
 	if status == "parsed" {
+		var groups []parser.AnomalyGroup
 		f5, err := os.Open(rec.StoragePath)
 		if err == nil {
-			if groups, aerr := parser.ExtractAnomalies(f5); aerr == nil {
-				_ = s.store.SaveAnomalies(rec.ID, groups)
-				log.Printf("parse %s: %d recurring anomaly groups extracted", rec.ID, len(groups))
+			if logGroups, aerr := parser.ExtractAnomalies(f5); aerr == nil {
+				groups = append(groups, logGroups...)
 			} else {
-				log.Printf("parse %s: anomalies: %v", rec.ID, aerr)
+				log.Printf("parse %s: log anomalies: %v", rec.ID, aerr)
 			}
 			f5.Close()
+		}
+		fromCounters := parser.CounterAnomalies(samples)
+		groups = append(groups, fromCounters...)
+		groups = parser.SortAnomalies(groups)
+		if len(groups) > 0 {
+			_ = s.store.SaveAnomalies(rec.ID, groups)
+		} else {
+			// still store the empty result so the tab reports "none found"
+			// rather than a 404
+			_ = s.store.SaveAnomalies(rec.ID, []parser.AnomalyGroup{})
+		}
+		log.Printf("parse %s: %d anomaly groups (%d from counters)", rec.ID, len(groups), len(fromCounters))
+	}
+
+	// pass 6: OOM detection + memory-leak attribution (best-effort — powers
+	// the Graphs > Memory / OOM tab). Needs the counters from pass 3 and the
+	// archive index from pass 1, so it runs last.
+	if status == "parsed" {
+		f6, err := os.Open(rec.StoragePath)
+		if err == nil {
+			oom, oerr := parser.FindOOMEvents(f6)
+			f6.Close()
+			if oerr != nil {
+				log.Printf("parse %s: oom scan: %v", rec.ID, oerr)
+			}
+			idx, _ := s.store.ArchiveIndex(rec.ID)
+			rep := store.MemoryReport{
+				MP:     parser.AnalyzeMemory(samples, oom, "mp"),
+				DP:     parser.AnalyzeMemory(samples, oom, "dp"),
+				Config: parser.ConfigSizeRisk(idx, samples, "mp"),
+			}
+			_ = s.store.SaveMemory(rec.ID, rep)
+			log.Printf("parse %s: memory analysis (%d OOM events, %d mp suspects)",
+				rec.ID, len(oom), len(rep.MP.Suspects))
 		}
 	}
 
@@ -307,8 +346,10 @@ func (s *Server) handleCounterData(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "missing ?names= parameter (| separated)")
 		return
 	}
-	if len(clean) > 12 {
-		httpError(w, http.StatusBadRequest, "at most 12 counters per request")
+	// generous: the UI no longer caps how many counters may be plotted, and
+	// batches its requests, so this only guards against absurd URLs
+	if len(clean) > 200 {
+		httpError(w, http.StatusBadRequest, "at most 200 counters per request")
 		return
 	}
 	from, okF := parseTimeParam(r.URL.Query().Get("from"))
@@ -370,6 +411,16 @@ func (s *Server) handleAnomalies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"file_id": id, "anomalies": groups})
+}
+
+func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	rep, err := s.store.MemoryFor(id)
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "no memory analysis for this file")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"file_id": id, "memory": rep})
 }
 
 func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {

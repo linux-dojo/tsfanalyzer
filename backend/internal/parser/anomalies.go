@@ -272,15 +272,24 @@ func GroupAnomalies(events []AnomalyEvent) []AnomalyGroup {
 	for _, label := range order {
 		g := groups[label]
 		sort.Slice(g.Occurrences, func(i, j int) bool { return g.Occurrences[i].Ts.Before(g.Occurrences[j].Ts) })
+		if g.Occurrences == nil {
+			g.Occurrences = []AnomalyOccurrence{} // nil marshals as JSON null; the UI indexes this
+		}
 		out = append(out, *g)
 	}
-	// severity first (critical → info), then most frequent within a band
-	sort.SliceStable(out, func(i, j int) bool {
-		si, sj := severityRank(out[i].Severity), severityRank(out[j].Severity)
+	return SortAnomalies(out)
+}
+
+// SortAnomalies orders groups severity first (critical → info), then most
+// frequent within a severity band. Shared so log-derived and counter-derived
+// anomalies interleave consistently once merged.
+func SortAnomalies(groups []AnomalyGroup) []AnomalyGroup {
+	sort.SliceStable(groups, func(i, j int) bool {
+		si, sj := severityRank(groups[i].Severity), severityRank(groups[j].Severity)
 		if si != sj {
 			return si > sj
 		}
-		return out[i].Count > out[j].Count
+		return groups[i].Count > groups[j].Count
 	})
-	return out
+	return groups
 }
