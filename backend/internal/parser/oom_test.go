@@ -58,33 +58,39 @@ func TestFindOOMEventsNoneFound(t *testing.T) {
 	}
 }
 
-// helper: build a linear series of samples
-func mkSeries(name string, startVal, endVal float64, from time.Time, days int) []CounterSample {
-	var out []CounterSample
+// helper: build a linear series and add it to a Series map
+func addSeries(m Series, name string, startVal, endVal float64, from time.Time, days int) Series {
+	if m == nil {
+		m = Series{}
+	}
 	for i := 0; i <= days; i++ {
 		frac := float64(i) / float64(days)
-		out = append(out, CounterSample{
-			Name:  name,
+		m[name] = append(m[name], Point{
 			Ts:    from.AddDate(0, 0, i),
 			Value: startVal + (endVal-startVal)*frac,
 		})
 	}
-	return out
+	return m
+}
+
+// single-series convenience
+func mkSeries(name string, startVal, endVal float64, from time.Time, days int) Series {
+	return addSeries(Series{}, name, startVal, endVal, from, days)
 }
 
 // The documented user-space workflow: available memory falls, and one
 // process's Res+Swap growth accounts for it.
 func TestAnalyzeMemoryUserspaceLeak(t *testing.T) {
 	from := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
-	var s []CounterSample
+	s := Series{}
 	// available memory drops 10 GB across 30 days (kB)
-	s = append(s, mkSeries("mp__memorydetail__memavailable", 12*1024*1024, 2*1024*1024, from, 30)...)
+	addSeries(s, "mp__memorydetail__memavailable", 12*1024*1024, 2*1024*1024, from, 30)
 	// logd grows 5 GB — the biggest contributor
-	s = append(s, mkSeries("mp__processes__logd_1001_res_swap", 200_000, 5*1024*1024+200_000, from, 30)...)
+	addSeries(s, "mp__processes__logd_1001_res_swap", 200_000, 5*1024*1024+200_000, from, 30)
 	// useridd grows 2 GB
-	s = append(s, mkSeries("mp__processes__useridd_1002_res_swap", 100_000, 2*1024*1024+100_000, from, 30)...)
+	addSeries(s, "mp__processes__useridd_1002_res_swap", 100_000, 2*1024*1024+100_000, from, 30)
 	// a big but flat process must NOT be flagged: high usage alone isn't a leak
-	s = append(s, mkSeries("mp__processes__pan_task_1003_res_swap", 6*1024*1024, 6*1024*1024, from, 30)...)
+	addSeries(s, "mp__processes__pan_task_1003_res_swap", 6*1024*1024, 6*1024*1024, from, 30)
 
 	a := AnalyzeMemory(s, nil, "mp")
 
@@ -122,15 +128,15 @@ func TestAnalyzeMemoryUserspaceLeak(t *testing.T) {
 // unreclaimable slab / a slab cache does.
 func TestAnalyzeMemoryKernelLeak(t *testing.T) {
 	from := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
-	var s []CounterSample
+	s := Series{}
 	// 6 GB decline over 40 days
-	s = append(s, mkSeries("mp__memorydetail__memavailable", 8*1024*1024, 2*1024*1024, from, 40)...)
+	addSeries(s, "mp__memorydetail__memavailable", 8*1024*1024, 2*1024*1024, from, 40)
 	// no process grows more than ~200 MB
-	s = append(s, mkSeries("mp__processes__configd_1001_res_swap", 300_000, 500_000, from, 40)...)
-	s = append(s, mkSeries("mp__processes__devsrvr_1002_res_swap", 200_000, 300_000, from, 40)...)
+	addSeries(s, "mp__processes__configd_1001_res_swap", 300_000, 500_000, from, 40)
+	addSeries(s, "mp__processes__devsrvr_1002_res_swap", 200_000, 300_000, from, 40)
 	// unreclaimable slab grows ~5.5 GB, and kmalloc-96 accounts for it
-	s = append(s, mkSeries("mp__memorydetail__sunreclaim", 500_000, 500_000+5.5*1024*1024, from, 40)...)
-	s = append(s, mkSeries("mp__slabinfo__kmalloc_96_totalactsize", 100*1024*1024, 5*1024*1024*1024, from, 40)...)
+	addSeries(s, "mp__memorydetail__sunreclaim", 500_000, 500_000+5.5*1024*1024, from, 40)
+	addSeries(s, "mp__slabinfo__kmalloc_96_totalactsize", 100*1024*1024, 5*1024*1024*1024, from, 40)
 
 	a := AnalyzeMemory(s, nil, "mp")
 
@@ -188,14 +194,14 @@ func TestAnalyzeMemoryTopAvailUnitConversion(t *testing.T) {
 // as duplicate instances.
 func TestAnalyzeMemoryConcurrentDuplicatesOnly(t *testing.T) {
 	from := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
-	var s []CounterSample
-	s = append(s, mkSeries("mp__memorydetail__memavailable", 4*1024*1024, 3*1024*1024, from, 5)...)
+	s := Series{}
+	addSeries(s, "mp__memorydetail__memavailable", 4*1024*1024, 3*1024*1024, from, 5)
 	// two pan_comm PIDs sampled at the same timestamps: concurrent
-	s = append(s, mkSeries("mp__processes__pan_comm_2001_res_swap", 100_000, 120_000, from, 5)...)
-	s = append(s, mkSeries("mp__processes__pan_comm_2002_res_swap", 100_000, 120_000, from, 5)...)
+	addSeries(s, "mp__processes__pan_comm_2001_res_swap", 100_000, 120_000, from, 5)
+	addSeries(s, "mp__processes__pan_comm_2002_res_swap", 100_000, 120_000, from, 5)
 	// useridd hands over from one PID to the next: a restart, not a duplicate
-	s = append(s, mkSeries("mp__processes__useridd_3001_res_swap", 400_000, 900_000, from, 5)...)
-	s = append(s, mkSeries("mp__processes__useridd_3002_res_swap", 500_000, 520_000, from.AddDate(0, 0, 6), 5)...)
+	addSeries(s, "mp__processes__useridd_3001_res_swap", 400_000, 900_000, from, 5)
+	addSeries(s, "mp__processes__useridd_3002_res_swap", 500_000, 520_000, from.AddDate(0, 0, 6), 5)
 
 	a := AnalyzeMemory(s, nil, "mp")
 	has := func(n string) bool {
@@ -221,14 +227,14 @@ func TestAnalyzeMemoryConcurrentDuplicatesOnly(t *testing.T) {
 func TestAnalyzeMemoryRestartReclaimIsTheEvidence(t *testing.T) {
 	from := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	const mb = 1024.0
-	var s []CounterSample
-	s = append(s, mkSeries("mp__memorydetail__memavailable", 6*1024*1024, 4*1024*1024, from, 30)...)
+	s := Series{}
+	addSeries(s, "mp__memorydetail__memavailable", 6*1024*1024, 4*1024*1024, from, 30)
 	// pid 11889: climbs 400 MB -> 1.4 GB over 20 days
-	s = append(s, mkSeries("mp__processes__useridd_11889_res_swap", 400*mb, 1400*mb, from, 20)...)
+	addSeries(s, "mp__processes__useridd_11889_res_swap", 400*mb, 1400*mb, from, 20)
 	// pid 23011: settles at ~700 MB and stays there
-	s = append(s, mkSeries("mp__processes__useridd_23011_res_swap", 700*mb, 715*mb, from.AddDate(0, 0, 21), 9)...)
+	addSeries(s, "mp__processes__useridd_23011_res_swap", 700*mb, 715*mb, from.AddDate(0, 0, 21), 9)
 	// a legitimately large but flat daemon must not outrank it
-	s = append(s, mkSeries("mp__processes__pan_task_900_res_swap", 1200*mb, 1200*mb, from, 30)...)
+	addSeries(s, "mp__processes__pan_task_900_res_swap", 1200*mb, 1200*mb, from, 30)
 
 	a := AnalyzeMemory(s, nil, "mp")
 	if len(a.Suspects) == 0 {
@@ -299,7 +305,7 @@ func TestAnalyzeMemoryFindingsMentionOOMCaveat(t *testing.T) {
 func TestAnalyzeMemoryNeverMarshalsNullSlices(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
-		samples []CounterSample
+		samples Series
 		oom     []OOMEvent
 	}{
 		{"completely empty", nil, nil},

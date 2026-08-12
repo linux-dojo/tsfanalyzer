@@ -72,18 +72,14 @@ tcp6       3      0 :::28769                :::*                    LISTEN      
 tcp        0      0 127.0.0.1:42660         127.0.0.1:28888         ESTABLISHED -
 `
 
-func collectFromString(t *testing.T, content, plane string) map[string][]CounterSample {
+func collectFromString(t *testing.T, content, plane string) Series {
 	t.Helper()
 	tgz := buildMultiTgz(t, map[string]string{"var/log/pan/" + plane + "-monitor.log": content})
 	samples, err := CollectAllCounters(bytes.NewReader(tgz))
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := map[string][]CounterSample{}
-	for _, s := range samples {
-		got[s.Name] = append(got[s.Name], s)
-	}
-	return got
+	return samples
 }
 
 func TestGlobalCountersKeepLongElapsedOnly(t *testing.T) {
@@ -339,7 +335,7 @@ Mount            Used (%)   Used (kB)
 :fptcp_seg                25000     0         0         0         25        3802        0           0           3795        16 (24)
 `
 
-func wantValues(t *testing.T, got map[string][]CounterSample, want map[string]float64) {
+func wantValues(t *testing.T, got Series, want map[string]float64) {
 	t.Helper()
 	for name, v := range want {
 		ss, ok := got[name]
@@ -618,7 +614,7 @@ Totals                         6     133        211250024    6649272            
 :used wqe 50 total wqe 25206 0% used
 `
 
-func approx(t *testing.T, got map[string][]CounterSample, name string, want float64) {
+func approx(t *testing.T, got Series, name string, want float64) {
 	t.Helper()
 	v, ok := got[name]
 	if !ok {

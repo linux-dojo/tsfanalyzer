@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"pan-ts-analyzer/internal/parser"
@@ -24,10 +25,27 @@ type Server struct {
 	store     store.Store
 	uploadDir string
 	mux       *http.ServeMux
+
+	// Parsing one archive peaks at hundreds of megabytes, so archives are
+	// parsed one at a time. Uploading several at once previously multiplied
+	// that peak and got the container OOM-killed.
+	parseSlot chan struct{}
+
+	// Config trees are rebuilt per request rather than retained (see
+	// parser.ConfigDoc); this caches the most recent one so clicking around
+	// the Config tab doesn't re-parse tens of megabytes each time.
+	cfgMu    sync.Mutex
+	cfgID    string
+	cfgTree  *parser.ConfigNode
 }
 
 func NewServer(st store.Store, uploadDir string) *Server {
-	s := &Server{store: st, uploadDir: uploadDir, mux: http.NewServeMux()}
+	s := &Server{
+		store:     st,
+		uploadDir: uploadDir,
+		mux:       http.NewServeMux(),
+		parseSlot: make(chan struct{}, 1),
+	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("POST /api/v1/files", s.handleUpload)
 	s.mux.HandleFunc("GET /api/v1/files", s.handleList)
@@ -117,6 +135,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 // The archive index is mandatory; system info is best-effort (some archives
 // may lack a CLI dump, the file is still browsable).
 func (s *Server) parseArchive(rec store.TechSupportFile) string {
+	// one archive at a time: peak memory is per-parse, not per-request
+	s.parseSlot <- struct{}{}
+	defer func() { <-s.parseSlot }()
+
 	status := "parsed"
 	errMsg := ""
 
@@ -156,7 +178,7 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 	}
 
 	// pass 3: counter time series from dp-monitor / mp-monitor logs
-	var samples []parser.CounterSample
+	var samples parser.Series
 	if status == "parsed" {
 		f3, err := os.Open(rec.StoragePath)
 		if err == nil {
@@ -395,12 +417,51 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	cfg, err := s.store.Config(id)
+	doc, err := s.store.Config(id)
 	if errors.Is(err, store.ErrNotFound) {
 		httpError(w, http.StatusNotFound, "no config extracted for this file")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"file_id": id, "config": cfg})
+	rec, rerr := s.store.Get(id)
+	if rerr != nil {
+		httpError(w, http.StatusNotFound, "file not found")
+		return
+	}
+
+	tree, terr := s.configTree(id, rec.StoragePath, doc.Path)
+	if terr != nil {
+		log.Printf("config %s: parse %s: %v", id, doc.Path, terr)
+		httpError(w, http.StatusInternalServerError, "could not parse "+doc.Path)
+		return
+	}
+
+	// copy the metadata and attach the freshly parsed tree for this response
+	out := *doc
+	out.Root = tree
+	writeJSON(w, http.StatusOK, map[string]any{"file_id": id, "config": out})
+}
+
+// configTree parses the config for a file, caching the most recent one. The
+// tree is not kept in the store: one Panorama merged config per uploaded file
+// was enough to exhaust the container.
+func (s *Server) configTree(id, storagePath, cfgPath string) (*parser.ConfigNode, error) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	if s.cfgID == id && s.cfgTree != nil {
+		return s.cfgTree, nil
+	}
+	f, err := os.Open(storagePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	tree, err := parser.ParseConfigTree(f, cfgPath)
+	if err != nil {
+		return nil, err
+	}
+	// hold only one at a time
+	s.cfgID, s.cfgTree = id, tree
+	return tree, nil
 }
 
 func (s *Server) handleAnomalies(w http.ResponseWriter, r *http.Request) {

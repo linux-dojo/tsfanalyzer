@@ -6,12 +6,15 @@ import (
 	"time"
 )
 
-func atTime(name string, base time.Time, vals ...float64) []CounterSample {
-	out := make([]CounterSample, 0, len(vals))
+func atTime(name string, base time.Time, vals ...float64) Series {
+	return addAt(Series{}, name, base, vals...)
+}
+
+func addAt(m Series, name string, base time.Time, vals ...float64) Series {
 	for i, v := range vals {
-		out = append(out, CounterSample{Name: name, Ts: base.Add(time.Duration(i) * time.Minute), Value: v})
+		m[name] = append(m[name], Point{Ts: base.Add(time.Duration(i) * time.Minute), Value: v})
 	}
-	return out
+	return m
 }
 
 func groupsByLabel(g []AnomalyGroup) map[string]AnomalyGroup {
@@ -56,11 +59,11 @@ func TestCounterAnomaliesLoadAverageBands(t *testing.T) {
 
 func TestCounterAnomaliesLoadWindowsAreSeparate(t *testing.T) {
 	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
-	var s []CounterSample
-	s = append(s, atTime("mp__cpu_load_avg__i_1", base, 6.0)...)
-	s = append(s, atTime("mp__cpu_load_avg__i_5", base, 6.0)...)
-	s = append(s, atTime("mp__cpu_load_avg__i_15", base, 3.0)...)
-	s = append(s, atTime("dp__cpu_load_avg__i_1", base, 6.0)...)
+	s := Series{}
+	addAt(s, "mp__cpu_load_avg__i_1", base, 6.0)
+	addAt(s, "mp__cpu_load_avg__i_5", base, 6.0)
+	addAt(s, "mp__cpu_load_avg__i_15", base, 3.0)
+	addAt(s, "dp__cpu_load_avg__i_1", base, 6.0)
 	got := groupsByLabel(CounterAnomalies(s))
 	for _, want := range []string{
 		"mp cpu 1 min load above 5",
@@ -94,12 +97,12 @@ func TestCounterAnomaliesIowaitBands(t *testing.T) {
 
 func TestCounterAnomaliesPlaneCPU(t *testing.T) {
 	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
-	var s []CounterSample
-	s = append(s, atTime("dp__cpu__last_3m_avg_pct", base, 40, 92)...)
-	s = append(s, atTime("dp__cpu__last_3m_max_pct", base, 70, 99)...)
+	s := Series{}
+	addAt(s, "dp__cpu__last_3m_avg_pct", base, 40, 92)
+	addAt(s, "dp__cpu__last_3m_max_pct", base, 70, 99)
 	// per-core entries collapse into one group per plane+kind
-	s = append(s, atTime("dp__cpu__03_max", base, 85)...)
-	s = append(s, atTime("dp__cpu__07_max", base, 91)...)
+	addAt(s, "dp__cpu__03_max", base, 85)
+	addAt(s, "dp__cpu__07_max", base, 91)
 	got := groupsByLabel(CounterAnomalies(s))
 
 	if g, ok := got["dp cpu avg above 80%"]; !ok || g.Severity != "critical" || g.Count != 1 {
@@ -131,9 +134,9 @@ func TestCounterAnomaliesPlaneCPU(t *testing.T) {
 
 func TestCounterAnomaliesProcessCPU(t *testing.T) {
 	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
-	var s []CounterSample
-	s = append(s, atTime("mp__processes__useridd_11889_cpu", base, 12, 91, 96)...)
-	s = append(s, atTime("mp__processes__logd_1001_cpu", base, 10, 20)...) // below threshold
+	s := Series{}
+	addAt(s, "mp__processes__useridd_11889_cpu", base, 12, 91, 96)
+	addAt(s, "mp__processes__logd_1001_cpu", base, 10, 20) // below threshold
 	got := groupsByLabel(CounterAnomalies(s))
 
 	g, ok := got["mp process useridd cpu above 85%"]
@@ -159,7 +162,14 @@ func TestCounterAnomaliesGrowingSocketQueue(t *testing.T) {
 	rising := atTime("mp__netstat_detail__tcp_mgmtsrvr_recv_q", base, 0, 0, 500, 2000, 8000, 20000, 60000)
 	// a transient spike that drains: must NOT be flagged
 	spike := atTime("mp__netstat_detail__tcp_sslmgr_send_q", base, 0, 0, 9000, 0, 0, 0, 0)
-	got := groupsByLabel(CounterAnomalies(append(rising, spike...)))
+	both := Series{}
+	for k, v := range rising {
+		both[k] = v
+	}
+	for k, v := range spike {
+		both[k] = v
+	}
+	got := groupsByLabel(CounterAnomalies(both))
 
 	g, ok := got["mp netstat tcp_mgmtsrvr recv_q increasing"]
 	if !ok {
@@ -188,10 +198,10 @@ func TestCounterAnomaliesQueueNeedsEnoughSamples(t *testing.T) {
 
 func TestCounterAnomaliesSortedBySeverityThenCount(t *testing.T) {
 	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
-	var s []CounterSample
-	s = append(s, atTime("mp__processes__x_1_cpu", base, 90)...)               // high
-	s = append(s, atTime("mp__cpu_load_avg__i_1", base, 6, 6, 6)...)          // critical, 3
-	s = append(s, atTime("mp__cpu_load_avg__i_5", base, 6)...)                // critical, 1
+	s := Series{}
+	addAt(s, "mp__processes__x_1_cpu", base, 90)               // high
+	addAt(s, "mp__cpu_load_avg__i_1", base, 6, 6, 6)          // critical, 3
+	addAt(s, "mp__cpu_load_avg__i_5", base, 6)                // critical, 1
 	out := CounterAnomalies(s)
 	if len(out) < 3 {
 		t.Fatalf("want 3 groups, got %d", len(out))

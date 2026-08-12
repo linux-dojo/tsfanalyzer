@@ -124,8 +124,8 @@ func fmtVal(v float64) string {
 }
 
 // applyBands attributes each breaching sample to its highest matching band.
-func applyBands(a *anomAccum, pts []CounterSample, bands []band, subtype string,
-	labelFor func(b band) string, descFor func(b band, p CounterSample) string) {
+func applyBands(a *anomAccum, pts []Point, bands []band, subtype string,
+	labelFor func(b band) string, descFor func(b band, p Point) string) {
 	for _, p := range pts {
 		for _, b := range bands {
 			if p.Value > b.level {
@@ -138,8 +138,7 @@ func applyBands(a *anomAccum, pts []CounterSample, bands []band, subtype string,
 
 // CounterAnomalies turns threshold breaches and growing socket queues in the
 // counter series into AnomalyGroups.
-func CounterAnomalies(samples []CounterSample) []AnomalyGroup {
-	byName := bySeries(samples)
+func CounterAnomalies(byName Series) []AnomalyGroup {
 	a := newAnomAccum()
 
 	for name, pts := range byName {
@@ -149,7 +148,7 @@ func CounterAnomalies(samples []CounterSample) []AnomalyGroup {
 			plane, window := m[1], m[2]
 			applyBands(a, pts, loadBands, "cpu",
 				func(b band) string { return plane + " cpu " + window + " min load " + b.suffix },
-				func(b band, p CounterSample) string {
+				func(b band, p Point) string {
 					return plane + " " + window + "-minute load average " + fmtVal(p.Value) +
 						" (threshold " + fmtVal(b.level) + ") — " + name
 				})
@@ -159,7 +158,7 @@ func CounterAnomalies(samples []CounterSample) []AnomalyGroup {
 			plane := m[1]
 			applyBands(a, pts, iowaitBands, "cpu",
 				func(b band) string { return plane + " cpu iowait " + b.suffix },
-				func(b band, p CounterSample) string {
+				func(b band, p Point) string {
 					return plane + " iowait " + fmtVal(p.Value) + "% (threshold " + fmtVal(b.level) + "%) — " + name
 				})
 
@@ -168,7 +167,7 @@ func CounterAnomalies(samples []CounterSample) []AnomalyGroup {
 			plane, kind := m[1], m[2]
 			applyBands(a, pts, cpuBands, "cpu",
 				func(b band) string { return plane + " cpu " + kind + " " + b.suffix },
-				func(b band, p CounterSample) string {
+				func(b band, p Point) string {
 					return plane + " CPU " + kind + " " + fmtVal(p.Value) + "% — " + name
 				})
 
@@ -180,7 +179,7 @@ func CounterAnomalies(samples []CounterSample) []AnomalyGroup {
 			// the occurrence instead
 			applyBands(a, pts, cpuBands, "cpu",
 				func(b band) string { return plane + " cpu core " + kind + " " + b.suffix },
-				func(b band, p CounterSample) string {
+				func(b band, p Point) string {
 					return plane + " core " + core + " " + kind + " " + fmtVal(p.Value) + "% — " + name
 				})
 
@@ -193,7 +192,7 @@ func CounterAnomalies(samples []CounterSample) []AnomalyGroup {
 			plane, proc, pid := m[1], m[2], m[3]
 			applyBands(a, pts, procCPUBands, "process",
 				func(b band) string { return plane + " process " + proc + " cpu " + b.suffix },
-				func(b band, p CounterSample) string {
+				func(b band, p Point) string {
 					return proc + " (pid " + pid + ") cpu " + fmtVal(p.Value) + "% — " + name
 				})
 
@@ -221,13 +220,13 @@ func CounterAnomalies(samples []CounterSample) []AnomalyGroup {
 
 type queueTrend struct {
 	first, last float64
-	rising      []CounterSample
+	rising      []Point
 }
 
 // growingQueue reports a socket queue that trends upward and ends non-empty.
 // Comparing the median of the first third against the last third avoids
 // firing on a single transient spike, which queues do routinely.
-func growingQueue(pts []CounterSample) *queueTrend {
+func growingQueue(pts []Point) *queueTrend {
 	if len(pts) < queueMinSamples {
 		return nil
 	}
@@ -250,7 +249,7 @@ func growingQueue(pts []CounterSample) *queueTrend {
 	}
 	// keep the samples that are above the starting level: those are the
 	// points worth plotting
-	var rising []CounterSample
+	var rising []Point
 	for _, p := range pts {
 		if p.Value > f {
 			rising = append(rising, p)

@@ -111,8 +111,10 @@ func TestExtractConfigPrefersLargestUnderMgmtDir(t *testing.T) {
 	if doc.Path != "opt/pancfg/mgmt/mergesp.xml" {
 		t.Fatalf("picked %q, want the largest XML under opt/pancfg/mgmt", doc.Path)
 	}
-	if doc.Root == nil || doc.Root.Tag != "config" {
-		t.Fatalf("root = %+v", doc.Root)
+	// the tree is parsed on demand, not retained on the doc
+	root, perr := ParseConfigTree(bytes.NewReader(tgz), doc.Path)
+	if perr != nil || root == nil || root.Tag != "config" {
+		t.Fatalf("on-demand parse: root=%+v err=%v", root, perr)
 	}
 	// the pick must be recorded, and other candidates reported
 	var picked int
@@ -201,8 +203,9 @@ func TestExtractConfigFallbackOutsideMgmtDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if doc.Root == nil || doc.Root.Tag != "config" {
-		t.Fatalf("config outside the mgmt dir should still be found: %+v", doc)
+	root, perr := ParseConfigTree(bytes.NewReader(tgz), doc.Path)
+	if perr != nil || root == nil || root.Tag != "config" {
+		t.Fatalf("config outside the mgmt dir should still be found: %+v (err %v)", doc, perr)
 	}
 }
 
@@ -248,7 +251,10 @@ func TestExtractConfigTreeShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := doc.Root
+	cfg, perr := ParseConfigTree(bytes.NewReader(tgz), doc.Path)
+	if perr != nil {
+		t.Fatal(perr)
+	}
 	if cfg.Attrs["version"] != "10.2.0" {
 		t.Fatalf("root attrs = %+v", cfg.Attrs)
 	}
@@ -259,6 +265,26 @@ func TestExtractConfigTreeShape(t *testing.T) {
 	}
 	if ip := findChild(addr.Children[0], "ip-netmask"); ip == nil || ip.Text != "10.1.1.5/32" {
 		t.Fatalf("ip-netmask = %+v", ip)
+	}
+}
+
+// Regression: retaining the parsed tree per uploaded file is what exhausted
+// the API container on a third archive. Extraction must return metadata only.
+func TestExtractConfigDoesNotRetainTree(t *testing.T) {
+	tgz := buildMultiTgz(t, map[string]string{"opt/pancfg/mgmt/mergesp.xml": samplePanoramaConfigXML})
+	doc, err := ExtractConfig(bytes.NewReader(tgz))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.Root != nil {
+		t.Error("ExtractConfig must not hold the parsed tree; it is rebuilt per request")
+	}
+	if doc.Path == "" {
+		t.Error("the path is needed to parse on demand")
+	}
+	// and Panorama detection must still work without a tree
+	if !doc.PanoramaManaged {
+		t.Errorf("panorama detection should work from raw bytes: %v", doc.Markers)
 	}
 }
 

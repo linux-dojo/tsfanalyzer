@@ -6,17 +6,33 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
 // CounterSample is one measurement of one counter at one point in time.
+// Used while streaming a log and by tests; stored data uses Series below.
 type CounterSample struct {
 	Name  string    `json:"name"`
 	Ts    time.Time `json:"ts"`
 	Value float64   `json:"value"`
 }
+
+// Point is one sample of an already-identified counter.
+//
+// The name is deliberately absent: it is the map key in Series. Carrying it
+// per sample meant a large archive held millions of copies of ~30k distinct
+// strings, which was enough on its own to exhaust the API container.
+type Point struct {
+	Ts    time.Time `json:"ts"`
+	Value float64   `json:"value"`
+}
+
+// Series is every counter in an archive, keyed by name. Each name exists
+// exactly once (as the map key) and each slice is sorted oldest-first.
+type Series map[string][]Point
 
 // Global-counter sections with a shorter elapsed time are incremental deltas
 // printed between full samples; they would throw the series off, so only
@@ -27,12 +43,14 @@ var monitorFileRe = regexp.MustCompile(`(?:^|/)(dp|mp)-monitor\.log(?:\.\d+)?$`)
 
 // CollectAllCounters makes a single pass over the archive and extracts
 // counter time series from every dp-monitor.log* and mp-monitor.log* file.
-func CollectAllCounters(r io.ReadSeeker) ([]CounterSample, error) {
+// Samples accumulate straight into a name-keyed map, so a counter name is
+// allocated once no matter how many samples it has.
+func CollectAllCounters(r io.ReadSeeker) (Series, error) {
 	tr, err := openTar(r)
 	if err != nil {
 		return nil, err
 	}
-	var out []CounterSample
+	out := Series{}
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -48,7 +66,13 @@ func CollectAllCounters(r io.ReadSeeker) ([]CounterSample, error) {
 		if m == nil {
 			continue
 		}
-		out = append(out, collectMonitor(tr, m[1])...)
+		collectMonitor(tr, m[1], out)
+	}
+	// rotated logs can be visited out of order, so normalize per series
+	for name := range out {
+		pts := out[name]
+		sort.Slice(pts, func(i, j int) bool { return pts[i].Ts.Before(pts[j].Ts) })
+		out[name] = pts
 	}
 	return out, nil
 }
@@ -193,18 +217,17 @@ type counterCollector struct {
 
 	powThread int // vmpow: current thread context (for io lines)
 
-	out []CounterSample
+	out Series
 }
 
-func collectMonitor(r io.Reader, plane string) []CounterSample {
+func collectMonitor(r io.Reader, plane string, out Series) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	c := &counterCollector{plane: plane}
+	c := &counterCollector{plane: plane, out: out}
 	for sc.Scan() {
 		c.line(strings.TrimRight(sc.Text(), "\r"))
 	}
 	c.flushNetstat()
-	return c.out
 }
 
 func (c *counterCollector) flushNetstat() {
@@ -218,7 +241,9 @@ func (c *counterCollector) emitAt(ts time.Time, name string, v float64) {
 	if !c.haveTs {
 		return
 	}
-	c.out = append(c.out, CounterSample{Name: name, Ts: ts, Value: v})
+	// appending under the map key means the freshly concatenated name string
+	// is retained once (as the key) and the rest becomes garbage
+	c.out[name] = append(c.out[name], Point{Ts: ts, Value: v})
 }
 
 func (c *counterCollector) emit(name string, v float64) {

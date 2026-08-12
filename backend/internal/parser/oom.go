@@ -214,22 +214,9 @@ var availCandidates = []struct {
 	{"__top__avail_mem", kbPerMiB},            // --- top, MiB
 }
 
-func bySeries(samples []CounterSample) map[string][]CounterSample {
-	m := make(map[string][]CounterSample, 256)
-	for _, s := range samples {
-		m[s.Name] = append(m[s.Name], s)
-	}
-	for k := range m {
-		v := m[k]
-		sort.Slice(v, func(i, j int) bool { return v[i].Ts.Before(v[j].Ts) })
-		m[k] = v
-	}
-	return m
-}
-
 // pickAvailTrend chooses the best available-memory series for the plane and
 // summarizes its trend.
-func pickAvailTrend(byName map[string][]CounterSample, plane string) *MemTrend {
+func pickAvailTrend(byName Series, plane string) *MemTrend {
 	for _, c := range availCandidates {
 		name := plane + c.suffix
 		pts := byName[name]
@@ -288,7 +275,7 @@ func median(v []float64) float64 {
 // Absolute size is deliberately not the ranking key: several PAN-OS
 // processes are legitimately large. What is ranked is growth, and the
 // memory a restart reclaimed and did not re-acquire.
-func processSuspects(byName map[string][]CounterSample, plane string, dropKB float64) ([]MemSuspect, []string) {
+func processSuspects(byName Series, plane string, dropKB float64) ([]MemSuspect, []string) {
 	type agg struct {
 		pts      []procPoint
 		counters map[string]bool
@@ -430,7 +417,7 @@ func processSuspects(byName map[string][]CounterSample, plane string, dropKB flo
 
 // kernelSuspects looks for kernel-side growth: unreclaimable slab first,
 // then the individual slab caches that make it up.
-func kernelSuspects(byName map[string][]CounterSample, plane string, dropKB float64) []MemSuspect {
+func kernelSuspects(byName Series, plane string, dropKB float64) []MemSuspect {
 	var out []MemSuspect
 
 	add := func(name, label string, toKB float64) {
@@ -481,7 +468,7 @@ const (
 // AnalyzeMemory correlates OOM events, the available-memory trend, per
 // process growth and kernel slab growth into a single verdict. plane is
 // "mp" (management) or "dp" (dataplane).
-func AnalyzeMemory(samples []CounterSample, oom []OOMEvent, plane string) MemoryAnalysis {
+func AnalyzeMemory(byName Series, oom []OOMEvent, plane string) MemoryAnalysis {
 	a := MemoryAnalysis{OOMEvents: oom, Suspects: []MemSuspect{}, KernelSuspects: []MemSuspect{}}
 	if len(oom) > 0 {
 		// OOMs often cascade; the first one in the window is the one worth
@@ -490,7 +477,6 @@ func AnalyzeMemory(samples []CounterSample, oom []OOMEvent, plane string) Memory
 		a.FirstOOM = &first
 	}
 
-	byName := bySeries(samples)
 	a.Trend = pickAvailTrend(byName, plane)
 	dropKB := 0.0
 	if a.Trend != nil {
@@ -700,7 +686,7 @@ const (
 // Report generation and short content-update intervals compound it, but
 // those live in the config rather than the counters, so they're named in
 // the advice instead of tested here.
-func ConfigSizeRisk(entries []ArchiveEntry, samples []CounterSample, plane string) []Finding {
+func ConfigSizeRisk(entries []ArchiveEntry, byName Series, plane string) []Finding {
 	var mergespSize int64 = -1
 	for _, e := range entries {
 		if mergespRe.MatchString(e.Path) {
@@ -711,7 +697,6 @@ func ConfigSizeRisk(entries []ArchiveEntry, samples []CounterSample, plane strin
 	}
 
 	var totalKB float64
-	byName := bySeries(samples)
 	for _, n := range []string{plane + "__memorydetail__memtotal", plane + "__memory__mem_total"} {
 		if pts := byName[n]; len(pts) > 0 {
 			totalKB = pts[0].Value

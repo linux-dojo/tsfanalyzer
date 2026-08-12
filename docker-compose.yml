@@ -3,11 +3,19 @@ services:
     build: ./backend
     command: ["/app/api"]
     env_file: .env
+    environment:
+      # Let Go's GC work against the container limit instead of discovering it
+      # by being killed. Keep this below mem_limit.
+      GOMEMLIMIT: "3GiB"
     ports:
       - "8081:8081"
     volumes:
       - upload-data:/data/uploads
     depends_on: [postgres, redis, minio]
+    # a parse that still runs the container out of memory should come back
+    # rather than leave nginx talking to a dead upstream (502 Bad Gateway)
+    restart: unless-stopped
+    mem_limit: 4g
 
   worker:
     build: ./backend
@@ -50,6 +58,7 @@ services:
     ports:
       - "8080:80"
     depends_on: [api]
+    restart: unless-stopped
 
 volumes:
   pg-data:

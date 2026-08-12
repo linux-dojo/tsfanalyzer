@@ -314,8 +314,10 @@ function parseLookup(q: string): {
   return { matches: (c) => nameTest(c.name) && (pred === null || pred(c)) };
 }
 
+/* The counter name is the key of the series map, so points don't repeat it.
+   Dropping it shrank both the API payload and the server's memory use
+   substantially on archives with tens of thousands of counters. */
 interface CounterPoint {
-  name: string;
   ts: string;
   value: number;
 }
@@ -524,7 +526,6 @@ function transformSeries(pts: CounterPoint[], mode: SeriesMode): CounterPoint[] 
     const dv = pts[i].value - pts[i - 1].value;
     const dt = (Date.parse(pts[i].ts) - Date.parse(pts[i - 1].ts)) / 1000;
     out.push({
-      name: pts[i].name,
       ts: pts[i].ts,
       value: mode === "del" ? dv : dt > 0 ? dv / dt : 0,
     });

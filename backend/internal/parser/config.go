@@ -51,8 +51,14 @@ type ConfigCandidate struct {
 }
 
 // ConfigDoc is the chosen configuration plus where it came from.
+//
+// Root is populated on demand rather than retained after parsing: a
+// Panorama merged config is tens of megabytes of XML, which becomes a very
+// large pointer-heavy tree, and holding one per uploaded file was enough to
+// exhaust the API container. The archive is already on disk, so the tree is
+// rebuilt per request and discarded.
 type ConfigDoc struct {
-	Root *ConfigNode `json:"root"`
+	Root *ConfigNode `json:"root,omitempty"`
 	Path string      `json:"path"`
 	Size int64       `json:"size"`
 	// PanoramaManaged is set when the config carries Panorama fingerprints:
@@ -120,17 +126,11 @@ func ExtractConfig(r io.ReadSeeker) (*ConfigDoc, error) {
 			doc.Candidates = append(doc.Candidates, c)
 			continue
 		}
-		node, perr := parseConfigXML(data)
-		if perr != nil {
-			c.Reason = "parse error: " + perr.Error()
-			doc.Candidates = append(doc.Candidates, c)
-			continue
-		}
-
 		c.Picked = true
 		doc.Candidates = append(doc.Candidates, c)
-		doc.Root, doc.Path, doc.Size = node, c.Path, c.Size
-		doc.Markers = panoramaMarkers(node)
+		doc.Path, doc.Size = c.Path, c.Size
+		// scanned on the raw bytes so no tree has to be built or retained
+		doc.Markers = panoramaMarkersInBytes(data)
 		doc.PanoramaManaged = len(doc.Markers) > 0
 		// record the rest as unattempted, for diagnostics
 		for j := i + 1; j < len(ranked); j++ {
@@ -221,33 +221,27 @@ var panoramaMarkerTags = []string{
 	"pre-rulebase", "post-rulebase", "device-group", "template-stack", "template", "panorama",
 }
 
-// panoramaMarkers reports which Panorama fingerprints the config contains.
-func panoramaMarkers(root *ConfigNode) []string {
-	present := map[string]bool{}
-	var walk func(n *ConfigNode)
-	walk = func(n *ConfigNode) {
-		if n == nil {
-			return
+// panoramaMarkersInBytes reports which Panorama fingerprints appear in the
+// raw config XML. Scanning bytes avoids building a tree just to answer this.
+func panoramaMarkersInBytes(data []byte) []string {
+	var out []string
+	for _, t := range panoramaMarkerTags {
+		if bytes.Contains(data, []byte("<"+t+">")) || bytes.Contains(data, []byte("<"+t+" ")) {
+			out = append(out, t)
 		}
-		for _, t := range panoramaMarkerTags {
-			if n.Tag == t {
-				present[t] = true
-			}
-		}
-		for _, c := range n.Children {
-			walk(c)
-		}
-	}
-	walk(root)
-	if len(present) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(present))
-	for t := range present {
-		out = append(out, t)
 	}
 	sort.Strings(out)
 	return out
+}
+
+// ParseConfigTree reads one config file out of the archive and parses it.
+// Called per request so the tree is transient rather than retained.
+func ParseConfigTree(r io.ReadSeeker, path string) (*ConfigNode, error) {
+	data, err := readEntry(r, path)
+	if err != nil {
+		return nil, err
+	}
+	return parseConfigXML(data)
 }
 
 /* ---------- XML decoding ---------- */

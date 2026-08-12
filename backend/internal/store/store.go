@@ -40,9 +40,9 @@ type Store interface {
 	Anomalies(fileID string) ([]parser.AnomalyGroup, error)
 	SaveMemory(fileID string, m MemoryReport) error
 	MemoryFor(fileID string) (MemoryReport, error)
-	SaveCounters(fileID string, samples []parser.CounterSample) error
+	SaveCounters(fileID string, series parser.Series) error
 	CounterNames(fileID string) ([]CounterMeta, error)
-	CounterSeries(fileID string, names []string, from, to time.Time) (map[string][]parser.CounterSample, error)
+	CounterSeries(fileID string, names []string, from, to time.Time) (map[string][]parser.Point, error)
 }
 
 // MemoryReport is the memory/OOM verdict for a file: one analysis per
@@ -70,7 +70,7 @@ type Memory struct {
 	config    map[string]*parser.ConfigDoc
 	anomalies map[string][]parser.AnomalyGroup
 	memory    map[string]MemoryReport
-	counters  map[string]map[string][]parser.CounterSample
+	counters  map[string]parser.Series
 }
 
 func NewMemory() *Memory {
@@ -81,7 +81,7 @@ func NewMemory() *Memory {
 		config:    make(map[string]*parser.ConfigDoc),
 		anomalies: make(map[string][]parser.AnomalyGroup),
 		memory:    make(map[string]MemoryReport),
-		counters:  make(map[string]map[string][]parser.CounterSample),
+		counters:  make(map[string]parser.Series),
 	}
 }
 
@@ -189,22 +189,16 @@ func (m *Memory) Config(fileID string) (*parser.ConfigDoc, error) {
 	return cfg, nil
 }
 
-func (m *Memory) SaveCounters(fileID string, samples []parser.CounterSample) error {
+// SaveCounters stores the series exactly as the parser produced it: already
+// name-keyed and sorted. Regrouping it here used to hold a second full copy
+// of every sample, which on a large archive was hundreds of megabytes.
+func (m *Memory) SaveCounters(fileID string, series parser.Series) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.files[fileID]; !ok {
 		return ErrNotFound
 	}
-	byName := make(map[string][]parser.CounterSample)
-	for _, s := range samples {
-		byName[s.Name] = append(byName[s.Name], s)
-	}
-	for name := range byName {
-		ss := byName[name]
-		sort.Slice(ss, func(i, j int) bool { return ss[i].Ts.Before(ss[j].Ts) })
-		byName[name] = ss
-	}
-	m.counters[fileID] = byName
+	m.counters[fileID] = series
 	return nil
 }
 
@@ -232,16 +226,16 @@ func (m *Memory) CounterNames(fileID string) ([]CounterMeta, error) {
 	return out, nil
 }
 
-func (m *Memory) CounterSeries(fileID string, names []string, from, to time.Time) (map[string][]parser.CounterSample, error) {
+func (m *Memory) CounterSeries(fileID string, names []string, from, to time.Time) (map[string][]parser.Point, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	byName, ok := m.counters[fileID]
 	if !ok {
 		return nil, ErrNotFound
 	}
-	out := make(map[string][]parser.CounterSample, len(names))
+	out := make(map[string][]parser.Point, len(names))
 	for _, name := range names {
-		var sel []parser.CounterSample
+		var sel []parser.Point
 		for _, s := range byName[name] {
 			if !from.IsZero() && s.Ts.Before(from) {
 				continue
