@@ -75,7 +75,7 @@ tcp        0      0 127.0.0.1:42660         127.0.0.1:28888         ESTABLISHED 
 func collectFromString(t *testing.T, content, plane string) Series {
 	t.Helper()
 	tgz := buildMultiTgz(t, map[string]string{"var/log/pan/" + plane + "-monitor.log": content})
-	samples, err := CollectAllCounters(bytes.NewReader(tgz))
+	samples, err := CollectAllCounters(bytes.NewReader(tgz), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

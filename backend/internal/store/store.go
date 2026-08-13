@@ -38,6 +38,10 @@ type Store interface {
 	Config(fileID string) (*parser.ConfigDoc, error)
 	SaveAnomalies(fileID string, groups []parser.AnomalyGroup) error
 	Anomalies(fileID string) ([]parser.AnomalyGroup, error)
+	SaveAppStats(fileID string, st *parser.AppStats) error
+	AppStats(fileID string) (*parser.AppStats, error)
+	SaveLicenses(fileID string, lics []parser.License) error
+	Licenses(fileID string) ([]parser.License, error)
 	SaveMemory(fileID string, m MemoryReport) error
 	MemoryFor(fileID string) (MemoryReport, error)
 	SaveCounters(fileID string, series parser.Series) error
@@ -69,6 +73,8 @@ type Memory struct {
 	archive   map[string][]parser.ArchiveEntry
 	config    map[string]*parser.ConfigDoc
 	anomalies map[string][]parser.AnomalyGroup
+	appstats  map[string]*parser.AppStats
+	licenses  map[string][]parser.License
 	memory    map[string]MemoryReport
 	counters  map[string]parser.Series
 }
@@ -80,6 +86,8 @@ func NewMemory() *Memory {
 		archive:   make(map[string][]parser.ArchiveEntry),
 		config:    make(map[string]*parser.ConfigDoc),
 		anomalies: make(map[string][]parser.AnomalyGroup),
+		appstats:  make(map[string]*parser.AppStats),
+		licenses:  make(map[string][]parser.License),
 		memory:    make(map[string]MemoryReport),
 		counters:  make(map[string]parser.Series),
 	}
@@ -124,9 +132,51 @@ func (m *Memory) Delete(id string) error {
 	delete(m.archive, id)
 	delete(m.config, id)
 	delete(m.anomalies, id)
+	delete(m.appstats, id)
+	delete(m.licenses, id)
 	delete(m.memory, id)
 	delete(m.counters, id)
 	return nil
+}
+
+func (m *Memory) SaveAppStats(fileID string, st *parser.AppStats) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.files[fileID]; !ok {
+		return ErrNotFound
+	}
+	m.appstats[fileID] = st
+	return nil
+}
+
+func (m *Memory) AppStats(fileID string) (*parser.AppStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	st, ok := m.appstats[fileID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return st, nil
+}
+
+func (m *Memory) SaveLicenses(fileID string, lics []parser.License) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.files[fileID]; !ok {
+		return ErrNotFound
+	}
+	m.licenses[fileID] = lics
+	return nil
+}
+
+func (m *Memory) Licenses(fileID string) ([]parser.License, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	lics, ok := m.licenses[fileID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return lics, nil
 }
 
 func (m *Memory) SaveMemory(fileID string, rep MemoryReport) error {

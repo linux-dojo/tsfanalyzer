@@ -5,7 +5,7 @@ import type { MouseEvent as ReactMouseEvent } from "react";
 import Dygraph from "dygraphs";
 import "dygraphs/dist/dygraph.css";
 
-type Tab = "system" | "logs" | "graphs" | "config";
+type Tab = "system" | "logs" | "graphs" | "appstats" | "licenses" | "config";
 
 interface TsFile {
   id: string;
@@ -26,11 +26,18 @@ interface Entry {
   size: number;
 }
 
+interface ContextLine {
+  line_no: number;
+  text: string;
+  before: boolean;
+}
+
 interface SearchResult {
   type: "file" | "line";
   path: string;
   line_no?: number;
   text?: string;
+  context?: ContextLine[]; // grep-style -A / -B lines
 }
 
 interface LogEntryRow {
@@ -44,10 +51,50 @@ interface ViewItem {
   line?: number; // jump target from a search hit
 }
 
+/* Everything the Log Files tab holds, cached per tech-support file so that
+   navigating to another left-hand tab and back does not discard opened files,
+   search results or the picker state. Mirrors graphStateCache. */
+interface LogFilesState {
+  open: boolean;
+  minimized: boolean;
+  cwd: string;
+  selected: string[];
+  from: string;
+  to: string;
+  viewItems: ViewItem[];
+  maximized: boolean;
+  fileFilter: string;
+  query: string;
+  results: SearchResult[] | null;
+  scoped: string[]; // restrict the search to these paths
+}
+
+const logStateCache = new Map<string, LogFilesState>();
+
+function logStateFor(fileId: string): LogFilesState {
+  let st = logStateCache.get(fileId);
+  if (!st) {
+    st = {
+      open: false, minimized: false, cwd: "", selected: [], from: "", to: "",
+      viewItems: [], maximized: false, fileFilter: "", query: "",
+      results: null, scoped: [],
+    };
+    logStateCache.set(fileId, st);
+    while (logStateCache.size > GRAPH_CACHE_MAX_FILES) {
+      const oldest = logStateCache.keys().next().value;
+      if (oldest === undefined || oldest === fileId) break;
+      logStateCache.delete(oldest);
+    }
+  }
+  return st;
+}
+
 const TABS: { id: Tab; label: string }[] = [
   { id: "system", label: "System Info" },
   { id: "logs", label: "Log Files" },
   { id: "graphs", label: "Graphs" },
+  { id: "appstats", label: "App Stats" },
+  { id: "licenses", label: "Licenses" },
   { id: "config", label: "Config" },
 ];
 
@@ -255,6 +302,8 @@ function FileView({ id }: { id: string }) {
         {tab === "system" && <SystemInfo fileId={id} />}
         {tab === "logs" && <LogFiles fileId={id} />}
         {tab === "graphs" && <Graphs fileId={id} />}
+        {tab === "appstats" && <AppStatsTab fileId={id} />}
+        {tab === "licenses" && <LicensesTab fileId={id} />}
         {tab === "config" && <ConfigTab fileId={id} />}
       </main>
     </div>
@@ -2856,19 +2905,144 @@ const fmtSize = (n: number) =>
       ? (n / 1024).toFixed(1) + " KB"
       : n + " B";
 
+/* ---------- shared search query language ----------
+   Same grammar as the backend (parser/search.go) so the archive-wide search
+   and the in-file search behave identically:
+     ospf AND down · tunnel OR ipsec · NOT · "exact phrase" · regex terms
+     · parentheses · grep-style -A / -B / -C context
+   Bare terms are regular expressions; quoted terms match literally. */
+
+interface LineQuery {
+  empty: boolean;
+  before: number;
+  after: number;
+  match: (line: string) => boolean;
+}
+
+const CONTEXT_FLAG_RE = /(^|\s)-([ABC])\s*(\d+)/gi;
+const MAX_CONTEXT = 30;
+
+function parseLineQuery(raw: string): LineQuery {
+  let before = 0, after = 0;
+  const body = raw
+    .replace(CONTEXT_FLAG_RE, (_m, _p, flag: string, n: string) => {
+      const v = Math.min(parseInt(n, 10) || 0, MAX_CONTEXT);
+      const f = flag.toUpperCase();
+      if (f === "A") after = v;
+      else if (f === "B") before = v;
+      else { before = v; after = v; }
+      return " ";
+    })
+    .trim();
+
+  const noMatch = { empty: true, before, after, match: () => false };
+  if (!body) return noMatch;
+
+  type Tok = { k: string; v?: string; quot?: boolean };
+  const toks: Tok[] = [];
+  let i = 0;
+  while (i < body.length) {
+    const c = body[i];
+    if (c === " " || c === "\t") { i++; continue; }
+    if (c === "(" || c === ")") { toks.push({ k: c }); i++; continue; }
+    if (c === "!") { toks.push({ k: "not" }); i++; continue; }
+    if (c === "&") { i += body[i + 1] === "&" ? 2 : 1; toks.push({ k: "and" }); continue; }
+    if (c === "|") { i += body[i + 1] === "|" ? 2 : 1; toks.push({ k: "or" }); continue; }
+    if (c === '"' || c === "'") {
+      const end = body.indexOf(c, i + 1);
+      const v = end < 0 ? body.slice(i + 1) : body.slice(i + 1, end);
+      i = end < 0 ? body.length : end + 1;
+      if (v) toks.push({ k: "term", v, quot: true });
+      continue;
+    }
+    let j = i;
+    while (j < body.length && !" \t()!&|".includes(body[j])) j++;
+    const w = body.slice(i, j);
+    const up = w.toUpperCase();
+    toks.push(up === "AND" ? { k: "and" } : up === "OR" ? { k: "or" } : up === "NOT" ? { k: "not" } : { k: "term", v: w });
+    i = j;
+  }
+
+  type Pred = (s: string) => boolean;
+  const term = (t: Tok): Pred => {
+    const v = t.v ?? "";
+    if (t.quot) { const lit = v.toLowerCase(); return (s) => s.includes(lit); }
+    try { const re = new RegExp(v, "i"); return (s) => re.test(s); }
+    catch { const lit = v.toLowerCase(); return (s) => s.includes(lit); }
+  };
+
+  let p = 0;
+  const peek = () => toks[p];
+  const parseNot = (): Pred | null => {
+    const t = peek();
+    if (!t) return null;
+    if (t.k === "not") { p++; const a = parseNot(); return a ? (s) => !a(s) : null; }
+    if (t.k === "(") { p++; const inner = parseOr(); if (peek()?.k === ")") p++; return inner; }
+    if (t.k === "term") { p++; return term(t); }
+    p++; return parseNot();
+  };
+  const parseAnd = (): Pred | null => {
+    let left: Pred | null = parseNot();
+    if (!left) return null;
+    for (;;) {
+      const t = peek();
+      if (!t || t.k === "or" || t.k === ")") break;
+      if (t.k === "and") p++;
+      const right = parseNot();
+      if (!right) break;
+      const a: Pred = left, b: Pred = right;
+      left = (v: string) => a(v) && b(v);
+    }
+    return left;
+  };
+  const parseOr = (): Pred | null => {
+    let left: Pred | null = parseAnd();
+    if (!left) return null;
+    while (peek()?.k === "or") {
+      p++;
+      const right = parseAnd();
+      if (!right) return left;
+      const a: Pred = left, b: Pred = right;
+      left = (v: string) => a(v) || b(v);
+    }
+    return left;
+  };
+
+  let root = parseOr();
+  if (!root) { const lit = body.toLowerCase(); root = (s) => s.includes(lit); }
+  const fn = root;
+  return { empty: false, before, after, match: (line) => fn(line.toLowerCase()) };
+}
+
 /* ---------- Log Files tab ---------- */
 
 function LogFiles({ fileId }: { fileId: string }) {
+  const saved = logStateFor(fileId);
   const [entries, setEntries] = useState<Entry[]>([]);
-  const [open, setOpen] = useState(false);
-  const [minimized, setMinimized] = useState(false);
-  const [cwd, setCwd] = useState(""); // "" = archive root
-  const [selected, setSelected] = useState<string[]>([]);
-  const [from, setFrom] = useState("");
-  const [to, setTo] = useState("");
-  const [viewItems, setViewItems] = useState<ViewItem[]>([]);
-  const [maximized, setMaximized] = useState(false);
-  const [fileFilter, setFileFilter] = useState("");
+  const [open, setOpen] = useState(saved.open);
+  const [minimized, setMinimized] = useState(saved.minimized);
+  const [cwd, setCwd] = useState(saved.cwd); // "" = archive root
+  const [selected, setSelected] = useState<string[]>(saved.selected);
+  const [from, setFrom] = useState(saved.from);
+  const [to, setTo] = useState(saved.to);
+  const [viewItems, setViewItems] = useState<ViewItem[]>(saved.viewItems);
+  const [maximized, setMaximized] = useState(saved.maximized);
+  const [fileFilter, setFileFilter] = useState(saved.fileFilter);
+
+  // Everything above outlives leaving this tab: the picker, the time filter,
+  // which files are open and whether the viewer was maximized.
+  useEffect(() => {
+    const st = logStateFor(fileId);
+    st.open = open;
+    st.minimized = minimized;
+    st.cwd = cwd;
+    st.selected = selected;
+    st.from = from;
+    st.to = to;
+    st.viewItems = viewItems;
+    st.maximized = maximized;
+    st.fileFilter = fileFilter;
+  }, [fileId, open, minimized, cwd, selected, from, to, viewItems, maximized, fileFilter]);
 
   useEffect(() => {
     fetch(`/api/v1/files/${fileId}/archive`)
@@ -2924,14 +3098,24 @@ function LogFiles({ fileId }: { fileId: string }) {
     window.open(`/files/${fileId}/logs?${q.toString()}`, "_blank");
   };
 
-  const openFromSearch = (path: string, line?: number) => {
+  // Alt/Option+click on a hit opens it straight into the maximized viewer
+  const openFromSearch = (path: string, line?: number, maximize?: boolean) => {
     setViewItems((v) => [...v.filter((it) => it.path !== path), { path, line }]);
+    if (maximize) setMaximized(true);
   };
+
+  const closeViewItem = (path: string) =>
+    setViewItems((v) => v.filter((it) => it.path !== path));
 
   return (
     <section>
       <h2>Log Files</h2>
-      <ArchiveSearch fileId={fileId} onOpen={openFromSearch} />
+      <ArchiveSearch
+        fileId={fileId}
+        onOpen={openFromSearch}
+        title="Global search — the whole tech-support file"
+        cacheKey="global"
+      />
       <button className="dropdown-btn" onClick={() => { setOpen(!open); setMinimized(false); }}>
         Select log files {open ? "▴" : "▾"}
       </button>
@@ -2963,6 +3147,19 @@ function LogFiles({ fileId }: { fileId: string }) {
               </button>
             )}
           </div>
+
+          <ArchiveSearch
+            fileId={fileId}
+            onOpen={openFromSearch}
+            title="Search within selected files"
+            cacheKey="scoped"
+            scopePaths={selected}
+            placeholder={
+              selected.length
+                ? `Search the ${selected.length} selected file${selected.length === 1 ? "" : "s"}…`
+                : "Check files below to restrict the search, or leave empty to search everything…"
+            }
+          />
 
           <div className="picker-cols">
             <div className="picker-col">
@@ -3069,6 +3266,7 @@ function LogFiles({ fileId }: { fileId: string }) {
             from={from}
             to={to}
             highlightLine={it.line}
+            onClose={() => closeViewItem(it.path)}
           />
         ))}
 
@@ -3079,6 +3277,7 @@ function LogFiles({ fileId }: { fileId: string }) {
           from={from}
           to={to}
           onMinimize={() => setMaximized(false)}
+          onClose={closeViewItem}
         />
       )}
     </section>
@@ -3092,12 +3291,14 @@ function MaxViewer({
   from,
   to,
   onMinimize,
+  onClose,
 }: {
   fileId: string;
   items: ViewItem[];
   from: string;
   to: string;
   onMinimize: () => void;
+  onClose?: (path: string) => void;
 }) {
   const [activePath, setActivePath] = useState(items[0]?.path ?? "");
   const active = items.find((it) => it.path === activePath) ?? items[0];
@@ -3114,14 +3315,24 @@ function MaxViewer({
       <div className="viewer-split">
         <aside className="viewer-files">
           {items.map((it) => (
-            <button
-              key={it.path}
-              className={it.path === active?.path ? "active" : ""}
-              onClick={() => setActivePath(it.path)}
-              title={it.path}
-            >
-              {it.path.split("/").pop()}
-            </button>
+            <div key={it.path} className="viewer-file-row">
+              <button
+                className={it.path === active?.path ? "active" : ""}
+                onClick={() => setActivePath(it.path)}
+                title={it.path}
+              >
+                {it.path.split("/").pop()}
+              </button>
+              {onClose && (
+                <button
+                  className="viewer-file-close"
+                  title="Close this file"
+                  onClick={() => onClose(it.path)}
+                >
+                  ✕
+                </button>
+              )}
+            </div>
           ))}
         </aside>
         <div className="viewer-pane">
@@ -3137,6 +3348,7 @@ function MaxViewer({
                 from={from}
                 to={to}
                 highlightLine={it.line}
+                onClose={onClose ? () => onClose(it.path) : undefined}
               />
             </div>
           ))}
@@ -3146,16 +3358,41 @@ function MaxViewer({
   );
 }
 
+/* Archive-wide search. Used twice: once unrestricted (global) and once
+   scoped to the files chosen in the picker. Supports the shared query
+   language including grep-style -A/-B/-C, which is sent to the backend. */
 function ArchiveSearch({
   fileId,
   onOpen,
+  title,
+  cacheKey,
+  scopePaths,
+  placeholder,
 }: {
   fileId: string;
-  onOpen: (path: string, line?: number) => void;
+  onOpen: (path: string, line?: number, maximize?: boolean) => void;
+  title: string;
+  cacheKey: "global" | "scoped";
+  scopePaths?: string[];
+  placeholder?: string;
 }) {
-  const [query, setQuery] = useState("");
-  const [results, setResults] = useState<SearchResult[] | null>(null);
+  const saved = logStateFor(fileId);
+  const [query, setQuery] = useState(cacheKey === "global" ? saved.query : "");
+  const [results, setResults] = useState<SearchResult[] | null>(
+    cacheKey === "global" ? saved.results : null
+  );
   const [searching, setSearching] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
+
+  // the global search box and its results survive leaving the tab
+  useEffect(() => {
+    if (cacheKey !== "global") return;
+    const st = logStateFor(fileId);
+    st.query = query;
+    st.results = results;
+  }, [cacheKey, fileId, query, results]);
+
+  const scopeKey = (scopePaths ?? []).join("|");
 
   useEffect(() => {
     if (query.trim().length < 2) {
@@ -3164,46 +3401,92 @@ function ArchiveSearch({
     }
     setSearching(true);
     const t = setTimeout(() => {
-      fetch(`/api/v1/files/${fileId}/search?q=${encodeURIComponent(query.trim())}`)
+      const p = new URLSearchParams({ q: query.trim() });
+      if (scopeKey) p.set("paths", scopeKey);
+      fetch(`/api/v1/files/${fileId}/search?${p.toString()}`)
         .then((r) => (r.ok ? r.json() : Promise.reject()))
         .then((d) => setResults(d.results ?? []))
         .catch(() => setResults([]))
         .finally(() => setSearching(false));
-    }, 500);
+    }, 450);
     return () => clearTimeout(t);
-  }, [query, fileId]);
+  }, [query, fileId, scopeKey]);
+
+  const lineHits = (results ?? []).filter((r) => r.type === "line").length;
 
   return (
     <div className="search-wrap">
+      <div className="search-head">
+        <span className="search-title">{title}</span>
+        {scopeKey && (
+          <span className="search-scope">
+            {(scopePaths ?? []).length} file{(scopePaths ?? []).length === 1 ? "" : "s"}
+          </span>
+        )}
+        {results !== null && (
+          <>
+            <span className="muted">
+              {results.length} result{results.length === 1 ? "" : "s"}
+              {lineHits !== results.length ? ` (${lineHits} line)` : ""}
+            </span>
+            <button className="link-btn" onClick={() => setCollapsed(!collapsed)}>
+              {collapsed ? "show" : "hide"}
+            </button>
+            <button className="link-btn" onClick={() => { setQuery(""); setResults(null); }}>
+              clear
+            </button>
+          </>
+        )}
+      </div>
       <input
         className="search-input"
         type="search"
-        placeholder="Search log files and log lines…"
+        placeholder={placeholder ?? 'Search…  ospf AND down · "exact phrase" · regex · -A 3 -B 2'}
+        title={
+          "AND / OR / NOT (also && || !), parentheses\n" +
+          'bare terms are regexes, "quoted" terms match literally\n' +
+          "-A n / -B n / -C n show lines after / before / around each match\n\n" +
+          "Click a hit to open it below; Alt/Option+click opens it maximized."
+        }
         value={query}
         onChange={(e) => setQuery(e.target.value)}
       />
       {searching && <p className="muted">Searching…</p>}
-      {results !== null && !searching && (
+      {results !== null && !searching && !collapsed && (
         <div className="search-results">
           {results.map((r, i) => (
-            <button
-              key={i}
-              className="result-row"
-              onClick={() => onOpen(r.path, r.type === "line" ? r.line_no : undefined)}
-              title={r.type === "line" ? `${r.path} (line ${r.line_no})` : r.path}
-            >
-              <span className="result-main">
-                <span className="result-path">{r.path}</span>
-                {r.type === "line" && (
-                  <span className="result-text">
-                    {r.line_no}: {r.text}
-                  </span>
-                )}
-              </span>
-              <span className={r.type === "file" ? "tag tag-file" : "tag tag-line"}>
-                {r.type === "file" ? "log file" : "log line"}
-              </span>
-            </button>
+            <div key={i} className="result-item">
+              <button
+                className="result-row"
+                onClick={(e) => onOpen(r.path, r.type === "line" ? r.line_no : undefined, e.altKey)}
+                title={
+                  (r.type === "line" ? `${r.path} (line ${r.line_no})` : r.path) +
+                  "\nAlt/Option+click to open maximized"
+                }
+              >
+                <span className="result-main">
+                  <span className="result-path">{r.path}</span>
+                  {r.type === "line" && (
+                    <span className="result-text">
+                      {r.line_no}: {r.text}
+                    </span>
+                  )}
+                </span>
+                <span className={r.type === "file" ? "tag tag-file" : "tag tag-line"}>
+                  {r.type === "file" ? "log file" : "log line"}
+                </span>
+              </button>
+              {(r.context ?? []).length > 0 && (
+                <div className="result-context">
+                  {(r.context ?? []).map((c, k) => (
+                    <div key={k} className={"ctx-line" + (c.before ? " ctx-before" : " ctx-after")}>
+                      <span className="ctx-no">{c.line_no}</span>
+                      <span className="ctx-text">{c.text}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           ))}
           {results.length === 0 && <p className="muted">No matches.</p>}
         </div>
@@ -3254,12 +3537,14 @@ function LogContent({
   from,
   to,
   highlightLine,
+  onClose,
 }: {
   fileId: string;
   path: string;
   from: string;
   to: string;
   highlightLine?: number;
+  onClose?: () => void;
 }) {
   const [text, setText] = useState<string | null>(null);
   const [entries, setEntries] = useState<LogEntryRow[] | null>(null);
@@ -3270,6 +3555,10 @@ function LogContent({
   const [err, setErr] = useState<string | null>(null);
   const [structured, setStructured] = useState(true);
   const [scrollTop, setScrollTop] = useState(0);
+  // in-file search, same query language as the archive search (including
+  // -A/-B/-C), so a loaded file can be narrowed without another round trip
+  const [q, setQ] = useState("");
+  const query = useMemo(() => parseLineQuery(q), [q]);
   const viewRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -3323,7 +3612,30 @@ function LogContent({
 
   // flatten entries into uniform-height display rows (long messages become
   // continuation rows with blank ts/label)
+  // entries kept by the in-file search, plus their -A/-B context
+  const shownEntries = useMemo(() => {
+    if (!entries) return null;
+    if (query.empty) return entries;
+    const keep = new Set<number>();
+    entries.forEach((e, i) => {
+      if (query.match(`${e.ts} ${e.label} ${e.msg}`)) {
+        keep.add(i);
+        for (let k = 1; k <= query.before; k++) if (i - k >= 0) keep.add(i - k);
+        for (let k = 1; k <= query.after; k++) if (i + k < entries.length) keep.add(i + k);
+      }
+    });
+    return entries.filter((_, i) => keep.has(i));
+  }, [entries, query]);
+
+  const matchCount = useMemo(() => {
+    if (!entries || query.empty) return 0;
+    let n = 0;
+    for (const e of entries) if (query.match(`${e.ts} ${e.label} ${e.msg}`)) n++;
+    return n;
+  }, [entries, query]);
+
   const rows: FlatRow[] = useMemo(() => {
+    const entries = shownEntries;
     if (!entries) return [];
     const out: FlatRow[] = [];
     entries.forEach((e, i) => {
@@ -3336,9 +3648,12 @@ function LogContent({
       );
     });
     return out;
-  }, [entries]);
+  }, [shownEntries]);
 
-  const hlEntryIdx = highlightLine !== undefined ? highlightLine - 1 - offset : -1;
+  // the highlight indexes into the unfiltered list, so it only applies when
+  // the in-file search is not narrowing the view
+  const hlEntryIdx =
+    query.empty && highlightLine !== undefined ? highlightLine - 1 - offset : -1;
   const hlRowIdx = useMemo(
     () => (hlEntryIdx < 0 ? -1 : rows.findIndex((r) => r.entryIdx === hlEntryIdx && r.first)),
     [rows, hlEntryIdx]
@@ -3363,10 +3678,37 @@ function LogContent({
   return (
     <div className="log-block">
       <h3 className="log-title">
-        <span>{path}</span>
-        <button className="view-toggle" onClick={() => setStructured(!structured)}>
-          {structured ? "Raw view" : "Table view"}
-        </button>
+        <span className="log-title-path">{path}</span>
+        <span className="log-title-actions">
+          {structured && (
+            <input
+              className="log-search"
+              type="search"
+              placeholder='search this file…  ospf AND down · "phrase" · -A 3'
+              title={
+                "Same syntax as the archive search:\n" +
+                "  AND / OR / NOT (also && || !), parentheses\n" +
+                '  bare terms are regexes, "quoted" terms are literal\n' +
+                "  -A n / -B n / -C n for lines after / before / around a match"
+              }
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+            />
+          )}
+          {structured && !query.empty && (
+            <span className="log-search-count">
+              {matchCount} match{matchCount === 1 ? "" : "es"}
+            </span>
+          )}
+          <button className="view-toggle" onClick={() => setStructured(!structured)}>
+            {structured ? "Raw view" : "Table view"}
+          </button>
+          {onClose && (
+            <button className="view-toggle log-close" onClick={onClose} title="Close this file">
+              ✕
+            </button>
+          )}
+        </span>
       </h3>
       {err && <p className="error">{err}</p>}
       {text === null && entries === null && !err && <p className="muted">Loading…</p>}
@@ -3504,6 +3846,276 @@ function SystemInfo({ fileId }: { fileId: string }) {
           ))}
         </div>
       )}
+    </section>
+  );
+}
+
+/* ---------- App Stats tab ----------
+   The per-application traffic table from "show running application
+   statistics", with the shares and per-session ratios derived from it. */
+
+interface AppStat {
+  app: string;
+  vsys: string;
+  sessions: number;
+  packets: number;
+  bytes: number;
+  app_changed: number;
+  threats: number;
+  sessions_pct: number;
+  packets_pct: number;
+  bytes_pct: number;
+  app_changed_pct: number;
+  threats_pct: number;
+  packets_per_session: number;
+  bytes_per_session: number;
+  avg_packet_size: number;
+}
+
+interface AppStatsDoc {
+  rows: AppStat[];
+  vsyses: string[];
+  source: string;
+  names_resolved: boolean;
+  total_sessions: number;
+  total_packets: number;
+  total_bytes: number;
+  total_app_changed: number;
+  total_threats: number;
+  reported_sessions: number;
+  reported_packets: number;
+  reported_bytes: number;
+}
+
+type AppSortKey =
+  | "app" | "vsys" | "sessions" | "packets" | "bytes" | "app_changed" | "threats"
+  | "packets_per_session" | "bytes_per_session" | "avg_packet_size";
+
+const APP_COLUMNS: { key: AppSortKey; label: string; pct?: keyof AppStat; int?: boolean }[] = [
+  { key: "app", label: "Application" },
+  { key: "vsys", label: "Vsys" },
+  { key: "sessions", label: "Sessions", pct: "sessions_pct" },
+  { key: "packets", label: "Packets", pct: "packets_pct" },
+  { key: "bytes", label: "Bytes", pct: "bytes_pct" },
+  { key: "app_changed", label: "App Changed", pct: "app_changed_pct" },
+  { key: "threats", label: "Threats", pct: "threats_pct" },
+  { key: "packets_per_session", label: "Pkts / Session" },
+  { key: "bytes_per_session", label: "Bytes / Session" },
+  { key: "avg_packet_size", label: "Avg Pkt Size" },
+];
+
+const fmtNum = (n: number) =>
+  Number.isFinite(n) ? Math.round(n).toLocaleString() : "—";
+
+const fmtBytesShort = (n: number) => {
+  if (!Number.isFinite(n)) return "—";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let v = n, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? Math.round(v).toString() : v.toFixed(2)) + " " + u[i];
+};
+
+function AppStatsTab({ fileId }: { fileId: string }) {
+  const [doc, setDoc] = useState<AppStatsDoc | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [sortKey, setSortKey] = useState<AppSortKey>("bytes");
+  const [asc, setAsc] = useState(false);
+  const [filter, setFilter] = useState("");
+
+  useEffect(() => {
+    fetch(`/api/v1/files/${fileId}/app-stats`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((d) => setDoc(d.app_stats ?? null))
+      .catch(() =>
+        setErr("No application statistics — 'show running application statistics' was not in this archive's CLI dump.")
+      );
+  }, [fileId]);
+
+  const rows = useMemo(() => {
+    if (!doc) return [];
+    const f = filter.trim().toLowerCase();
+    const list = f ? doc.rows.filter((r) => r.app.toLowerCase().includes(f)) : doc.rows.slice();
+    list.sort((a, b) => {
+      // text columns compare lexically, every other column numerically, and
+      // each is sortable in both directions
+      if (sortKey === "app" || sortKey === "vsys") {
+        const av = String(a[sortKey]), bv = String(b[sortKey]);
+        return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+      }
+      const av = a[sortKey] as number, bv = b[sortKey] as number;
+      return asc ? av - bv : bv - av;
+    });
+    return list;
+  }, [doc, sortKey, asc, filter]);
+
+  const sortBy = (k: AppSortKey) => {
+    if (k === sortKey) setAsc(!asc);
+    else { setSortKey(k); setAsc(false); }
+  };
+
+  if (err) return <section><h2>App Stats</h2><p className="error">{err}</p></section>;
+  if (!doc) return <section><h2>App Stats</h2><p className="muted">Loading…</p></section>;
+
+  return (
+    <section>
+      <h2>App Stats</h2>
+      <div className="cfg-source">
+        <span className="cfg-source-path">{doc.source || "—"}</span>
+        {doc.source === "panio_infreq" && (
+          <span className="cfg-local-badge">dataplane · time series</span>
+        )}
+        {!doc.names_resolved && (
+          <span className="app-unnamed" title="opt/pancfg/mgmt/updates/curcontent/.../global.xml was not in this archive, so applications are shown by numeric ID">
+            application IDs unresolved
+          </span>
+        )}
+      </div>
+      <div className="mem-stats">
+        <Stat label="Applications" value={doc.rows.length.toLocaleString()} />
+        <Stat label="Sessions" value={fmtNum(doc.total_sessions)} />
+        <Stat label="Packets" value={fmtNum(doc.total_packets)} />
+        <Stat label="Bytes" value={fmtBytesShort(doc.total_bytes)} />
+        <Stat label="App Changed" value={fmtNum(doc.total_app_changed)} />
+        <Stat label="Threats" value={fmtNum(doc.total_threats)} />
+        {doc.vsyses.length > 0 && <Stat label="Vsys" value={doc.vsyses.join(", ")} />}
+      </div>
+      <div className="anom-search">
+        <input
+          className="search-input"
+          type="search"
+          placeholder="Filter applications…"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        />
+        {filter.trim() !== "" && (
+          <span className="anom-search-count muted">{rows.length} of {doc.rows.length}</span>
+        )}
+      </div>
+      <div className="cfg-table-wrap">
+        <table className="cfg-table app-table">
+          <thead>
+            <tr>
+              {APP_COLUMNS.map((c) => (
+                <th
+                  key={c.key}
+                  className="app-th"
+                  onClick={() => sortBy(c.key)}
+                  title="Click to sort"
+                >
+                  {c.label}
+                  {sortKey === c.key && <span className="app-sort">{asc ? " ▲" : " ▼"}</span>}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr key={r.app + r.vsys + i}>
+                <td className="cfg-name">{r.app}</td>
+                <td>{r.vsys || "—"}</td>
+                <td>{fmtNum(r.sessions)}<span className="app-pct">{r.sessions_pct.toFixed(2)}%</span></td>
+                <td>{fmtNum(r.packets)}<span className="app-pct">{r.packets_pct.toFixed(2)}%</span></td>
+                <td>{fmtBytesShort(r.bytes)}<span className="app-pct">{r.bytes_pct.toFixed(2)}%</span></td>
+                <td>{fmtNum(r.app_changed)}<span className="app-pct">{r.app_changed_pct.toFixed(2)}%</span></td>
+                <td>{fmtNum(r.threats)}<span className="app-pct">{r.threats_pct.toFixed(2)}%</span></td>
+                <td>{fmtNum(r.packets_per_session)}</td>
+                <td>{fmtBytesShort(r.bytes_per_session)}</td>
+                <td>{fmtNum(r.avg_packet_size)}</td>
+              </tr>
+            ))}
+            {rows.length === 0 && (
+              <tr><td colSpan={APP_COLUMNS.length}><span className="muted">No applications match.</span></td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+/* ---------- Licenses tab ---------- */
+
+interface LicenseRow {
+  feature: string;
+  description: string;
+  serial: string;
+  authcode?: string;
+  issued?: string;
+  expires?: string;
+  expired?: string;
+  base_license?: string;
+  other?: KV[];
+}
+
+function LicensesTab({ fileId }: { fileId: string }) {
+  const [lics, setLics] = useState<LicenseRow[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch(`/api/v1/files/${fileId}/licenses`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((d) => setLics(d.licenses ?? []))
+      .catch(() =>
+        setErr("No licence information — 'request license info' was not in this archive's CLI dump.")
+      );
+  }, [fileId]);
+
+  if (err) return <section><h2>Licenses</h2><p className="error">{err}</p></section>;
+  if (!lics) return <section><h2>Licenses</h2><p className="muted">Loading…</p></section>;
+
+  const expiredCount = lics.filter((l) => (l.expired ?? "").toLowerCase() === "yes").length;
+
+  return (
+    <section>
+      <h2>Licenses</h2>
+      <div className="mem-stats">
+        <Stat label="Installed" value={String(lics.length)} />
+        <Stat label="Expired" value={String(expiredCount)} bad={expiredCount > 0} />
+      </div>
+      <div className="cfg-table-wrap">
+        <table className="cfg-table">
+          <thead>
+            <tr>
+              <th>Feature</th>
+              <th>Description</th>
+              <th>Expires</th>
+              <th>Expired</th>
+              <th>Issued</th>
+              <th>Serial</th>
+              <th>Auth Code</th>
+              <th>Base</th>
+              <th>Other</th>
+            </tr>
+          </thead>
+          <tbody>
+            {lics.map((l, i) => {
+              const isExpired = (l.expired ?? "").toLowerCase() === "yes";
+              return (
+                <tr key={l.feature + i} className={isExpired ? "lic-expired" : ""}>
+                  <td className="cfg-name">{l.feature || "—"}</td>
+                  <td>{l.description || "—"}</td>
+                  <td>{l.expires || "—"}</td>
+                  <td>
+                    {l.expired
+                      ? <span className={"sev " + (isExpired ? "sev-high" : "sev-low")}>{l.expired}</span>
+                      : "—"}
+                  </td>
+                  <td>{l.issued || "—"}</td>
+                  <td className="mem-src">{l.serial || "—"}</td>
+                  <td className="mem-src">{l.authcode || "—"}</td>
+                  <td>{l.base_license || "—"}</td>
+                  <td className="muted">
+                    {(l.other ?? []).map((kv) => `${kv.key}: ${kv.value}`).join(" · ") || "—"}
+                  </td>
+                </tr>
+              );
+            })}
+            {lics.length === 0 && (
+              <tr><td colSpan={9}><span className="muted">No licences found.</span></td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }

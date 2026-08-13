@@ -55,6 +55,8 @@ func NewServer(st store.Store, uploadDir string) *Server {
 	s.mux.HandleFunc("GET /api/v1/files/{id}/config", s.handleConfig)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/anomalies", s.handleAnomalies)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/memory", s.handleMemory)
+	s.mux.HandleFunc("GET /api/v1/files/{id}/app-stats", s.handleAppStats)
+	s.mux.HandleFunc("GET /api/v1/files/{id}/licenses", s.handleLicenses)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/content", s.handleContent)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/search", s.handleSearch)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/counters", s.handleCounters)
@@ -177,12 +179,24 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 		}
 	}
 
-	// pass 3: counter time series from dp-monitor / mp-monitor logs
+	// pass 3: counter time series from dp-monitor / mp-monitor logs.
+	// The application ID -> name map is resolved first so the per-app
+	// counters can be named rather than numbered.
 	var samples parser.Series
+	appNames := map[int]string{}
 	if status == "parsed" {
+		if fa, err := os.Open(rec.StoragePath); err == nil {
+			if got, aerr := parser.ExtractAppIDs(fa); aerr == nil && len(got) > 0 {
+				appNames = got
+				log.Printf("parse %s: %d application IDs mapped from the content DB", rec.ID, len(got))
+			} else if len(got) == 0 {
+				log.Printf("parse %s: no content DB in archive; applications will show as app-<id>", rec.ID)
+			}
+			fa.Close()
+		}
 		f3, err := os.Open(rec.StoragePath)
 		if err == nil {
-			if got, cerr := parser.CollectAllCounters(f3); cerr == nil && len(got) > 0 {
+			if got, cerr := parser.CollectAllCounters(f3, appNames); cerr == nil && len(got) > 0 {
 				samples = got
 				_ = s.store.SaveCounters(rec.ID, got)
 				log.Printf("parse %s: collected %d counter samples", rec.ID, len(got))
@@ -254,6 +268,38 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 			_ = s.store.SaveMemory(rec.ID, rep)
 			log.Printf("parse %s: memory analysis (%d OOM events, %d mp suspects)",
 				rec.ID, len(oom), len(rep.MP.Suspects))
+		}
+	}
+
+	// pass 7: CLI dump extras — application statistics and licences
+	if status == "parsed" {
+		// Prefer the dataplane's own per-app accounting (panio_infreq, which
+		// is a time series) over the one-off CLI snapshot; fall back to the
+		// snapshot when the block is absent.
+		if st := parser.AppStatsFromSeries(samples, "dp"); st != nil {
+			st.Source = "panio_infreq"
+			st.NamesResolved = len(appNames) > 0
+			_ = s.store.SaveAppStats(rec.ID, st)
+			log.Printf("parse %s: app stats from panio_infreq (%d applications)", rec.ID, len(st.Rows))
+		} else if f7, err := os.Open(rec.StoragePath); err == nil {
+			if st, aerr := parser.ExtractAppStats(f7); aerr == nil {
+				st.Source = "show running application statistics"
+				st.NamesResolved = true
+				_ = s.store.SaveAppStats(rec.ID, st)
+				log.Printf("parse %s: app stats from the CLI dump (%d applications)", rec.ID, len(st.Rows))
+			} else {
+				log.Printf("parse %s: app stats: %v", rec.ID, aerr)
+			}
+			f7.Close()
+		}
+		if f8, err := os.Open(rec.StoragePath); err == nil {
+			if lics, lerr := parser.ExtractLicenses(f8); lerr == nil {
+				_ = s.store.SaveLicenses(rec.ID, lics)
+				log.Printf("parse %s: %d licences", rec.ID, len(lics))
+			} else {
+				log.Printf("parse %s: licences: %v", rec.ID, lerr)
+			}
+			f8.Close()
 		}
 	}
 
@@ -400,6 +446,16 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "query must be at least 2 characters")
 		return
 	}
+	// optional: restrict to specific archive paths, and grep-style context
+	// (which may also be given inline in the query as -A/-B/-C)
+	var paths []string
+	if pv := r.URL.Query().Get("paths"); strings.TrimSpace(pv) != "" {
+		paths = strings.Split(pv, "|")
+	}
+	before, _ := strconv.Atoi(r.URL.Query().Get("before"))
+	after, _ := strconv.Atoi(r.URL.Query().Get("after"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+
 	src, err := os.Open(rec.StoragePath)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "could not open stored archive")
@@ -407,12 +463,16 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	defer src.Close()
 
-	results, err := parser.SearchArchive(src, q, 200)
+	results, err := parser.SearchArchive(src, parser.SearchOptions{
+		Query: q, Paths: paths, Before: before, After: after, MaxResults: limit,
+	})
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "search failed: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"query": q, "results": results})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"query": q, "paths": paths, "results": results,
+	})
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -482,6 +542,26 @@ func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"file_id": id, "memory": rep})
+}
+
+func (s *Server) handleAppStats(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	st, err := s.store.AppStats(id)
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "no application statistics for this file")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"file_id": id, "app_stats": st})
+}
+
+func (s *Server) handleLicenses(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	lics, err := s.store.Licenses(id)
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "no licence information for this file")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"file_id": id, "licenses": lics})
 }
 
 func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {

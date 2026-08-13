@@ -45,7 +45,7 @@ var monitorFileRe = regexp.MustCompile(`(?:^|/)(dp|mp)-monitor\.log(?:\.\d+)?$`)
 // counter time series from every dp-monitor.log* and mp-monitor.log* file.
 // Samples accumulate straight into a name-keyed map, so a counter name is
 // allocated once no matter how many samples it has.
-func CollectAllCounters(r io.ReadSeeker) (Series, error) {
+func CollectAllCounters(r io.ReadSeeker, appNames map[int]string) (Series, error) {
 	tr, err := openTar(r)
 	if err != nil {
 		return nil, err
@@ -66,7 +66,7 @@ func CollectAllCounters(r io.ReadSeeker) (Series, error) {
 		if m == nil {
 			continue
 		}
-		collectMonitor(tr, m[1], out)
+		collectMonitor(tr, m[1], out, appNames)
 	}
 	// rotated logs can be visited out of order, so normalize per series
 	for name := range out {
@@ -110,6 +110,12 @@ var (
 	// "--- memory" block
 	memRowRe  = regexp.MustCompile(`^Mem\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)`)
 	swapRowRe = regexp.MustCompile(`^Swap\s+(\d+)\s+(\d+)\s+(\d+)`)
+
+	// "--- panio_infreq" per-application table. Rows are keyed by numeric
+	// application ID and every line is prefixed with ':' like other panio
+	// output: ":15   1421963   274502175   152236539894   0   363080"
+	appVsysRe = regexp.MustCompile(`^:Vsys:\s*(\S+)`)
+	appRowRe  = regexp.MustCompile(`^:(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$`)
 
 	// "--- memory_detail" block: /proc/meminfo style "Key:  <n> kB" lines.
 	// SUnreclaim (unreclaimable slab) is the key signal for kernel-side
@@ -217,13 +223,17 @@ type counterCollector struct {
 
 	powThread int // vmpow: current thread context (for io lines)
 
+	// panio_infreq: per-application table keyed by numeric app ID
+	appVsys  string
+	appNames map[int]string
+
 	out Series
 }
 
-func collectMonitor(r io.Reader, plane string, out Series) {
+func collectMonitor(r io.Reader, plane string, out Series, appNames map[int]string) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	c := &counterCollector{plane: plane, out: out}
+	c := &counterCollector{plane: plane, out: out, appNames: appNames}
 	for sc.Scan() {
 		c.line(strings.TrimRight(sc.Text(), "\r"))
 	}
@@ -287,6 +297,7 @@ func (c *counterCollector) line(raw string) {
 		c.nsSection = ""
 		c.detKind, c.detName, c.ruLabel = "", "", ""
 		c.powThread = 0
+		c.appVsys = ""
 		if c.block == "netstat_detail" {
 			c.nsAcc = make(map[string]float64)
 			c.nsTs = c.ts
@@ -328,6 +339,9 @@ func (c *counterCollector) line(raw string) {
 		return
 	case "top":
 		c.topLine(trimmed)
+		return
+	case "panio_infreq":
+		c.appStatsLine(trimmed)
 		return
 	}
 
@@ -557,6 +571,36 @@ func (c *counterCollector) memoryLine(trimmed string) {
 		c.emit(c.plane+"__memory__swap_min", atofu(m[2]))
 		c.emit(c.plane+"__memory__swap_total", atofu(m[3]))
 	}
+}
+
+// appStatsLine handles the "--- panio_infreq" per-application table. The
+// first column is the numeric application ID, which is resolved to a name
+// via the content database when that was collected. Emitted as
+// <plane>__appstats__vsys<N>_<app>_<metric> so the volumes can be trended
+// like any other counter.
+func (c *counterCollector) appStatsLine(trimmed string) {
+	if m := appVsysRe.FindStringSubmatch(trimmed); m != nil {
+		c.appVsys = m[1]
+		return
+	}
+	m := appRowRe.FindStringSubmatch(trimmed)
+	if m == nil {
+		return // header, separator, ":Time:", ":Number of apps:"
+	}
+	id, err := strconv.Atoi(m[1])
+	if err != nil {
+		return
+	}
+	vsys := c.appVsys
+	if vsys == "" {
+		vsys = "1" // some builds omit the Vsys line when there is only one
+	}
+	base := c.plane + "__appstats__vsys" + sanitizeCounter(vsys) + "_" + sanitizeCounter(AppLabel(id, c.appNames))
+	c.emit(base+"_sessions", atofu(m[2]))
+	c.emit(base+"_packets", atofu(m[3]))
+	c.emit(base+"_bytes", atofu(m[4]))
+	c.emit(base+"_app_changed", atofu(m[5]))
+	c.emit(base+"_threats", atofu(m[6]))
 }
 
 // memoryDetailLine handles "--- memory_detail", the /proc/meminfo dump.
