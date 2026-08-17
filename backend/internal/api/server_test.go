@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -114,6 +115,81 @@ func TestUploadListDelete(t *testing.T) {
 	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/files/"+created.ID, nil))
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete: got %d, want 204", rec.Code)
+	}
+}
+
+// End to end: the search endpoint must answer from the index built during
+// parsing, and must clean the blob up when the file is deleted.
+func TestSearchUsesTheIndexAndCleansUp(t *testing.T) {
+	srv := newTestServer(t)
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormFile("file", "techsupport.tgz")
+	fw.Write(buildTechSupportTgz(t))
+	mw.Close()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/files", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload: %d %s", rec.Code, rec.Body.String())
+	}
+	var created store.TechSupportFile
+	json.Unmarshal(rec.Body.Bytes(), &created)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		rec = httptest.NewRecorder()
+		srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/files/"+created.ID, nil))
+		var f store.TechSupportFile
+		json.Unmarshal(rec.Body.Bytes(), &f)
+		if f.Status == "parsed" {
+			break
+		}
+		if f.Status == "failed" || time.Now().After(deadline) {
+			t.Fatalf("never parsed (status=%q)", f.Status)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/api/v1/files/"+created.ID+"/search?q=serial", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("search: %d %s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Results []parser.SearchResult `json:"results"`
+		Indexed bool                  `json:"indexed"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Indexed {
+		t.Error("the search should have been served from the parse-time index")
+	}
+	if len(got.Results) == 0 {
+		t.Fatalf("no results for a term that is in the archive: %s", rec.Body.String())
+	}
+
+	// the blob is several times the archive's size, so deletion must remove it
+	// (StoragePath is not serialised, so it comes from the store)
+	stored, serr := srv.store.Get(created.ID)
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	blob := searchBlobPath(stored.StoragePath)
+	if _, err := os.Stat(blob); err != nil {
+		t.Fatalf("the index blob should exist after parsing: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/files/"+created.ID, nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete: %d", rec.Code)
+	}
+	if _, err := os.Stat(blob); !os.IsNotExist(err) {
+		t.Errorf("search blob %s survived deletion of its archive", blob)
 	}
 }
 

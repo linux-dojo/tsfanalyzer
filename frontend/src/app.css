@@ -754,3 +754,63 @@ td button { border: 0; background: #fdecea; color: #c0392b; padding: 5px 10px; b
   padding: 6px 8px; border-radius: 5px; font-size: 11px;
 }
 .viewer-file-close:hover { background: #3a2422; color: #ffb4ab; }
+.search-capped {
+  background: #fff4e0; color: #9a6300; border: 1px solid #ffe2b0;
+  border-radius: 999px; padding: 1px 9px; font-size: 11px; font-weight: 700;
+  cursor: help;
+}
+
+/* how much of the archive the search actually had to read — quiet, because
+   it is reassurance rather than a warning */
+.search-scanned {
+  font-size: 11px;
+  cursor: help;
+  opacity: 0.75;
+}
+
+/* A rule above any result block that is not a continuation of the previous
+   one. Without it consecutive hits run together and it is impossible to see
+   where one match's context ends and the next begins. */
+.result-break {
+  border-top: 1px dashed #d7dbe0;
+  margin-top: 8px;
+  padding-top: 8px;
+}
+
+/* the anchor line of a block whose own values failed the field filter: it is
+   context for the lines below it, not a result in its own right */
+.result-row-filtered .result-text { opacity: 0.55; font-style: italic; }
+
+/* the "⋯" row that breaks non-adjacent blocks in the in-file table view.
+   Height must match ROW_H in App.tsx or virtual scrolling drifts. */
+.vt-sep {
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: repeating-linear-gradient(
+    90deg, transparent, transparent 6px, #e6e9ec 6px, #e6e9ec 12px
+  );
+}
+.vt-sep-mark {
+  background: #fff;
+  color: #8a9099;
+  font-size: 11px;
+  letter-spacing: 2px;
+  padding: 0 10px;
+}
+
+/* -A/-B context rows sit behind the lines that actually matched */
+.vt-ctx { opacity: 0.62; }
+
+.log-filter-tag {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  background: #eef4ff; color: #2c5aa0; border: 1px solid #d4e2f7;
+  border-radius: 4px; padding: 1px 6px; cursor: help;
+}
+.log-filter-bad {
+  font-size: 11px; font-weight: 700;
+  background: #fff4e0; color: #9a6300; border: 1px solid #ffe2b0;
+  border-radius: 999px; padding: 1px 9px; cursor: help;
+}

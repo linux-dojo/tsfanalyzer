@@ -47,6 +47,8 @@ type Store interface {
 	SaveCounters(fileID string, series parser.Series) error
 	CounterNames(fileID string) ([]CounterMeta, error)
 	CounterSeries(fileID string, names []string, from, to time.Time) (map[string][]parser.Point, error)
+	SaveSearchIndex(fileID string, idx *parser.SearchIndex) error
+	SearchIndexFor(fileID string) (*parser.SearchIndex, error)
 }
 
 // MemoryReport is the memory/OOM verdict for a file: one analysis per
@@ -77,6 +79,7 @@ type Memory struct {
 	licenses  map[string][]parser.License
 	memory    map[string]MemoryReport
 	counters  map[string]parser.Series
+	searchIdx map[string]*parser.SearchIndex
 }
 
 func NewMemory() *Memory {
@@ -90,6 +93,7 @@ func NewMemory() *Memory {
 		licenses:  make(map[string][]parser.License),
 		memory:    make(map[string]MemoryReport),
 		counters:  make(map[string]parser.Series),
+		searchIdx: make(map[string]*parser.SearchIndex),
 	}
 }
 
@@ -136,7 +140,31 @@ func (m *Memory) Delete(id string) error {
 	delete(m.licenses, id)
 	delete(m.memory, id)
 	delete(m.counters, id)
+	delete(m.searchIdx, id)
 	return nil
+}
+
+// SaveSearchIndex stores the parse-time search index. The blob it points at
+// lives on disk beside the archive; removing it is the caller's job, since
+// the store owns no files.
+func (m *Memory) SaveSearchIndex(fileID string, idx *parser.SearchIndex) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.files[fileID]; !ok {
+		return ErrNotFound
+	}
+	m.searchIdx[fileID] = idx
+	return nil
+}
+
+func (m *Memory) SearchIndexFor(fileID string) (*parser.SearchIndex, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	idx, ok := m.searchIdx[fileID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return idx, nil
 }
 
 func (m *Memory) SaveAppStats(fileID string, st *parser.AppStats) error {

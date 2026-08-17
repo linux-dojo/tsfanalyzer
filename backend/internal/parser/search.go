@@ -17,6 +17,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"regexp"
 	"strconv"
@@ -38,6 +39,10 @@ type SearchResult struct {
 	LineNo  int           `json:"line_no,omitempty"`
 	Text    string        `json:"text,omitempty"`
 	Context []ContextLine `json:"context,omitempty"`
+	// Filtered means this line matched the search but not the field filter.
+	// It is kept only as the anchor for context lines that did pass — the
+	// usual shape of "find this section header, show the values under it".
+	Filtered bool `json:"filtered,omitempty"`
 }
 
 // SearchOptions controls one search.
@@ -52,20 +57,55 @@ type SearchOptions struct {
 }
 
 const (
-	defaultMaxResults  = 200
-	maxLineHitsPerFile = 50
+	// Caps exist to bound the response, but they must be reported: a silently
+	// truncated result set made the counts look arbitrary (a per-file cap of
+	// 50 showed as "50 matches" for one file and "150" for three). They are
+	// generous now that the index makes a scan cheap.
+	defaultMaxResults  = 2000
+	maxLineHitsPerFile = 500
 	maxContextLines    = 30
 )
+
+// SearchOutcome is the result set plus what was left out, so the UI can say
+// so rather than presenting a truncated count as the total.
+type SearchOutcome struct {
+	Results []SearchResult `json:"results"`
+	// Truncated is set when the overall cap stopped the scan early.
+	Truncated bool `json:"truncated"`
+	// CappedFiles lists files where the per-file cap was hit.
+	CappedFiles []string `json:"capped_files,omitempty"`
+	Limit       int      `json:"limit"`
+
+	// Indexed reports whether the trigram index served this search, and
+	// Candidates/Scanned how much of the archive it had to look at — the
+	// difference between the two is what the index saved.
+	Indexed    bool `json:"indexed"`
+	Candidates int  `json:"candidates,omitempty"`
+	Scanned    int  `json:"scanned,omitempty"`
+	// TimedOut means the deadline stopped the scan, so the results are
+	// partial. Reporting it beats letting the request die as a 504.
+	TimedOut bool `json:"timed_out,omitempty"`
+
+	// Filter echoes the "| $2 > 10" clause that was applied, and FilterError
+	// explains a clause that could not be parsed (in which case none was
+	// applied, so the user sees everything rather than nothing).
+	Filter      string `json:"filter,omitempty"`
+	FilterError string `json:"filter_error,omitempty"`
+}
 
 /* ---------- query parsing ---------- */
 
 type queryNode interface {
 	match(lower string) bool
+	// plan states which trigrams a match requires, for narrowing the set of
+	// candidate files. A node that cannot promise anything returns triAny.
+	plan() triQuery
 }
 
 type termNode struct {
 	re      *regexp.Regexp // set for regex terms
 	literal string         // set for quoted terms (already lower-cased)
+	tq      triQuery       // what this term requires of a file
 }
 
 func (t termNode) match(lower string) bool {
@@ -75,6 +115,8 @@ func (t termNode) match(lower string) bool {
 	return strings.Contains(lower, t.literal)
 }
 
+func (t termNode) plan() triQuery { return t.tq }
+
 type notNode struct{ a queryNode }
 type andNode struct{ a, b queryNode }
 type orNode struct{ a, b queryNode }
@@ -83,12 +125,25 @@ func (n notNode) match(s string) bool { return !n.a.match(s) }
 func (n andNode) match(s string) bool { return n.a.match(s) && n.b.match(s) }
 func (n orNode) match(s string) bool  { return n.a.match(s) || n.b.match(s) }
 
+// A negated term says nothing about what a file must contain.
+func (n notNode) plan() triQuery { return triAny() }
+func (n andNode) plan() triQuery { return triAnd(n.a.plan(), n.b.plan()) }
+func (n orNode) plan() triQuery  { return triOr(n.a.plan(), n.b.plan()) }
+
 // SearchQuery is a parsed query plus the context counts pulled out of it.
 type SearchQuery struct {
 	root   queryNode
 	Before int
 	After  int
 	Empty  bool
+	// Tri is the trigram requirement derived from the tree, used to pick
+	// candidate files and to gate individual lines.
+	Tri triQuery
+	// Filter is the trailing "| $2 > 10" clause, if any. It narrows the lines
+	// that are shown; it is deliberately not part of Tri, because a file can
+	// only be excluded by what the search terms require, never by a value
+	// test that a line elsewhere in the file might satisfy.
+	Filter *FieldFilter
 }
 
 // Match reports whether a line satisfies the query.
@@ -106,6 +161,11 @@ var contextFlagRe = regexp.MustCompile(`(?i)(^|\s)-([ABC])\s*(\d+)`)
 // than failing, so typing mid-query never errors.
 func ParseSearchQuery(raw string) *SearchQuery {
 	q := &SearchQuery{}
+
+	// peel off a trailing "| $2 > 10" field filter before anything else, so
+	// the search half never sees it
+	raw, clause := SplitFieldClause(raw)
+	q.Filter = ParseFieldFilter(clause)
 
 	// pull out the grep-style context flags first
 	body := contextFlagRe.ReplaceAllStringFunc(raw, func(m string) string {
@@ -128,6 +188,7 @@ func ParseSearchQuery(raw string) *SearchQuery {
 	body = strings.TrimSpace(body)
 	if body == "" {
 		q.Empty = true
+		q.Tri = triAny()
 		return q
 	}
 	toks := tokenizeQuery(body)
@@ -135,9 +196,11 @@ func ParseSearchQuery(raw string) *SearchQuery {
 	root := p.parseOr()
 	if root == nil {
 		// fall back to a literal match on the whole body
-		root = termNode{literal: strings.ToLower(body)}
+		lower := strings.ToLower(body)
+		root = termNode{literal: lower, tq: triFromLiteral(lower)}
 	}
 	q.root = root
+	q.Tri = root.plan()
 	return q
 }
 
@@ -290,25 +353,44 @@ func (p *queryParser) parseNot() queryNode {
 
 // makeTerm compiles a bare term as a case-insensitive regex; a quoted term
 // is matched literally so that punctuation-heavy phrases need no escaping.
+// Each term also carries the trigrams a file must contain for it to match.
 func makeTerm(t qtok) queryNode {
 	if t.quot {
-		return termNode{literal: strings.ToLower(t.val)}
+		lower := strings.ToLower(t.val)
+		return termNode{literal: lower, tq: triFromLiteral(lower)}
 	}
 	re, err := regexp.Compile("(?i)" + t.val)
 	if err != nil {
-		return termNode{literal: strings.ToLower(t.val)}
+		// an unparseable regex degrades to a literal, so its trigrams are
+		// exactly the literal's
+		lower := strings.ToLower(t.val)
+		return termNode{literal: lower, tq: triFromLiteral(lower)}
 	}
-	return termNode{re: re}
+	return termNode{re: re, tq: triFromRegexp(t.val)}
+}
+
+// noteFilter records the field-filter clause on the outcome so the UI can
+// echo it, and can say when a clause was ignored rather than applied.
+func (o *SearchOutcome) noteFilter(q *SearchQuery) {
+	if q == nil || q.Filter == nil {
+		return
+	}
+	o.Filter = q.Filter.Text
+	o.FilterError = q.Filter.Bad
 }
 
 /* ---------- the search itself ---------- */
 
 // SearchArchive scans the archive for a query, optionally restricted to a set
 // of paths, returning matches with grep-style context.
-func SearchArchive(r io.ReadSeeker, opts SearchOptions) ([]SearchResult, error) {
+//
+// This is the unindexed path: it inflates the whole archive, so it is the
+// fallback (and the oracle the indexed path is tested against) rather than
+// what the UI normally hits. See SearchIndexed.
+func SearchArchive(r io.ReadSeeker, opts SearchOptions) (*SearchOutcome, error) {
 	q := ParseSearchQuery(opts.Query)
 	if q.Empty {
-		return []SearchResult{}, nil
+		return &SearchOutcome{Results: []SearchResult{}, Limit: 0}, nil
 	}
 	before, after := q.Before, q.After
 	if opts.Before > before {
@@ -333,7 +415,12 @@ func SearchArchive(r io.ReadSeeker, opts SearchOptions) ([]SearchResult, error) 
 	if err != nil {
 		return nil, err
 	}
-	out := []SearchResult{}
+	res := &SearchOutcome{Results: []SearchResult{}, Limit: max}
+	res.noteFilter(q)
+	out := res.Results
+	// Deliberately no line gate here: this path is the oracle the indexed
+	// path is tested against, so it runs the query tree over every line.
+	var scratch []byte
 
 	for len(out) < max {
 		hdr, err := tr.Next()
@@ -364,15 +451,31 @@ func SearchArchive(r io.ReadSeeker, opts SearchOptions) ([]SearchResult, error) 
 		if peek, _ := br.Peek(512); bytes.IndexByte(peek, 0) >= 0 {
 			continue // binary
 		}
-		out = searchLines(br, p, q, before, after, max, out)
+		var capped bool
+		out, capped, scratch = searchLines(context.Background(), br, p, q, nil, scratch, before, after, max, out)
+		if capped {
+			res.CappedFiles = append(res.CappedFiles, p)
+		}
 	}
-	return out, nil
+	res.Results = out
+	res.Truncated = len(out) >= max
+	return res, nil
 }
+
+// deadlineCheckLines is how often the scan looks at the context: often enough
+// to stop promptly, rarely enough that the check costs nothing.
+const deadlineCheckLines = 4096
 
 // searchLines scans one file, keeping a ring buffer of preceding lines so
 // -B context can be emitted, and a countdown so -A context following a match
 // is captured as the scan continues.
-func searchLines(r io.Reader, path string, q *SearchQuery, before, after, max int, out []SearchResult) []SearchResult {
+//
+// gate, when set, is a folded literal that every matching line must contain.
+// Testing it with a byte search first is far cheaper than running the regex
+// tree, and it means a non-matching line costs no allocation at all: the line
+// is only converted to a string once it is a real candidate. scratch is a
+// reusable fold buffer, returned so the caller can carry it between files.
+func searchLines(ctx context.Context, r io.Reader, path string, q *SearchQuery, gate, scratch []byte, before, after, max int, out []SearchResult) ([]SearchResult, bool, []byte) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
@@ -384,17 +487,29 @@ func searchLines(r io.Reader, path string, q *SearchQuery, before, after, max in
 	ring := make([]ContextLine, 0, before) // the last `before` lines seen
 	lineNo := 0
 	hits := 0
+	start := len(out) // where this file's results begin, for the filter sweep
 
 	for sc.Scan() {
 		lineNo++
-		line := sc.Text()
+		raw := sc.Bytes()
 
-		// 1. this line is trailing context for any result still waiting
+		if lineNo%deadlineCheckLines == 0 && ctx.Err() != nil {
+			break
+		}
+
+		// 1. this line is trailing context for any result still waiting. The
+		// countdown runs whether or not the line survives the field filter,
+		// because grep emits the next n lines and awk drops some of them —
+		// the window is n lines, not n surviving lines.
 		if len(pend) > 0 {
 			keep := pend[:0]
+			text := clip(string(raw))
+			survives := q.Filter.Keep(string(raw))
 			for _, a := range pend {
-				out[a.idx].Context = append(out[a.idx].Context,
-					ContextLine{LineNo: lineNo, Text: clip(line)})
+				if survives {
+					out[a.idx].Context = append(out[a.idx].Context,
+						ContextLine{LineNo: lineNo, Text: text})
+				}
 				if a.need--; a.need > 0 {
 					keep = append(keep, a)
 				}
@@ -402,25 +517,45 @@ func searchLines(r io.Reader, path string, q *SearchQuery, before, after, max in
 			pend = keep
 		}
 
-		// 2. does the line itself match?
-		if hits < maxLineHitsPerFile && len(out) < max && q.Match(line) {
-			res := SearchResult{Type: "line", Path: path, LineNo: lineNo, Text: clip(line)}
-			if before > 0 {
-				res.Context = append(res.Context, ring...)
+		// 2. does the line itself match? The gate rejects the overwhelming
+		// majority of lines without touching the regex engine.
+		if hits < maxLineHitsPerFile && len(out) < max {
+			candidate := true
+			if len(gate) > 0 {
+				scratch = foldLine(scratch[:0], raw)
+				candidate = bytes.Contains(scratch, gate)
 			}
-			out = append(out, res)
-			hits++
-			if after > 0 {
-				pend = append(pend, awaiting{idx: len(out) - 1, need: after})
+			if candidate && q.Match(string(raw)) {
+				passes := q.Filter.Keep(string(raw))
+				// A match that fails the filter is only worth keeping if it
+				// can still anchor context lines that pass.
+				if passes || before > 0 || after > 0 {
+					res := SearchResult{
+						Type: "line", Path: path, LineNo: lineNo,
+						Text: clip(string(raw)), Filtered: !passes,
+					}
+					for _, cl := range ring {
+						if q.Filter.Keep(cl.Text) {
+							res.Context = append(res.Context, cl)
+						}
+					}
+					out = append(out, res)
+					hits++
+					if after > 0 {
+						pend = append(pend, awaiting{idx: len(out) - 1, need: after})
+					}
+				}
 			}
 		}
 
-		// 3. remember this line as possible leading context for later matches
+		// 3. remember this line as possible leading context for later matches.
+		// The ring is unfiltered so it stays a true "last n lines" window;
+		// filtering happens when the lines are emitted, above.
 		if before > 0 {
 			if len(ring) == before {
 				ring = ring[1:]
 			}
-			ring = append(ring, ContextLine{LineNo: lineNo, Text: clip(line), Before: true})
+			ring = append(ring, ContextLine{LineNo: lineNo, Text: clip(string(raw)), Before: true})
 		}
 
 		// stop once the cap is reached and nothing is still collecting context
@@ -428,7 +563,22 @@ func searchLines(r io.Reader, path string, q *SearchQuery, before, after, max in
 			break
 		}
 	}
-	return out
+
+	// Drop anchors whose context all failed the filter too: nothing of that
+	// block survived, so it should not appear at all.
+	if q.Filter.Active() {
+		kept := out[:start]
+		for _, r := range out[start:] {
+			if r.Filtered && len(r.Context) == 0 {
+				continue
+			}
+			kept = append(kept, r)
+		}
+		out = kept
+	}
+
+	// report whether this file had more matches than the per-file cap allowed
+	return out, hits >= maxLineHitsPerFile, scratch
 }
 
 func clip(s string) string {

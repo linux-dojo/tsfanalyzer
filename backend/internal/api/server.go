@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -20,6 +21,14 @@ import (
 )
 
 const maxUploadBytes = 512 << 20 // 512 MiB
+
+// searchDeadline bounds one search. Well under the proxy's own timeout, so a
+// slow query returns partial results the UI can explain rather than a 504.
+const searchDeadline = 20 * time.Second
+
+// searchBlobPath is where the uncompressed text of an archive is cached for
+// searching: beside the archive, so it is removed with it.
+func searchBlobPath(storagePath string) string { return storagePath + ".sblob" }
 
 type Server struct {
 	store     store.Store
@@ -45,6 +54,16 @@ func NewServer(st store.Store, uploadDir string) *Server {
 		uploadDir: uploadDir,
 		mux:       http.NewServeMux(),
 		parseSlot: make(chan struct{}, 1),
+	}
+	// The registry is in memory, so nothing survives a restart — including
+	// the indexes these blobs belong to. Clear them out rather than let each
+	// restart leave a few gigabytes behind.
+	if stale, err := filepath.Glob(filepath.Join(uploadDir, "*.sblob")); err == nil {
+		for _, p := range stale {
+			if os.Remove(p) == nil {
+				log.Printf("removed stale search blob %s", filepath.Base(p))
+			}
+		}
 	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("POST /api/v1/files", s.handleUpload)
@@ -161,6 +180,24 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 				status, errMsg = "failed", "save index: "+err.Error()
 			} else {
 				log.Printf("parse %s: indexed %d files", rec.ID, len(idx))
+			}
+		}
+	}
+
+	// pass 1b: the search index. Doing this here means every later search is
+	// a read from an uncompressed blob over a handful of candidate files,
+	// instead of inflating the whole archive per query.
+	if status == "parsed" {
+		fs, err := os.Open(rec.StoragePath)
+		if err == nil {
+			sidx, serr := parser.BuildSearchIndex(fs, searchBlobPath(rec.StoragePath))
+			fs.Close()
+			if serr != nil {
+				log.Printf("parse %s: search index: %v (search falls back to scanning)", rec.ID, serr)
+			} else {
+				_ = s.store.SaveSearchIndex(rec.ID, sidx)
+				log.Printf("parse %s: search index over %d files, %d MB of text, %d trigrams, %d postings",
+					rec.ID, len(sidx.Files), sidx.BlobBytes>>20, sidx.Trigrams, sidx.Postings)
 			}
 		}
 	}
@@ -463,15 +500,38 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	defer src.Close()
 
-	results, err := parser.SearchArchive(src, parser.SearchOptions{
+	// A deadline, not a hang: a query broad enough to outrun it comes back
+	// with partial results flagged as such, which is far more useful than the
+	// proxy killing the request and the UI showing nothing.
+	ctx, cancel := context.WithTimeout(r.Context(), searchDeadline)
+	defer cancel()
+
+	opts := parser.SearchOptions{
 		Query: q, Paths: paths, Before: before, After: after, MaxResults: limit,
-	})
+	}
+	var outcome *parser.SearchOutcome
+	if sidx, ierr := s.store.SearchIndexFor(id); ierr == nil {
+		outcome, err = parser.SearchIndexed(ctx, sidx, src, opts)
+	} else {
+		// still parsing, or the index could not be built
+		outcome, err = parser.SearchArchive(src, opts)
+	}
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "search failed: "+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"query": q, "paths": paths, "results": results,
+		"query": q, "paths": paths,
+		"results":      outcome.Results,
+		"truncated":    outcome.Truncated,
+		"capped_files": outcome.CappedFiles,
+		"limit":        outcome.Limit,
+		"indexed":      outcome.Indexed,
+		"candidates":   outcome.Candidates,
+		"scanned":      outcome.Scanned,
+		"timed_out":    outcome.TimedOut,
+		"filter":       outcome.Filter,
+		"filter_error": outcome.FilterError,
 	})
 }
 
@@ -599,9 +659,12 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "file not found")
 		return
 	}
-	// Delete blob first, then registry entry (phase 2: also cascade-delete parsed data).
+	// Delete the stored files first, then the registry entry (phase 2: also
+	// cascade-delete parsed data). The search blob is several times the size
+	// of the archive, so leaving it behind would quietly fill the disk.
 	if f.StoragePath != "" {
 		os.Remove(f.StoragePath)
+		os.Remove(searchBlobPath(f.StoragePath))
 	}
 	if err := s.store.Delete(id); err != nil {
 		httpError(w, http.StatusInternalServerError, "could not delete file")

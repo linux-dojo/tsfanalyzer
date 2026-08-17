@@ -38,6 +38,9 @@ interface SearchResult {
   line_no?: number;
   text?: string;
   context?: ContextLine[]; // grep-style -A / -B lines
+  // matched the search but not the field filter; kept as the anchor for
+  // context lines that did pass
+  filtered?: boolean;
 }
 
 interface LogEntryRow {
@@ -2912,17 +2915,249 @@ const fmtSize = (n: number) =>
      · parentheses · grep-style -A / -B / -C context
    Bare terms are regular expressions; quoted terms match literally. */
 
+/* Two results continue one another when they are consecutive lines of the
+   same file — anything else starts a new block and gets a rule above it, the
+   way grep separates groups with "--". */
+function continuesPrevious(prev: SearchResult, cur: SearchResult): boolean {
+  if (prev.path !== cur.path) return false;
+  if (prev.type !== "line" || cur.type !== "line") return false;
+  const prevEnd = (prev.context ?? []).reduce(
+    (m, c) => Math.max(m, c.line_no),
+    prev.line_no ?? 0
+  );
+  const curStart = (cur.context ?? []).reduce(
+    (m, c) => Math.min(m, c.line_no),
+    cur.line_no ?? 0
+  );
+  return curStart <= prevEnd + 1;
+}
+
 interface LineQuery {
   empty: boolean;
   before: number;
   after: number;
   match: (line: string) => boolean;
+  /* the trailing "| $2 > 10" clause: keeps lines whose fields pass a test */
+  keep: (line: string) => boolean;
+  filterText: string;
+  filterError: string;
 }
 
 const CONTEXT_FLAG_RE = /(^|\s)-([ABC])\s*(\d+)/gi;
 const MAX_CONTEXT = 30;
 
-function parseLineQuery(raw: string): LineQuery {
+/* ---------- awk-style field filter (mirrors parser/fieldfilter.go) ----------
+   Fields are counted from the message: a leading timestamp and severity /
+   subsystem label are skipped, so on
+     2026/08/04 21:00:20 medium general pkt_recv 4523
+   $1 is "pkt_recv" and $2 is "4523". $0 is the whole line. */
+
+const TS_DATE_RE = /^\d{4}[-/]\d{2}[-/]\d{2}([T ]|$)/;
+const TS_TIME_RE = /^\d{1,2}:\d{2}(:\d{2})?([.,]\d+)?$/;
+const TS_MON_RE = /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)$/i;
+const TS_DAY_RE = /^\d{1,2}$/;
+const LOG_LABEL_RE =
+  /^(critical|high|medium|low|informational|info|debug|warn|warning|error|err|notice|alert|emerg)$/i;
+const BARE_WORD_RE = /^[A-Za-z_-][A-Za-z0-9_-]*$/;
+
+/* offset at which the message begins, past any timestamp and severity label */
+function messageStart(line: string): number {
+  const toks: { s: string; off: number }[] = [];
+  const re = /[^\s]+/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(line)) !== null) toks.push({ s: m[0], off: m.index });
+
+  let i = 0;
+  if (i < toks.length && TS_DATE_RE.test(toks[i].s)) i++;
+  else if (i + 1 < toks.length && TS_MON_RE.test(toks[i].s) && TS_DAY_RE.test(toks[i + 1].s)) i += 2;
+  if (i < toks.length && TS_TIME_RE.test(toks[i].s)) i++;
+  if (i > 0 && i < toks.length && LOG_LABEL_RE.test(toks[i].s)) {
+    i++;
+    if (i < toks.length && BARE_WORD_RE.test(toks[i].s)) i++;
+  }
+  return i >= toks.length ? line.length : toks[i].off;
+}
+
+function messageFields(line: string): string[] {
+  const msg = line.slice(messageStart(line));
+  return msg.trim() === "" ? [] : msg.split(/\s+/).filter(Boolean);
+}
+
+/* -F splitting: empty fields are kept (with an explicit separator an empty
+   field is data), and each field is trimmed. */
+function messageFieldsSep(line: string, sep: RegExp): string[] {
+  const msg = line.slice(messageStart(line));
+  if (msg === "") return [];
+  return msg.split(sep).map((s) => s.trim());
+}
+
+/* Follows awk's rule: a single character is literal, anything longer is a
+   regex, and a space means runs of whitespace. */
+function parseSeparator(arg: string): { re: RegExp | null; shown: string; error: string } {
+  const shown = arg;
+  let a = arg;
+  if (a.length >= 2 && (a[0] === "'" || a[0] === '"') && a[a.length - 1] === a[0]) {
+    a = a.slice(1, -1);
+  }
+  a = a.replace(/\\t/g, "\t").replace(/\\n/g, "\n").replace(/\\\\/g, "\\");
+  if (a === "") return { re: null, shown, error: "empty -F separator" };
+  if (a === " " || a === "\t") return { re: /\s+/, shown, error: "" };
+  const quote = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if ([...a].length === 1) return { re: new RegExp(quote(a)), shown, error: "" };
+  try {
+    return { re: new RegExp(a), shown, error: "" };
+  } catch {
+    // a multi-character separator that is not a valid regex is still a
+    // perfectly reasonable literal, e.g. -F'::'
+    return { re: new RegExp(quote(a)), shown, error: "" };
+  }
+}
+
+const SEP_FLAG_RE = /^-F\s*('[^']*'|"[^"]*"|\S+)\s*/;
+
+/* accepts the shapes counters appear in: "4523", "4523,", "1400000kB", "85%" */
+function fieldNumber(s: string): number | null {
+  const m = /^[+-]?[\d.]+/.exec(s.trim());
+  if (!m) return null;
+  const v = parseFloat(m[0].replace(/[.+-]+$/, ""));
+  return Number.isFinite(v) ? v : null;
+}
+
+interface FieldCond {
+  field: number;
+  op: string;
+  num: number | null;
+  str: string;
+  re: RegExp | null;
+}
+
+function splitKeyword(s: string, kw: string): string[] {
+  const out: string[] = [];
+  let cur: string[] = [];
+  for (const w of s.split(/\s+/).filter(Boolean)) {
+    if (w.toUpperCase() === kw) { out.push(cur.join(" ")); cur = []; continue; }
+    cur.push(w);
+  }
+  out.push(cur.join(" "));
+  return out;
+}
+
+const FIELD_COND_RE = /^\$(\d+)\s*(!~|~|>=|<=|==|!=|=|>|<)\s*(.+)$/;
+
+function parseFieldCond(s: string): FieldCond | string {
+  const m = FIELD_COND_RE.exec(s.trim());
+  if (!m) return s.trim() ? `expected $N followed by > >= < <= == != ~ : ${s}` : "empty condition";
+  const field = parseInt(m[1], 10);
+  const op = m[2] === "=" ? "==" : m[2];
+  const rhs = m[3].trim().replace(/^["']|["']$/g, "");
+  if (!rhs) return `missing value after ${m[2]}`;
+  if (op === "~" || op === "!~") {
+    try { return { field, op, num: null, str: "", re: new RegExp(rhs, "i") }; }
+    catch { return `bad regex: ${rhs}`; }
+  }
+  const num = fieldNumber(rhs);
+  return { field, op, num, str: rhs.toLowerCase(), re: null };
+}
+
+/* Returns a predicate plus the reason a clause was ignored. A clause that
+   cannot be parsed is not applied at all, so a half-typed filter shows
+   everything rather than an arbitrary subset. */
+function parseFieldFilter(clause: string): {
+  keep: (line: string) => boolean;
+  error: string;
+  active: boolean;
+  sep: string;
+} {
+  const pass = { keep: () => true, error: "", active: false, sep: "" };
+  let text = clause.trim();
+  if (!text) return pass;
+
+  let sepRe: RegExp | null = null;
+  let sepShown = "";
+  const sm = SEP_FLAG_RE.exec(text);
+  if (sm) {
+    const parsed = parseSeparator(sm[1]);
+    if (parsed.error) return { ...pass, error: parsed.error };
+    sepRe = parsed.re;
+    sepShown = parsed.shown;
+    text = text.slice(sm[0].length).trim();
+    if (!text) return { ...pass, error: "-F given with no condition after it" };
+  }
+
+  const groups: FieldCond[][] = [];
+  for (const orPart of splitKeyword(text, "OR")) {
+    const group: FieldCond[] = [];
+    for (const andPart of splitKeyword(orPart, "AND")) {
+      const c = parseFieldCond(andPart);
+      if (typeof c === "string") return { ...pass, error: c };
+      group.push(c);
+    }
+    if (group.length === 0) return { ...pass, error: "empty condition" };
+    groups.push(group);
+  }
+  if (groups.length === 0) return pass;
+
+  const evalCond = (c: FieldCond, line: string, fields: string[]): boolean => {
+    let val: string;
+    if (c.field === 0) val = line;
+    else if (c.field <= fields.length) val = fields[c.field - 1];
+    else return false;
+
+    if (c.op === "~") return c.re !== null && c.re.test(val);
+    if (c.op === "!~") return c.re !== null && !c.re.test(val);
+
+    if (c.num !== null) {
+      const n = fieldNumber(val);
+      if (n === null) return false;
+      switch (c.op) {
+        case ">": return n > c.num;
+        case ">=": return n >= c.num;
+        case "<": return n < c.num;
+        case "<=": return n <= c.num;
+        case "==": return n === c.num;
+        case "!=": return n !== c.num;
+      }
+      return false;
+    }
+    const lv = val.toLowerCase();
+    switch (c.op) {
+      case "==": return lv === c.str;
+      case "!=": return lv !== c.str;
+      case ">": return lv > c.str;
+      case ">=": return lv >= c.str;
+      case "<": return lv < c.str;
+      case "<=": return lv <= c.str;
+    }
+    return false;
+  };
+
+  return {
+    active: true,
+    error: "",
+    sep: sepShown,
+    keep: (line: string) => {
+      const fields = sepRe ? messageFieldsSep(line, sepRe) : messageFields(line);
+      return groups.some((g) => g.every((c) => evalCond(c, line, fields)));
+    },
+  };
+}
+
+/* Separates a query from its trailing pipe filter. The pipe must be followed
+   by a "$", so the "|" the search grammar accepts as OR is not mistaken for
+   a pipe. */
+function splitFieldClause(raw: string): [string, string] {
+  for (let i = raw.length - 1; i >= 0; i--) {
+    if (raw[i] !== "|") continue;
+    if (i > 0 && raw[i - 1] === "|") continue;
+    const rest = raw.slice(i + 1).trim();
+    if (rest.startsWith("$") || rest.startsWith("-F")) return [raw.slice(0, i).trim(), rest];
+  }
+  return [raw, ""];
+}
+
+function parseLineQuery(rawInput: string): LineQuery {
+  const [raw, clause] = splitFieldClause(rawInput);
+  const filter = parseFieldFilter(clause);
   let before = 0, after = 0;
   const body = raw
     .replace(CONTEXT_FLAG_RE, (_m, _p, flag: string, n: string) => {
@@ -2935,7 +3170,12 @@ function parseLineQuery(raw: string): LineQuery {
     })
     .trim();
 
-  const noMatch = { empty: true, before, after, match: () => false };
+  const extras = {
+    keep: filter.keep,
+    filterText: filter.active ? clause.trim() : "",
+    filterError: filter.error,
+  };
+  const noMatch = { empty: true, before, after, match: () => false, ...extras };
   if (!body) return noMatch;
 
   type Tok = { k: string; v?: string; quot?: boolean };
@@ -3011,7 +3251,7 @@ function parseLineQuery(raw: string): LineQuery {
   let root = parseOr();
   if (!root) { const lit = body.toLowerCase(); root = (s) => s.includes(lit); }
   const fn = root;
-  return { empty: false, before, after, match: (line) => fn(line.toLowerCase()) };
+  return { empty: false, before, after, match: (line) => fn(line.toLowerCase()), ...extras };
 }
 
 /* ---------- Log Files tab ---------- */
@@ -3383,6 +3623,22 @@ function ArchiveSearch({
   );
   const [searching, setSearching] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
+  // a failed request must never look like "no matches"
+  const [error, setError] = useState<string | null>(null);
+  const [truncated, setTruncated] = useState(false);
+  const [cappedFiles, setCappedFiles] = useState<string[]>([]);
+  // partial results because the deadline hit, rather than a dead request
+  const [timedOut, setTimedOut] = useState(false);
+  const [scanned, setScanned] = useState<{ scanned: number; candidates: number } | null>(null);
+  // the "| $2 > 10" clause the server applied, and why it ignored a bad one
+  const [filterText, setFilterText] = useState("");
+  const [filterError, setFilterError] = useState("");
+
+  // Guards against a slow earlier response overwriting a newer one. Without
+  // this, changing the query or the file scope mid-flight could show stale
+  // results, or clobber good results with an older empty set.
+  const seqRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
 
   // the global search box and its results survive leaving the tab
   useEffect(() => {
@@ -3395,20 +3651,68 @@ function ArchiveSearch({
   const scopeKey = (scopePaths ?? []).join("|");
 
   useEffect(() => {
-    if (query.trim().length < 2) {
+    const trimmed = query.trim();
+    if (trimmed.length < 2) {
+      abortRef.current?.abort();
+      seqRef.current++; // invalidate anything in flight
       setResults(null);
+      setError(null);
+      setSearching(false); // otherwise "Searching…" could stick forever
       return;
     }
     setSearching(true);
+    setError(null);
+
     const t = setTimeout(() => {
-      const p = new URLSearchParams({ q: query.trim() });
+      // supersede any request still running: they scan the whole archive, so
+      // leaving them to finish is both slow and a source of stale results
+      abortRef.current?.abort();
+      const ac = new AbortController();
+      abortRef.current = ac;
+      const seq = ++seqRef.current;
+
+      const p = new URLSearchParams({ q: trimmed });
       if (scopeKey) p.set("paths", scopeKey);
-      fetch(`/api/v1/files/${fileId}/search?${p.toString()}`)
-        .then((r) => (r.ok ? r.json() : Promise.reject()))
-        .then((d) => setResults(d.results ?? []))
-        .catch(() => setResults([]))
-        .finally(() => setSearching(false));
+
+      fetch(`/api/v1/files/${fileId}/search?${p.toString()}`, { signal: ac.signal })
+        .then(async (r) => {
+          if (!r.ok) {
+            let detail = `HTTP ${r.status}`;
+            try {
+              const body = await r.json();
+              if (body?.error) detail += ` — ${body.error}`;
+            } catch {
+              /* not JSON; the status alone is the message */
+            }
+            throw new Error(detail);
+          }
+          return r.json();
+        })
+        .then((d) => {
+          if (seq !== seqRef.current) return; // a newer search has taken over
+          setResults(d.results ?? []);
+          setTruncated(Boolean(d.truncated));
+          setCappedFiles(d.capped_files ?? []);
+          setTimedOut(Boolean(d.timed_out));
+          setFilterText(typeof d.filter === "string" ? d.filter : "");
+          setFilterError(typeof d.filter_error === "string" ? d.filter_error : "");
+          setScanned(
+            d.indexed
+              ? { scanned: Number(d.scanned) || 0, candidates: Number(d.candidates) || 0 }
+              : null
+          );
+          setSearching(false);
+        })
+        .catch((err: unknown) => {
+          if (seq !== seqRef.current) return;
+          const name = (err as { name?: string })?.name;
+          if (name === "AbortError") return; // superseded on purpose
+          setError((err as Error)?.message || "search failed");
+          setResults(null); // NOT [] — an error is not "no matches"
+          setSearching(false);
+        });
     }, 450);
+
     return () => clearTimeout(t);
   }, [query, fileId, scopeKey]);
 
@@ -3426,9 +3730,61 @@ function ArchiveSearch({
         {results !== null && (
           <>
             <span className="muted">
+              {truncated ? "first " : ""}
               {results.length} result{results.length === 1 ? "" : "s"}
               {lineHits !== results.length ? ` (${lineHits} line)` : ""}
             </span>
+            {truncated && (
+              <span
+                className="search-capped"
+                title="The result cap stopped the scan early — narrow the query or restrict it to specific files to see the rest."
+              >
+                more exist
+              </span>
+            )}
+            {cappedFiles.length > 0 && (
+              <span
+                className="search-capped"
+                title={"Per-file cap reached in:\n" + cappedFiles.join("\n")}
+              >
+                {cappedFiles.length} file{cappedFiles.length === 1 ? "" : "s"} capped
+              </span>
+            )}
+            {timedOut && (
+              <span
+                className="search-capped"
+                title="The search ran out of time and stopped early, so these results are partial. Narrow the query or restrict it to specific files."
+              >
+                partial — timed out
+              </span>
+            )}
+            {filterText && (
+              <span
+                className="log-filter-tag"
+                title="Field filter, applied to matched lines and their context alike"
+              >
+                | {filterText}
+              </span>
+            )}
+            {filterError && (
+              <span className="search-capped" title={filterError}>
+                filter ignored
+              </span>
+            )}
+            {scanned && (
+              <span
+                className="muted search-scanned"
+                title={
+                  "The search index narrowed the archive to " +
+                  scanned.candidates +
+                  " candidate file(s); " +
+                  scanned.scanned +
+                  " were read."
+                }
+              >
+                {scanned.scanned} file{scanned.scanned === 1 ? "" : "s"} read
+              </span>
+            )}
             <button className="link-btn" onClick={() => setCollapsed(!collapsed)}>
               {collapsed ? "show" : "hide"}
             </button>
@@ -3441,27 +3797,52 @@ function ArchiveSearch({
       <input
         className="search-input"
         type="search"
-        placeholder={placeholder ?? 'Search…  ospf AND down · "exact phrase" · regex · -A 3 -B 2'}
+        placeholder={placeholder ?? 'Search…  ospf AND down · "phrase" · -A 3 -B 2 · | $2 > 10000'}
         title={
           "AND / OR / NOT (also && || !), parentheses\n" +
           'bare terms are regexes, "quoted" terms match literally\n' +
           "-A n / -B n / -C n show lines after / before / around each match\n\n" +
+          "| $2 > 10000   filter by field value, like piping to awk\n" +
+          "   $1, $2, … count from the message (timestamp and label skipped)\n" +
+          "   $0 is the whole line; operators > >= < <= == != ~ !~\n" +
+          "   combine with AND / OR:  pkt_recv -A 10 | $2 > 1000 AND $1 ~ rx\n" +
+          "   -F sets the separator:  sessions | -F',' $3 > 500\n" +
+          "      one character is literal, longer is a regex: -F'\\s*:\\s*'\n" +
+          "   the filter applies to matched lines and their context alike\n\n" +
           "Click a hit to open it below; Alt/Option+click opens it maximized."
         }
         value={query}
         onChange={(e) => setQuery(e.target.value)}
       />
-      {searching && <p className="muted">Searching…</p>}
+      {searching && <p className="muted">Searching the archive…</p>}
+      {error && !searching && (
+        <p className="error">
+          Search failed: {error}. The archive is scanned per query, so a very
+          large file can time out — try restricting the search to specific files.
+        </p>
+      )}
       {results !== null && !searching && !collapsed && (
         <div className="search-results">
           {results.map((r, i) => (
-            <div key={i} className="result-item">
+            <div
+              key={i}
+              className={
+                "result-item" +
+                // a rule above each block that does not continue the previous
+                // one, so consecutive hits never run together
+                (i > 0 && !continuesPrevious(results[i - 1], r) ? " result-break" : "")
+              }
+            >
               <button
-                className="result-row"
+                className={"result-row" + (r.filtered ? " result-row-filtered" : "")}
                 onClick={(e) => onOpen(r.path, r.type === "line" ? r.line_no : undefined, e.altKey)}
                 title={
                   (r.type === "line" ? `${r.path} (line ${r.line_no})` : r.path) +
-                  "\nAlt/Option+click to open maximized"
+                  "\nAlt/Option+click to open maximized" +
+                  (r.filtered
+                    ? "\n\nThis line matched the search but not the field filter;" +
+                      " it is shown because context lines below did pass."
+                    : "")
                 }
               >
                 <span className="result-main">
@@ -3505,6 +3886,10 @@ interface FlatRow {
   msg: string;
   entryIdx: number;
   first: boolean;
+  /* a break between blocks that are not adjacent in the file, like grep's -- */
+  sep: boolean;
+  /* the line matched the search, rather than being -A/-B context around one */
+  match: boolean;
 }
 
 /* Fetched log content cache: keeps the last N opened files in memory so
@@ -3612,39 +3997,72 @@ function LogContent({
 
   // flatten entries into uniform-height display rows (long messages become
   // continuation rows with blank ts/label)
-  // entries kept by the in-file search, plus their -A/-B context
+  // Entries kept by the in-file search, plus their -A/-B context. Each kept
+  // entry records whether it was a match (rather than context) and whether a
+  // gap precedes it, so non-adjacent blocks can be separated the way grep
+  // separates them with "--" instead of running together.
   const shownEntries = useMemo(() => {
     if (!entries) return null;
-    if (query.empty) return entries;
+    if (query.empty) {
+      return entries.map((e) => ({ e, match: false, gap: false }));
+    }
+    const matched = new Set<number>();
     const keep = new Set<number>();
     entries.forEach((e, i) => {
       if (query.match(`${e.ts} ${e.label} ${e.msg}`)) {
+        matched.add(i);
         keep.add(i);
         for (let k = 1; k <= query.before; k++) if (i - k >= 0) keep.add(i - k);
         for (let k = 1; k <= query.after; k++) if (i + k < entries.length) keep.add(i + k);
       }
     });
-    return entries.filter((_, i) => keep.has(i));
+    const out: { e: LogEntryRow; match: boolean; gap: boolean }[] = [];
+    let prev = -1;
+    for (let i = 0; i < entries.length; i++) {
+      if (!keep.has(i)) continue;
+      // the field filter runs over matches and context alike, as piping to
+      // awk would
+      if (!query.keep(`${entries[i].ts} ${entries[i].label} ${entries[i].msg}`)) continue;
+      out.push({ e: entries[i], match: matched.has(i), gap: prev >= 0 && i > prev + 1 });
+      prev = i;
+    }
+    return out;
   }, [entries, query]);
 
   const matchCount = useMemo(() => {
     if (!entries || query.empty) return 0;
     let n = 0;
-    for (const e of entries) if (query.match(`${e.ts} ${e.label} ${e.msg}`)) n++;
+    for (const e of entries) {
+      const line = `${e.ts} ${e.label} ${e.msg}`;
+      if (query.match(line) && query.keep(line)) n++;
+    }
     return n;
   }, [entries, query]);
 
   const rows: FlatRow[] = useMemo(() => {
-    const entries = shownEntries;
-    if (!entries) return [];
+    const shown = shownEntries;
+    if (!shown) return [];
     const out: FlatRow[] = [];
-    entries.forEach((e, i) => {
+    shown.forEach((s, i) => {
+      const e = s.e;
+      if (s.gap) {
+        // a break between blocks that are not adjacent in the file
+        out.push({ ts: "", label: "", msg: "", entryIdx: i, first: false, sep: true, match: false });
+      }
       const chunks =
         e.msg.length > MSG_CHUNK
           ? e.msg.match(new RegExp(`.{1,${MSG_CHUNK}}`, "g")) ?? [e.msg]
           : [e.msg];
       chunks.forEach((c, j) =>
-        out.push({ ts: j === 0 ? e.ts : "", label: j === 0 ? e.label : "", msg: c, entryIdx: i, first: j === 0 })
+        out.push({
+          ts: j === 0 ? e.ts : "",
+          label: j === 0 ? e.label : "",
+          msg: c,
+          entryIdx: i,
+          first: j === 0,
+          sep: false,
+          match: s.match,
+        })
       );
     });
     return out;
@@ -3684,12 +4102,18 @@ function LogContent({
             <input
               className="log-search"
               type="search"
-              placeholder='search this file…  ospf AND down · "phrase" · -A 3'
+              placeholder='search this file…  ospf AND down · -A 3 · | $2 > 10000'
               title={
                 "Same syntax as the archive search:\n" +
                 "  AND / OR / NOT (also && || !), parentheses\n" +
                 '  bare terms are regexes, "quoted" terms are literal\n' +
-                "  -A n / -B n / -C n for lines after / before / around a match"
+                "  -A n / -B n / -C n for lines after / before / around a match\n" +
+                "  | $2 > 10000   filter by field value, like piping to awk\n" +
+                "     $1, $2, … count from the message (timestamp and label skipped)\n" +
+                "     $0 is the whole line; operators > >= < <= == != ~ !~\n" +
+                "     combine with AND / OR, e.g. | $2 > 1000 AND $1 ~ userid\n" +
+                "     -F sets the separator: | -F',' $3 > 500  (longer than one\n" +
+                "     character is treated as a regex, e.g. -F'\\s*:\\s*')"
               }
               value={q}
               onChange={(e) => setQ(e.target.value)}
@@ -3698,6 +4122,16 @@ function LogContent({
           {structured && !query.empty && (
             <span className="log-search-count">
               {matchCount} match{matchCount === 1 ? "" : "es"}
+            </span>
+          )}
+          {structured && query.filterText && (
+            <span className="log-filter-tag" title="Field filter applied to matches and context alike">
+              | {query.filterText}
+            </span>
+          )}
+          {structured && query.filterError && (
+            <span className="log-filter-bad" title={query.filterError}>
+              filter ignored
             </span>
           )}
           <button className="view-toggle" onClick={() => setStructured(!structured)}>
@@ -3744,18 +4178,26 @@ function LogContent({
             onScroll={(e) => setScrollTop((e.target as HTMLDivElement).scrollTop)}
           >
             <div style={{ height: padTop }} />
-            {rows.slice(winStart, winEnd).map((r, k) => (
-              <div
-                key={winStart + k}
-                className={
-                  "vt-row" + (r.entryIdx === hlEntryIdx && r.first ? " hl-vt" : "")
-                }
-              >
-                <span className="lt-ts">{r.ts}</span>
-                <span className="lt-label">{r.label}</span>
-                <span className="lt-msg">{r.msg}</span>
-              </div>
-            ))}
+            {rows.slice(winStart, winEnd).map((r, k) =>
+              r.sep ? (
+                <div key={winStart + k} className="vt-row vt-sep">
+                  <span className="vt-sep-mark">⋯</span>
+                </div>
+              ) : (
+                <div
+                  key={winStart + k}
+                  className={
+                    "vt-row" +
+                    (r.entryIdx === hlEntryIdx && r.first ? " hl-vt" : "") +
+                    (!query.empty && !r.match ? " vt-ctx" : "")
+                  }
+                >
+                  <span className="lt-ts">{r.ts}</span>
+                  <span className="lt-label">{r.label}</span>
+                  <span className="lt-msg">{r.msg}</span>
+                </div>
+              )
+            )}
             <div style={{ height: padBottom }} />
             {rows.length === 0 && (
               <p className="muted">(no entries — try Raw view or clear the time filter)</p>

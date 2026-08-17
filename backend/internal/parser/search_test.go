@@ -30,11 +30,11 @@ func searchTgz(t *testing.T) []byte {
 
 func runSearch(t *testing.T, opts SearchOptions) []SearchResult {
 	t.Helper()
-	res, err := SearchArchive(bytes.NewReader(searchTgz(t)), opts)
+	out, err := SearchArchive(bytes.NewReader(searchTgz(t)), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return res
+	return out.Results
 }
 
 func lineHits(res []SearchResult) []SearchResult {
@@ -179,6 +179,26 @@ func TestSearchFileNameMatchesOnlyWhenUnrestricted(t *testing.T) {
 		if r.Type == "file" {
 			t.Errorf("a restricted search should not report filename matches: %+v", r)
 		}
+	}
+}
+
+// The per-file cap must be reported, not silently applied: presenting a
+// truncated count as the total is what made the result counts look arbitrary.
+func TestSearchReportsCaps(t *testing.T) {
+	var sb strings.Builder
+	for i := 0; i < maxLineHitsPerFile+50; i++ {
+		sb.WriteString("repeated needle line\n")
+	}
+	tgz := buildMultiTgz(t, map[string]string{"var/log/pan/many.log": sb.String()})
+	out, err := SearchArchive(bytes.NewReader(tgz), SearchOptions{Query: "needle"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.CappedFiles) != 1 || out.CappedFiles[0] != "var/log/pan/many.log" {
+		t.Errorf("the capped file should be named: %+v", out.CappedFiles)
+	}
+	if out.Limit == 0 {
+		t.Error("the limit in force should be reported")
 	}
 }
 
