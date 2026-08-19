@@ -22,6 +22,12 @@ type TechSupportFile struct {
 	Error      string    `json:"error,omitempty"` // why parsing failed
 	UploadedAt time.Time `json:"uploaded_at"`
 	StoragePath string   `json:"-"`
+
+	// Kind is what the archive turned out to be: a firewall tech-support file
+	// or a GlobalProtect agent log collection. It decides which parse passes
+	// run and which tabs the UI shows. Empty until parsing identifies it.
+	Kind        parser.ArchiveKind `json:"kind,omitempty"`
+	KindMarkers []string           `json:"kind_markers,omitempty"`
 }
 
 type Store interface {
@@ -30,6 +36,7 @@ type Store interface {
 	Get(id string) (TechSupportFile, error)
 	Delete(id string) error
 	SetStatus(id, status, errMsg string) error
+	SetKind(id string, kind parser.ArchiveKind, markers []string) error
 	SaveSystemInfo(fileID string, info []parser.KV) error
 	SystemInfo(fileID string) ([]parser.KV, error)
 	SaveArchiveIndex(fileID string, entries []parser.ArchiveEntry) error
@@ -49,6 +56,19 @@ type Store interface {
 	CounterSeries(fileID string, names []string, from, to time.Time) (map[string][]parser.Point, error)
 	SaveSearchIndex(fileID string, idx *parser.SearchIndex) error
 	SearchIndexFor(fileID string) (*parser.SearchIndex, error)
+	SaveGP(fileID string, gp GPReport) error
+	GPFor(fileID string) (GPReport, error)
+}
+
+// GPReport is everything extracted from a GlobalProtect agent collection.
+type GPReport struct {
+	Overview *parser.GPOverview        `json:"overview"`
+	Timeline []parser.GPEvent          `json:"timeline"`
+	Attempts []parser.GPAttempt         `json:"attempts"`
+	Gateways *parser.GPGatewaySelection `json:"gateways"`
+	Portals  []parser.GPPortal          `json:"portals"`
+	HIP      *parser.HIPReport          `json:"hip"`
+	Auth     []parser.GPAuthEvent       `json:"auth"`
 }
 
 // MemoryReport is the memory/OOM verdict for a file: one analysis per
@@ -80,6 +100,7 @@ type Memory struct {
 	memory    map[string]MemoryReport
 	counters  map[string]parser.Series
 	searchIdx map[string]*parser.SearchIndex
+	gp        map[string]GPReport
 }
 
 func NewMemory() *Memory {
@@ -94,6 +115,7 @@ func NewMemory() *Memory {
 		memory:    make(map[string]MemoryReport),
 		counters:  make(map[string]parser.Series),
 		searchIdx: make(map[string]*parser.SearchIndex),
+		gp:        make(map[string]GPReport),
 	}
 }
 
@@ -141,7 +163,28 @@ func (m *Memory) Delete(id string) error {
 	delete(m.memory, id)
 	delete(m.counters, id)
 	delete(m.searchIdx, id)
+	delete(m.gp, id)
 	return nil
+}
+
+func (m *Memory) SaveGP(fileID string, gp GPReport) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.files[fileID]; !ok {
+		return ErrNotFound
+	}
+	m.gp[fileID] = gp
+	return nil
+}
+
+func (m *Memory) GPFor(fileID string) (GPReport, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	gp, ok := m.gp[fileID]
+	if !ok {
+		return GPReport{}, ErrNotFound
+	}
+	return gp, nil
 }
 
 // SaveSearchIndex stores the parse-time search index. The blob it points at
@@ -346,6 +389,21 @@ func (m *Memory) ArchiveIndex(fileID string) ([]parser.ArchiveEntry, error) {
 		return nil, ErrNotFound
 	}
 	return entries, nil
+}
+
+// SetKind records what the archive was identified as, with the paths that
+// decided it so a wrong call can be inspected rather than just doubted.
+func (m *Memory) SetKind(id string, kind parser.ArchiveKind, markers []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	f, ok := m.files[id]
+	if !ok {
+		return ErrNotFound
+	}
+	f.Kind = kind
+	f.KindMarkers = markers
+	m.files[id] = f
+	return nil
 }
 
 func (m *Memory) SetStatus(id, status, errMsg string) error {

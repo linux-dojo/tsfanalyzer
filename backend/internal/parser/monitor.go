@@ -15,6 +15,15 @@ type LogEntry struct {
 	Ts    string `json:"ts"`
 	Label string `json:"label"`
 	Msg   string `json:"msg"`
+	// Line is the 1-based line number this entry came from in the source file.
+	//
+	// It is not the entry's own index: blank lines are dropped, continuation
+	// lines are kept, and a GlobalProtect log can carry two entries on one
+	// physical line. So an index into this slice drifts from the file's line
+	// numbering, and a search hit — which reports a *file* line — cannot be
+	// located by index. Carrying the line number is what lets the viewer jump
+	// to and highlight the right row.
+	Line int `json:"line"`
 }
 
 var (
@@ -32,7 +41,16 @@ var (
 // StructureLogPage returns one page of structured entries plus the total
 // in-range entry count, so very large logs can be served in slices.
 func StructureLogPage(r io.Reader, from, to time.Time, offset, limit int) ([]LogEntry, int) {
-	all := StructureLog(r, from, to)
+	// A GlobalProtect agent log has its own line format; sniffing the opening
+	// lines picks the right parser without the caller needing to know which
+	// kind of archive the file came out of.
+	head, rest := headLines(r, 20)
+	var all []LogEntry
+	if looksLikeGPLog(head) {
+		all = StructureGPLog(rest, from, to)
+	} else {
+		all = StructureLog(rest, from, to)
+	}
 	total := len(all)
 	if offset < 0 {
 		offset = 0
@@ -80,7 +98,9 @@ func StructureLog(r io.Reader, from, to time.Time) []LogEntry {
 		return ts.Format("2006/01/02 15:04:05")
 	}
 
+	lineNo := 0
 	for sc.Scan() {
+		lineNo++
 		line := strings.TrimRight(sc.Text(), "\r")
 		trimmed := strings.TrimSpace(line)
 
@@ -91,7 +111,7 @@ func StructureLog(r io.Reader, from, to time.Time) []LogEntry {
 			}
 			label, sub, inResource = m[2], "", false
 			if inRange() {
-				out = append(out, LogEntry{fmtTs(), label, line})
+				out = append(out, LogEntry{Ts: fmtTs(), Label: label, Msg: line, Line: lineNo})
 			}
 			continue
 		}
@@ -128,7 +148,7 @@ func StructureLog(r io.Reader, from, to time.Time) []LogEntry {
 		if sub != "" {
 			lab += " " + sub
 		}
-		out = append(out, LogEntry{fmtTs(), lab, line})
+		out = append(out, LogEntry{Ts: fmtTs(), Label: lab, Msg: line, Line: lineNo})
 	}
 	return out
 }

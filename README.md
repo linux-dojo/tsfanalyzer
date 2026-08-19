@@ -26,6 +26,85 @@ browser ── nginx ──► api (Go) ──► postgres + timescaledb   (meta
 > implementation can drop in without touching the API or parsers. The Go backend is
 > currently **stdlib-only** (empty `go.mod` dependencies).
 
+### Two kinds of archive
+
+The tool takes both a **firewall tech-support file** and a **GlobalProtect agent log
+collection** (the `.tgz` the GP app's "Collect Logs" produces on an endpoint). They go
+to the same upload box; the kind is detected from the archive's own file list during
+the first parse pass, shown as a badge in My Files, and decides which tabs open.
+
+Firewall evidence always wins. A tech-support file from a firewall running
+GlobalProtect contains portal and gateway logs whose names look much like the agent's,
+whereas an endpoint collection never has `/opt/pancfg`, a CLI dump or dataplane monitor
+logs — so one firewall marker outweighs any number of GP-looking names. An archive that
+matches neither, but is small, flat and mostly `.log` files, is treated as an agent
+collection; anything else is left unrecognised and parsed as a firewall file.
+
+Parse passes that read PAN-OS-only material (counters, config, OOM analysis, app stats,
+licences) are skipped for an agent bundle. The archive index and search index are built
+for both, so browsing and searching work either way.
+
+A `.zip` (what the Windows GP app produces) is converted to `.tar.gz` once at upload,
+decided by the file's magic bytes rather than its extension, so the index, search blob
+and every parser see one container format.
+
+**GP tabs:** Overview · Connection · Authentication · HIP & Network · Log Files ·
+Anomalies. Overview, Connection and Log Files are implemented; the other three are
+scaffolded.
+
+#### Connection flow
+
+A connection is a fixed sequence, each stage reachable only if the one before it
+succeeded: portal pre-login → portal auth → portal config → network discovery →
+gateway select → gateway auth → tunnel → HIP. Each attempt in the log is segmented and
+scored against that sequence, so the Connection tab reports *where* it stopped rather
+than only that it failed — "57 attempts, 37 stopped at gateway select" is the diagnosis.
+
+Gateway selection gets its own table, because the agent's error for every failure there
+is the same unhelpful sentence about the network being unreachable. The table shows each
+gateway's priority, whether the client's source address matched the gateway's configured
+region, the measured TCP response time, and which one won. A region mismatch scores a
+gateway **-2** and silently removes it from contention — the common cause of "connected
+to the portal but never to a gateway", and exactly what the sample bundles showed: the
+gateway answered in 20 ms but its region was `0.0.0.0-0.255.255.255` while the portal
+placed the client in `10.0.0.0-10.255.255.255`.
+
+With more than one gateway, priority and response time both count. Since app 4.0.3 the
+highest/high/medium priorities are tried ahead of low/lowest regardless of response
+time, with the low ones appended after; before 4.0.3 a slower high-priority gateway
+could lose outright to a faster low-priority one. See
+[Gateway Priority in a Multiple Gateway Configuration](https://docs.paloaltonetworks.com/globalprotect/administration/globalprotect-gateways/gateway-priority-in-a-multiple-gateway-configuration).
+
+Two things the parser has to get right, both found by running it over real collections:
+rotated logs must be read **oldest first** (a tar lists members in arbitrary order, so
+reading `PanGPS.1.log` after `PanGPS.log` let a stale round overwrite the current one),
+and scoring is grouped into **rounds** delimited by `Parse gateway list`, with only the
+last round reported — earlier rounds can belong to a different portal entirely.
+
+#### GP log formats
+
+The agent writes three line formats, all handled, and the right parser is chosen by
+sniffing a file's opening lines:
+
+```
+08/18/2026 13:55:40:423 [Info ]: portal status is Connected.          event logs
+(P11496-T6520)Info (11298): 08/18/26 13:55:40:474 Connect method …    component logs
+(P11496-T14080)debug08/18/26 09:41:41:742 (152): [CP_DETECT] …        captive-portal log
+```
+
+Two of those were only found by measuring parser coverage against a real 6.3.3
+collection: `PanGPA.log` indents its lines by one space, and `pan_cp_events.log`
+orders the fields differently and runs a long severity straight into the date
+(`debug08/18/26`), so the severity has to be matched as letters only. A line matching
+no format is treated as a continuation of the entry above it and keeps its timestamp —
+in the sample bundle 24,000 of `PanGPA.log`'s lines are multi-line JSON dumps.
+
+The process and thread tag leads each component-log message rather than being
+discarded: the agent is two programs — PanGPS, the service that does the work, and
+PanGPA, the UI that relays commands to and from it — so following a connection means
+following a conversation between threads, and `P…-T…` is what makes one thread's story
+separable and searchable.
+
 ### Search syntax
 
 ```

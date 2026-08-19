@@ -76,6 +76,7 @@ func NewServer(st store.Store, uploadDir string) *Server {
 	s.mux.HandleFunc("GET /api/v1/files/{id}/memory", s.handleMemory)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/app-stats", s.handleAppStats)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/licenses", s.handleLicenses)
+	s.mux.HandleFunc("GET /api/v1/files/{id}/gp", s.handleGP)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/content", s.handleContent)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/search", s.handleSearch)
 	s.mux.HandleFunc("GET /api/v1/files/{id}/counters", s.handleCounters)
@@ -108,9 +109,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	if !strings.HasSuffix(strings.ToLower(header.Filename), ".tgz") &&
-		!strings.HasSuffix(strings.ToLower(header.Filename), ".tar.gz") {
-		httpError(w, http.StatusUnsupportedMediaType, "only .tgz / .tar.gz tech-support files are accepted")
+	// A firewall tech-support file is a gzipped tar; a GlobalProtect agent
+	// collection is a .zip on Windows. Both are accepted, and a zip is
+	// converted below so the rest of the pipeline sees one container format.
+	lower := strings.ToLower(header.Filename)
+	if !strings.HasSuffix(lower, ".tgz") && !strings.HasSuffix(lower, ".tar.gz") &&
+		!strings.HasSuffix(lower, ".zip") {
+		httpError(w, http.StatusUnsupportedMediaType,
+			"only .tgz / .tar.gz tech-support files and .zip GlobalProtect log bundles are accepted")
 		return
 	}
 
@@ -130,6 +136,29 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		os.Remove(dst)
 		httpError(w, http.StatusInternalServerError, "could not store file: "+err.Error())
 		return
+	}
+	out.Close() // the conversion below reopens it, and Windows-made zips need it closed
+
+	// Normalise a zip into the gzipped tar everything downstream expects. The
+	// magic bytes decide, not the extension, so a mislabelled file still works.
+	if parser.LooksLikeZip(dst) {
+		conv := dst + ".conv"
+		if cerr := parser.ConvertZipToTgz(dst, conv); cerr != nil {
+			os.Remove(conv)
+			os.Remove(dst)
+			log.Printf("upload: convert zip %s: %v", dst, cerr)
+			httpError(w, http.StatusBadRequest, "could not read the .zip archive: "+cerr.Error())
+			return
+		}
+		if rerr := os.Rename(conv, dst); rerr != nil {
+			os.Remove(conv)
+			os.Remove(dst)
+			httpError(w, http.StatusInternalServerError, "could not store converted archive")
+			return
+		}
+		if fi, serr := os.Stat(dst); serr == nil {
+			log.Printf("upload: converted zip to tar.gz (%d -> %d bytes)", size, fi.Size())
+		}
 	}
 
 	rec := store.TechSupportFile{
@@ -162,8 +191,12 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 
 	status := "parsed"
 	errMsg := ""
+	kind := parser.KindUnknown
 
-	// pass 1: index every file in the archive
+	// pass 1: index every file in the archive, and classify it from that same
+	// listing — a GlobalProtect agent collection has none of the firewall's
+	// counters, config or CLI dump, so most of the passes below do not apply
+	// to it and would only waste time.
 	f, err := os.Open(rec.StoragePath)
 	if err != nil {
 		status, errMsg = "failed", "open stored archive: "+err.Error()
@@ -179,10 +212,19 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 			if err := s.store.SaveArchiveIndex(rec.ID, idx); err != nil {
 				status, errMsg = "failed", "save index: "+err.Error()
 			} else {
-				log.Printf("parse %s: indexed %d files", rec.ID, len(idx))
+				det := parser.DetectKind(idx)
+				kind = det.Kind
+				_ = s.store.SetKind(rec.ID, det.Kind, det.Markers)
+				log.Printf("parse %s: indexed %d files, identified as %s (%d firewall / %d gp markers)",
+					rec.ID, len(idx), det.Kind, det.FirewallHits, det.GPHits)
 			}
 		}
 	}
+
+	// Everything from here that reads PAN-OS-only material is skipped for an
+	// endpoint collection. The archive index and the search index above apply
+	// to both, so browsing and searching work for either kind.
+	firewall := kind == parser.KindFirewall || kind == parser.KindUnknown
 
 	// pass 1b: the search index. Doing this here means every later search is
 	// a read from an uncompressed blob over a handful of candidate files,
@@ -202,8 +244,75 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 		}
 	}
 
+	// pass 1c: GlobalProtect agent collection — the endpoint overview and the
+	// connection narrative. Cheap: these files are small compared with a
+	// tech-support archive.
+	if status == "parsed" && kind == parser.KindGPAgent {
+		rep := store.GPReport{Timeline: []parser.GPEvent{}}
+		if fg, gerr := os.Open(rec.StoragePath); gerr == nil {
+			if ov, oerr := parser.ExtractGPOverview(fg); oerr == nil {
+				rep.Overview = ov
+			} else {
+				log.Printf("parse %s: gp overview: %v", rec.ID, oerr)
+			}
+			fg.Close()
+		}
+		if fg, gerr := os.Open(rec.StoragePath); gerr == nil {
+			if tl, terr := parser.ExtractGPTimeline(fg, 20000); terr == nil {
+				rep.Timeline = tl
+			} else {
+				log.Printf("parse %s: gp timeline: %v", rec.ID, terr)
+			}
+			fg.Close()
+		}
+		if fg, gerr := os.Open(rec.StoragePath); gerr == nil {
+			if at, aerr := parser.ExtractGPAttempts(fg); aerr == nil {
+				rep.Attempts = at
+			} else {
+				log.Printf("parse %s: gp attempts: %v", rec.ID, aerr)
+			}
+			fg.Close()
+		}
+		if fg, gerr := os.Open(rec.StoragePath); gerr == nil {
+			if gw, werr := parser.ExtractGPGateways(fg); werr == nil {
+				rep.Gateways = gw
+			} else {
+				log.Printf("parse %s: gp gateways: %v", rec.ID, werr)
+			}
+			fg.Close()
+		}
+		if fg, gerr := os.Open(rec.StoragePath); gerr == nil {
+			if ps, perr := parser.ExtractGPPortals(fg); perr == nil {
+				rep.Portals = ps
+			} else {
+				log.Printf("parse %s: gp portals: %v", rec.ID, perr)
+			}
+			fg.Close()
+		}
+		if fg, gerr := os.Open(rec.StoragePath); gerr == nil {
+			if h, herr := parser.ExtractHIPReport(fg); herr == nil {
+				rep.HIP = h
+			} else {
+				log.Printf("parse %s: hip report: %v", rec.ID, herr)
+			}
+			fg.Close()
+		}
+		// derived from the attempts, so the Authentication and Connection views
+		// can never disagree
+		rep.Auth = parser.GPAuthEvents(rep.Attempts)
+		_ = s.store.SaveGP(rec.ID, rep)
+		connected := 0
+		for _, a := range rep.Attempts {
+			if a.Outcome == "connected" {
+				connected++
+			}
+		}
+		log.Printf("parse %s: globalprotect agent bundle (%d events, %d attempts, %d connected)",
+			rec.ID, len(rep.Timeline), len(rep.Attempts), connected)
+	}
+
 	// pass 2: system info block (best-effort — file stays browsable without it)
-	if status == "parsed" {
+	if status == "parsed" && firewall {
 		f2, err := os.Open(rec.StoragePath)
 		if err == nil {
 			if info, perr := parser.ExtractSystemInfo(f2); perr == nil {
@@ -221,7 +330,7 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 	// counters can be named rather than numbered.
 	var samples parser.Series
 	appNames := map[int]string{}
-	if status == "parsed" {
+	if status == "parsed" && firewall {
 		if fa, err := os.Open(rec.StoragePath); err == nil {
 			if got, aerr := parser.ExtractAppIDs(fa); aerr == nil && len(got) > 0 {
 				appNames = got
@@ -245,7 +354,7 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 	}
 
 	// pass 4: PAN-OS running config (best-effort — powers the Config tab)
-	if status == "parsed" {
+	if status == "parsed" && firewall {
 		f4, err := os.Open(rec.StoragePath)
 		if err == nil {
 			if doc, cerr := parser.ExtractConfig(f4); cerr == nil {
@@ -260,8 +369,9 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 	}
 
 	// pass 5: anomalies — recurring system-log events plus counter threshold
-	// breaches and trends, merged into one list (best-effort)
-	if status == "parsed" {
+	// breaches and trends, merged into one list (best-effort). Both sources
+	// are PAN-OS-specific; the GP agent's own anomaly rules come separately.
+	if status == "parsed" && firewall {
 		var groups []parser.AnomalyGroup
 		f5, err := os.Open(rec.StoragePath)
 		if err == nil {
@@ -288,7 +398,7 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 	// pass 6: OOM detection + memory-leak attribution (best-effort — powers
 	// the Graphs > Memory / OOM tab). Needs the counters from pass 3 and the
 	// archive index from pass 1, so it runs last.
-	if status == "parsed" {
+	if status == "parsed" && firewall {
 		f6, err := os.Open(rec.StoragePath)
 		if err == nil {
 			oom, oerr := parser.FindOOMEvents(f6)
@@ -309,7 +419,7 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 	}
 
 	// pass 7: CLI dump extras — application statistics and licences
-	if status == "parsed" {
+	if status == "parsed" && firewall {
 		// Prefer the dataplane's own per-app accounting (panio_infreq, which
 		// is a time series) over the one-off CLI snapshot; fall back to the
 		// snapshot when the block is absent.
@@ -532,6 +642,39 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		"timed_out":    outcome.TimedOut,
 		"filter":       outcome.Filter,
 		"filter_error": outcome.FilterError,
+	})
+}
+
+func (s *Server) handleGP(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	rep, err := s.store.GPFor(id)
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "this file is not a GlobalProtect agent collection")
+		return
+	}
+	// nil slices marshal as null, which the UI would have to special-case
+	if rep.Timeline == nil {
+		rep.Timeline = []parser.GPEvent{}
+	}
+	if rep.Attempts == nil {
+		rep.Attempts = []parser.GPAttempt{}
+	}
+	if rep.Portals == nil {
+		rep.Portals = []parser.GPPortal{}
+	}
+	if rep.Auth == nil {
+		rep.Auth = []parser.GPAuthEvent{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"file_id":  id,
+		"overview": rep.Overview,
+		"timeline": rep.Timeline,
+		"attempts": rep.Attempts,
+		"gateways": rep.Gateways,
+		"portals":  rep.Portals,
+		"hip":      rep.HIP,
+		"auth":     rep.Auth,
+		"stages":   parser.GPStageOrder,
 	})
 }
 

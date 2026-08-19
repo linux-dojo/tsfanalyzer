@@ -5,7 +5,12 @@ import type { MouseEvent as ReactMouseEvent } from "react";
 import Dygraph from "dygraphs";
 import "dygraphs/dist/dygraph.css";
 
-type Tab = "system" | "logs" | "graphs" | "appstats" | "licenses" | "config";
+/* Firewall tech-support tabs, then the GlobalProtect agent ones. A file only
+   ever shows the set that matches what it is — the two archives share almost
+   nothing beyond being browsable and searchable. */
+type Tab =
+  | "system" | "logs" | "graphs" | "appstats" | "licenses" | "config"
+  | "gp-overview" | "gp-connection" | "gp-auth" | "gp-hip" | "gp-anomalies";
 
 interface TsFile {
   id: string;
@@ -14,7 +19,18 @@ interface TsFile {
   status: string; // parsing | parsed | failed
   error?: string;
   uploaded_at: string;
+  /* what the archive turned out to be; decides which tabs are shown */
+  kind?: ArchiveKind;
+  kind_markers?: string[];
 }
+
+type ArchiveKind = "firewall" | "gp-agent" | "unknown";
+
+const KIND_LABEL: Record<ArchiveKind, string> = {
+  firewall: "Firewall",
+  "gp-agent": "GP agent",
+  unknown: "Unrecognised",
+};
 
 interface KV {
   key: string;
@@ -47,6 +63,9 @@ interface LogEntryRow {
   ts: string;
   label: string;
   msg: string;
+  /* the 1-based line number in the source file this entry came from; a search
+     hit reports a file line, which is not the same as an index into this list */
+  line?: number;
 }
 
 interface ViewItem {
@@ -92,7 +111,7 @@ function logStateFor(fileId: string): LogFilesState {
   return st;
 }
 
-const TABS: { id: Tab; label: string }[] = [
+const FIREWALL_TABS: { id: Tab; label: string }[] = [
   { id: "system", label: "System Info" },
   { id: "logs", label: "Log Files" },
   { id: "graphs", label: "Graphs" },
@@ -100,6 +119,19 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "licenses", label: "Licenses" },
   { id: "config", label: "Config" },
 ];
+
+const GP_TABS: { id: Tab; label: string }[] = [
+  { id: "gp-overview", label: "Overview" },
+  { id: "gp-connection", label: "Connection" },
+  { id: "gp-auth", label: "Authentication" },
+  { id: "gp-hip", label: "HIP & Network" },
+  { id: "logs", label: "Log Files" },
+  { id: "gp-anomalies", label: "Anomalies" },
+];
+
+function tabsFor(kind: ArchiveKind | undefined): { id: Tab; label: string }[] {
+  return kind === "gp-agent" ? GP_TABS : FIREWALL_TABS;
+}
 
 export default function App() {
   const logs = window.location.pathname.match(/^\/files\/([0-9a-f]+)\/logs$/);
@@ -192,6 +224,7 @@ function FilesPage() {
           <thead>
             <tr>
               <th>Filename</th>
+              <th>Type</th>
               <th>Size</th>
               <th>Status</th>
               <th>Uploaded</th>
@@ -210,6 +243,15 @@ function FilesPage() {
                     f.filename
                   )}
                 </td>
+                <td>
+                  {f.kind ? (
+                    <span className={"kind-badge kind-" + f.kind} title={kindTitle(f)}>
+                      {KIND_LABEL[f.kind]}
+                    </span>
+                  ) : (
+                    <span className="muted">—</span>
+                  )}
+                </td>
                 <td>{(f.size_bytes / 1024 / 1024).toFixed(1)} MB</td>
                 <td>
                   <StatusIcon status={f.status} error={f.error} />
@@ -225,12 +267,982 @@ function FilesPage() {
             ))}
             {files.length === 0 && (
               <tr>
-                <td colSpan={5}>No files uploaded yet.</td>
+                <td colSpan={6}>No files uploaded yet.</td>
               </tr>
             )}
           </tbody>
         </table>
       </main>
+    </div>
+  );
+}
+
+function kindTitle(f: TsFile): string {
+  const base =
+    f.kind === "gp-agent"
+      ? "Identified as a GlobalProtect agent log collection"
+      : f.kind === "firewall"
+      ? "Identified as a firewall tech-support file"
+      : "The archive did not look like either a tech-support file or a GP agent collection";
+  return f.kind_markers?.length ? base + ", from:\n" + f.kind_markers.join("\n") : base;
+}
+
+/* The GP tabs whose parsers are not written yet. Rather than an empty pane,
+   each says what it will hold and why it is not there — the log formats are
+   being written against a real agent bundle instead of guessed at. */
+const GP_PENDING = {
+  overview:
+    "App version, operating system, host and user, the portal and gateway in use, " +
+    "and the connection state at the time the logs were collected.",
+  connection:
+    "Every connect, disconnect, portal contact and gateway selection in order, with " +
+    "the reason recorded for each — drawn from pan_gp_event.log and PanGPS.log.",
+  auth:
+    "Authentication attempts and their outcomes: method, cookie or certificate reuse, " +
+    "SAML redirects, and the failures in between.",
+  hip:
+    "The HIP report the agent produced and whether the gateway accepted it, alongside " +
+    "the routing table, adapters, DNS and proxy state captured at connect time.",
+  anomalies:
+    "Repeated failures grouped by cause — authentication rejections, certificate errors, " +
+    "tunnel drops, unreachable gateways, portal timeouts — plotted over time.",
+};
+
+interface GpOverview {
+  client_version?: string; service_version?: string;
+  portal?: string; gateway?: string; user?: string;
+  connect_method?: string; final_state?: string;
+  host_name?: string; os_name?: string; os_version?: string;
+  vendor?: string; model?: string; total_mem_mb?: string; boot_time?: string;
+  hip_user?: string; hip_host_id?: string; hip_ip?: string; hip_generated?: string;
+  first_seen?: string; last_seen?: string;
+}
+
+interface GpEvent {
+  ts: string;
+  severity: string;
+  phase: string;
+  message: string;
+  source: string;
+  outcome?: string;
+}
+
+interface GpStageResult {
+  stage: string;
+  status: "ok" | "failed" | "reached" | "not reached";
+  at?: string;
+  detail?: string;
+}
+
+interface GpAttempt {
+  start: string;
+  end: string;
+  stages: GpStageResult[];
+  reached: string;
+  stop_at: string;
+  outcome: "connected" | "failed" | "incomplete";
+  reason?: string;
+  portal?: string;
+  gateway?: string;
+  user?: string;
+  events: number;
+}
+
+interface GpGateway {
+  fqdn: string;
+  name?: string;
+  ipv4?: string;
+  ipv6?: string;
+  priority?: number;
+  manual?: boolean;
+  region_match?: boolean;
+  region?: string;
+  tcp_ms?: number;
+  ssl_ms?: number;
+  weight?: number;
+  selected: boolean;
+  internal: boolean;
+}
+
+interface GpGatewaySelection {
+  type?: string;
+  gateways: GpGateway[];
+  best?: string;
+  cutoff_secs?: number;
+  external_count?: number;
+  internal_count?: number;
+  notes?: string[];
+}
+
+interface GpPortalGateway {
+  fqdn: string;
+  name?: string;
+  ipv4?: string;
+  priority?: number;
+  duration_ms?: number;
+  weight?: number;
+  excluded?: string;
+  selected: boolean;
+}
+
+interface GpPortal {
+  address: string;
+  region?: string;
+  user?: string;
+  auth_method?: string;
+  browser?: string;
+  cloud_auth?: boolean;
+  tenant_id?: string;
+  gateways: GpPortalGateway[];
+  gateway_count: number;
+  cutoff_secs?: number;
+  selected_gateway?: string;
+  auth_success: boolean;
+  tunnels: number;
+  hip_submitted: number;
+  panos_version?: string;
+  assigned_ip?: string;
+}
+
+interface HipRow { category: string; item?: string; field: string; value: string }
+interface HipDrive { name: string; state: string }
+interface HipProduct {
+  category: string; vendor?: string; name: string; version?: string;
+  def_version?: string; engine_version?: string; def_date?: string;
+  real_time_protection?: string; last_full_scan?: string;
+  enabled?: string; last_backup?: string; drives?: HipDrive[];
+}
+interface HipPatch {
+  title: string; description?: string; vendor?: string; kb?: string;
+  bulletin?: string; severity?: string; category?: string; installed?: string;
+}
+interface HipInterface {
+  id?: string; description?: string; mac?: string; ipv4?: string[]; ipv6?: string[];
+}
+interface HipReport {
+  generated_at?: string; version?: string; source?: string;
+  client_version?: string; os?: string; os_vendor?: string; domain?: string;
+  host_name?: string; host_id?: string; user_name?: string; ip_address?: string;
+  products: HipProduct[]; patches: HipPatch[]; interfaces: HipInterface[];
+  empty_categories?: string[]; rows: HipRow[];
+}
+
+interface GpAuthEvent {
+  ts: string;
+  user?: string;
+  target: "portal" | "gateway";
+  address?: string;
+  method?: string;
+  outcome: string;
+  detail?: string;
+  wait_secs?: number;
+  single_sign_on?: boolean;
+}
+
+interface GpData {
+  overview: GpOverview | null;
+  hip: HipReport | null;
+  auth: GpAuthEvent[];
+  timeline: GpEvent[];
+  attempts: GpAttempt[];
+  gateways: GpGatewaySelection | null;
+  portals: GpPortal[];
+  stages: string[];
+}
+
+function useGp(fileId: string) {
+  const [data, setData] = useState<GpData | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    fetch(`/api/v1/files/${fileId}/gp`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((d) => {
+        if (!live) return;
+        setData({
+          overview: d.overview ?? null,
+          hip: d.hip ?? null,
+          auth: d.auth ?? [],
+          timeline: d.timeline ?? [],
+          attempts: d.attempts ?? [],
+          gateways: d.gateways ?? null,
+          portals: d.portals ?? [],
+          stages: d.stages ?? [],
+        });
+      })
+      .catch((e: Error) => { if (live) setError(e.message); });
+    return () => { live = false; };
+  }, [fileId]);
+  return { data, error };
+}
+
+/* An endpoint often talks to more than one portal, and each has its own
+   gateway list, user, region and authentication method. Showing one flat list
+   mixed them and undercounted the gateways, so everything is scoped to the
+   portal chosen here. */
+function GpPortals({ portals }: { portals: GpPortal[] }) {
+  const [sel, setSel] = useState(0);
+  if (portals.length === 0) return null;
+  const p = portals[Math.min(sel, portals.length - 1)];
+
+  return (
+    <div className="gp-portals">
+      <div className="gp-portal-pick">
+        <label htmlFor="gp-portal-select">Portal</label>
+        <select
+          id="gp-portal-select"
+          value={sel}
+          onChange={(e) => setSel(parseInt(e.target.value, 10) || 0)}
+        >
+          {portals.map((x, i) => (
+            <option key={x.address} value={i}>
+              {x.address}
+              {x.auth_success ? "" : " (never authenticated)"}
+              {` — ${x.gateway_count} gateway${x.gateway_count === 1 ? "" : "s"}`}
+              {x.user ? ` — ${decodeURIComponent(x.user)}` : ""}
+            </option>
+          ))}
+        </select>
+        <span className="muted">
+          {portals.length} portal{portals.length === 1 ? "" : "s"} found in these logs
+        </span>
+      </div>
+
+      <div className="gp-cards">
+        <section className="gp-card">
+          <h3>This portal</h3>
+          <table className="kv">
+            <tbody>
+              <tr><th>Address</th><td>{p.address}</td></tr>
+              {p.user && <tr><th>User</th><td>{decodeURIComponent(p.user)}</td></tr>}
+              {p.auth_method && (
+                <tr>
+                  <th>Authentication</th>
+                  <td>
+                    {p.auth_method}
+                    {p.browser ? ` · ${p.browser} browser` : ""}
+                    {p.cloud_auth ? " · cloud auth service" : ""}
+                  </td>
+                </tr>
+              )}
+              {p.region && <tr><th>Region</th><td>{p.region}</td></tr>}
+              {p.tenant_id && <tr><th>Tenant</th><td>{p.tenant_id}</td></tr>}
+              {p.panos_version && <tr><th>Gateway PAN-OS</th><td>{p.panos_version}</td></tr>}
+              {p.assigned_ip && <tr><th>Assigned IP</th><td>{p.assigned_ip}</td></tr>}
+              <tr>
+                <th>Result</th>
+                <td>
+                  {p.auth_success ? "authenticated" : "never authenticated"}
+                  {` · ${p.tunnels} tunnel${p.tunnels === 1 ? "" : "s"}`}
+                  {` · ${p.hip_submitted} HIP report${p.hip_submitted === 1 ? "" : "s"} sent`}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+      </div>
+
+      <h3 className="gp-h3">
+        Gateways from this portal ({p.gateway_count})
+        {p.cutoff_secs !== undefined && (
+          <span className="muted"> · cutoff {p.cutoff_secs}s</span>
+        )}
+      </h3>
+      <table className="gp-gw-table">
+        <thead>
+          <tr>
+            <th>Gateway</th><th>Name</th><th>Address</th>
+            <th>Priority</th><th>Response</th>
+            <th title="Composite score: priority combined with response time. Lowest wins.">Weight</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {p.gateways.map((g) => (
+            <tr key={g.fqdn} className={g.selected ? "gp-gw-sel" : ""}>
+              <td className="gp-gw-fqdn">{g.fqdn}</td>
+              <td>{g.name || "—"}</td>
+              <td>{g.ipv4 || "—"}</td>
+              <td className={g.priority !== undefined && g.priority < 0 ? "gp-neg" : ""}>
+                {g.priority ?? "—"}
+              </td>
+              <td>{g.duration_ms !== undefined ? `${g.duration_ms} ms` : "—"}</td>
+              <td className={g.selected ? "gp-best-weight" : ""}>{g.weight ?? "—"}</td>
+              <td>
+                {g.selected ? (
+                  <span className="gp-chip gp-chip-ok">selected</span>
+                ) : g.excluded === "region" ? (
+                  <span className="gp-chip gp-chip-warn" title="The client's source address is outside this gateway's configured region, so it scored -2 and was never measured.">
+                    out of region
+                  </span>
+                ) : g.excluded === "manual-only" ? (
+                  <span className="gp-chip gp-chip-warn" title="Configured for manual selection only, so it is not part of automatic discovery.">
+                    manual only
+                  </span>
+                ) : (
+                  <span className="muted">measured</span>
+                )}
+              </td>
+            </tr>
+          ))}
+          {p.gateways.length === 0 && (
+            <tr><td colSpan={7} className="muted">No gateway discovery recorded for this portal.</td></tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* One row per authentication. A connection normally produces two — the portal,
+   which prompts, and the gateway, which should be satisfied by the cookie the
+   portal issued — so seeing both on adjacent rows is what tells you whether
+   single sign-on is working or the user is being asked twice. */
+function GpAuthTab({ fileId }: { fileId: string }) {
+  const { data, error } = useGp(fileId);
+  const [q, setQ] = useState("");
+  const [only, setOnly] = useState<"" | "portal" | "gateway" | "failed">("");
+
+  const rows = useMemo(() => {
+    const all = data?.auth ?? [];
+    const needle = q.trim().toLowerCase();
+    return all.filter((r) => {
+      if (only === "portal" || only === "gateway") {
+        if (r.target !== only) return false;
+      } else if (only === "failed" && r.outcome !== "failed") {
+        return false;
+      }
+      if (!needle) return true;
+      return [r.user, r.target, r.address, r.method, r.outcome, r.detail]
+        .join(" ")
+        .toLowerCase()
+        .includes(needle);
+    });
+  }, [data, q, only]);
+
+  if (error) return <p className="error">Could not load: {error}</p>;
+  if (!data) return <p className="muted">Loading…</p>;
+
+  const all = data.auth;
+  const failed = all.filter((r) => r.outcome === "failed").length;
+  const sso = all.filter((r) => r.single_sign_on).length;
+
+  return (
+    <div className="gp-auth">
+      <h2>Authentication</h2>
+      <div className="gp-verdict">
+        <strong>{all.length} authentication{all.length === 1 ? "" : "s"}</strong>
+        {failed > 0 && <span className="gp-chip gp-chip-fail">{failed} failed</span>}
+        {sso > 0 && (
+          <span
+            className="gp-chip gp-chip-ok"
+            title="The portal prompted and the gateway accepted the cookie it issued, so the user was not asked twice."
+          >
+            {sso} single sign-on
+          </span>
+        )}
+      </div>
+
+      <div className="gp-hip-controls">
+        <input
+          className="search-input hip-filter"
+          type="search"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Filter by user, portal or gateway, method, outcome…"
+        />
+        {(["", "portal", "gateway", "failed"] as const).map((k) => (
+          <button key={k || "all"} className={only === k ? "active" : ""} onClick={() => setOnly(k)}>
+            {k === "" ? "All" : k}
+          </button>
+        ))}
+      </div>
+
+      <table className="gp-gw-table">
+        <thead>
+          <tr>
+            <th>Time</th><th>User</th><th>Authenticated at</th><th>Address</th>
+            <th>Method</th><th>Outcome</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={i} className={r.outcome === "failed" ? "gp-auth-fail" : ""}>
+              <td className="hip-val">{r.ts.replace("T", " ").slice(0, 19)}</td>
+              <td>{r.user ? decodeURIComponent(r.user) : "—"}</td>
+              <td>
+                <span className={"gp-chip gp-chip-" + (r.target === "portal" ? "warn" : "ok")}>
+                  {r.target}
+                </span>
+              </td>
+              <td className="hip-val">{r.address || "—"}</td>
+              <td>
+                {r.method || "—"}
+                {r.wait_secs ? (
+                  <span className="muted" title="Time the user spent in the identity provider's page">
+                    {" "}
+                    {r.wait_secs.toFixed(0)}s interactive
+                  </span>
+                ) : null}
+              </td>
+              <td>
+                <span
+                  className={
+                    "gp-chip " +
+                    (r.outcome === "success"
+                      ? "gp-chip-ok"
+                      : r.outcome === "failed"
+                      ? "gp-chip-fail"
+                      : "gp-chip-warn")
+                  }
+                  title={r.detail}
+                >
+                  {r.outcome}
+                </span>
+              </td>
+              <td>
+                {r.single_sign_on && (
+                  <span className="gp-chip gp-chip-ok" title="No second prompt: the portal's cookie was accepted here.">
+                    SSO
+                  </span>
+                )}
+              </td>
+            </tr>
+          ))}
+          {rows.length === 0 && (
+            <tr><td colSpan={7} className="muted">
+              {all.length === 0 ? "No authentication recorded in this bundle." : "Nothing matches."}
+            </td></tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* The HIP report is deeply nested and every category has a different shape, so
+   it is presented as the tables that matter plus one flat (category, item,
+   field, value) view. The single filter box below runs over every field of
+   every table, so "4.18.26070.9", "KB5122104" or a MAC address all find their
+   row without the user knowing which category holds it. */
+function GpHipTab({ fileId }: { fileId: string }) {
+  const { data, error } = useGp(fileId);
+  const [q, setQ] = useState("");
+  const [flat, setFlat] = useState(false);
+
+  const hip = data?.hip ?? null;
+  const needle = q.trim().toLowerCase();
+  const keep = (...parts: (string | undefined | string[])[]) => {
+    if (!needle) return true;
+    return parts
+      .map((p) => (Array.isArray(p) ? p.join(" ") : p ?? ""))
+      .join(" ")
+      .toLowerCase()
+      .includes(needle);
+  };
+
+  if (error) return <p className="error">Could not load: {error}</p>;
+  if (!data) return <p className="muted">Loading…</p>;
+  if (!hip) {
+    return (
+      <div className="gp-pending">
+        <h2>HIP</h2>
+        <p className="muted">
+          No HIP report was found in this bundle. The agent writes one into
+          PanGPS.log after each tunnel comes up, and also leaves a copy in
+          pan_gp_hrpt.xml.
+        </p>
+      </div>
+    );
+  }
+
+  const products = hip.products.filter((p) =>
+    keep(p.category, p.vendor, p.name, p.version, p.def_version, p.engine_version,
+      p.def_date, p.real_time_protection, p.last_full_scan, p.enabled, p.last_backup,
+      (p.drives ?? []).map((d) => `${d.name} ${d.state}`))
+  );
+  const patches = hip.patches.filter((p) =>
+    keep(p.title, p.description, p.vendor, p.kb, p.bulletin, p.severity, p.category, p.installed)
+  );
+  const ifaces = hip.interfaces.filter((i) =>
+    keep(i.id, i.description, i.mac, i.ipv4, i.ipv6)
+  );
+  const rows = hip.rows.filter((r) => keep(r.category, r.item, r.field, r.value));
+
+  return (
+    <div className="gp-hip">
+      <h2>HIP report</h2>
+      <p className="muted">
+        Generated {hip.generated_at || "—"} · version {hip.version || "—"}
+        {hip.source ? ` · read from ${hip.source}` : ""}
+        {" · a report is sent to the gateway after every tunnel comes up"}
+      </p>
+
+      <div className="gp-hip-controls">
+        <input
+          className="search-input hip-filter"
+          type="search"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Filter every field — product version, KB number, MAC, IP, drive state…"
+        />
+        <button className={flat ? "active" : ""} onClick={() => setFlat(!flat)}>
+          {flat ? "Grouped tables" : "Flat field list"}
+        </button>
+      </div>
+
+      {flat ? (
+        <table className="gp-gw-table">
+          <thead>
+            <tr><th>Category</th><th>Item</th><th>Field</th><th>Value</th></tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr key={i}>
+                <td>{r.category}</td>
+                <td>{r.item || "—"}</td>
+                <td>{r.field}</td>
+                <td className="hip-val">{r.value}</td>
+              </tr>
+            ))}
+            {rows.length === 0 && <tr><td colSpan={4} className="muted">Nothing matches.</td></tr>}
+          </tbody>
+        </table>
+      ) : (
+        <>
+          <h3 className="gp-h3">Host ({keep(hip.host_name, hip.os, hip.domain, hip.client_version) ? "" : "filtered out"})</h3>
+          <table className="kv hip-host">
+            <tbody>
+              {([
+                ["Host name", hip.host_name], ["Domain", hip.domain],
+                ["Host ID", hip.host_id], ["OS", hip.os], ["OS vendor", hip.os_vendor],
+                ["GP app version", hip.client_version],
+                ["User", hip.user_name && decodeURIComponent(hip.user_name)],
+                ["Source IP", hip.ip_address],
+              ] as [string, string | undefined][])
+                .filter(([, v]) => v)
+                .map(([k, v]) => (
+                  <tr key={k}><th>{k}</th><td>{v}</td></tr>
+                ))}
+            </tbody>
+          </table>
+
+          <h3 className="gp-h3">Products ({products.length})</h3>
+          <table className="gp-gw-table">
+            <thead>
+              <tr>
+                <th>Category</th><th>Product</th><th>Vendor</th><th>Version</th>
+                <th>Definitions</th><th>State</th>
+              </tr>
+            </thead>
+            <tbody>
+              {products.map((p, i) => (
+                <tr key={i}>
+                  <td>{p.category}</td>
+                  <td>{p.name}</td>
+                  <td>{p.vendor || "—"}</td>
+                  <td className="hip-val">{p.version || "—"}</td>
+                  <td className="hip-val">
+                    {p.def_version ? `def ${p.def_version}` : ""}
+                    {p.engine_version ? ` · engine ${p.engine_version}` : ""}
+                    {p.def_date ? ` · ${p.def_date}` : ""}
+                    {!p.def_version && !p.engine_version && !p.def_date ? "—" : ""}
+                  </td>
+                  <td>
+                    {p.real_time_protection && (
+                      <span className={"gp-chip " + (p.real_time_protection === "yes" ? "gp-chip-ok" : "gp-chip-fail")}>
+                        real-time {p.real_time_protection}
+                      </span>
+                    )}
+                    {p.enabled && (
+                      <span className={"gp-chip " + (p.enabled === "yes" ? "gp-chip-ok" : "gp-chip-fail")}>
+                        {p.enabled === "yes" ? "enabled" : "disabled"}
+                      </span>
+                    )}
+                    {(p.drives ?? []).map((d) => (
+                      <span
+                        key={d.name}
+                        className={"gp-chip " + (d.state === "unencrypted" ? "gp-chip-fail" : "gp-chip-ok")}
+                      >
+                        {d.name} {d.state}
+                      </span>
+                    ))}
+                    {p.last_full_scan && p.last_full_scan !== "n/a" && (
+                      <span className="muted">scan {p.last_full_scan}</span>
+                    )}
+                    {p.last_backup && p.last_backup !== "n/a" && (
+                      <span className="muted">backup {p.last_backup}</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+              {products.length === 0 && <tr><td colSpan={6} className="muted">Nothing matches.</td></tr>}
+            </tbody>
+          </table>
+
+          <h3 className="gp-h3">Missing patches ({patches.length})</h3>
+          <table className="gp-gw-table">
+            <thead>
+              <tr><th>Severity</th><th>Category</th><th>KB</th><th>Vendor</th><th>Title</th></tr>
+            </thead>
+            <tbody>
+              {patches.map((p, i) => (
+                <tr key={i}>
+                  <td className={p.severity === "2" ? "gp-neg" : ""}>{p.severity ?? "—"}</td>
+                  <td>{p.category || "—"}</td>
+                  <td className="hip-val">{p.kb || "—"}</td>
+                  <td>{p.vendor || "—"}</td>
+                  <td title={p.description}>{p.title}</td>
+                </tr>
+              ))}
+              {patches.length === 0 && <tr><td colSpan={5} className="muted">Nothing matches.</td></tr>}
+            </tbody>
+          </table>
+
+          <h3 className="gp-h3">Network interfaces ({ifaces.length})</h3>
+          <table className="gp-gw-table">
+            <thead>
+              <tr><th>Adapter</th><th>MAC</th><th>IPv4</th><th>IPv6</th></tr>
+            </thead>
+            <tbody>
+              {ifaces.map((i, k) => (
+                <tr key={k}>
+                  <td title={i.id}>{i.description || i.id}</td>
+                  <td className="hip-val">{i.mac || "—"}</td>
+                  <td className="hip-val">{(i.ipv4 ?? []).join(", ") || "—"}</td>
+                  <td className="hip-val">{(i.ipv6 ?? []).join(", ") || "—"}</td>
+                </tr>
+              ))}
+              {ifaces.length === 0 && <tr><td colSpan={4} className="muted">Nothing matches.</td></tr>}
+            </tbody>
+          </table>
+
+          {(hip.empty_categories ?? []).length > 0 && (
+            <p className="gp-note">
+              Reported with no product found: {(hip.empty_categories ?? []).join(", ")}. A HIP
+              policy matching on these categories will not match this endpoint.
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function GpOverviewTab({ fileId }: { fileId: string }) {
+  const { data, error } = useGp(fileId);
+  if (error) return <p className="error">Could not load: {error}</p>;
+  if (!data) return <p className="muted">Loading…</p>;
+  const o = data.overview;
+  if (!o) return <p className="muted">No overview could be extracted from this bundle.</p>;
+
+  const rows: [string, string | undefined][][] = [
+    [
+      ["Portal", o.portal],
+      ["Gateway", o.gateway],
+      ["User", o.user],
+      ["Connect method", o.connect_method],
+      ["Final state", o.final_state],
+    ],
+    [
+      ["App version", o.client_version],
+      ["Service version", o.service_version],
+      ["Host", o.host_name],
+      ["OS", o.os_name],
+      ["OS version", o.os_version],
+      ["Hardware", [o.vendor, o.model].filter(Boolean).join(" ")],
+      ["Memory", o.total_mem_mb],
+      ["Booted", o.boot_time],
+    ],
+    [
+      ["HIP user", o.hip_user],
+      ["HIP host ID", o.hip_host_id],
+      ["HIP source IP", o.hip_ip],
+      ["HIP generated", o.hip_generated],
+    ],
+  ];
+  const titles = ["Connection", "Endpoint", "Last HIP report"];
+
+  return (
+    <div className="gp-overview">
+      <h2>Overview</h2>
+      <GpPortals portals={data.portals} />
+      {o.first_seen && (
+        <p className="muted">
+          Logs cover {o.first_seen} → {o.last_seen}
+        </p>
+      )}
+      {/* The app and the service ship as separate binaries and can be at
+          different builds; a mismatch is worth seeing rather than hiding. */}
+      {o.client_version && o.service_version && o.client_version !== o.service_version && (
+        <p className="gp-note">
+          The app (<code>{o.client_version}</code>) and the PanGPS service (
+          <code>{o.service_version}</code>) report different builds.
+        </p>
+      )}
+      <div className="gp-cards">
+        {rows.map((group, i) => (
+          <section key={i} className="gp-card">
+            <h3>{titles[i]}</h3>
+            <table className="kv">
+              <tbody>
+                {group
+                  .filter(([, v]) => v)
+                  .map(([k, v]) => (
+                    <tr key={k}>
+                      <th>{k}</th>
+                      <td>{v}</td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+            {group.every(([, v]) => !v) && <p className="muted">Not present in this bundle.</p>}
+          </section>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* A connection is a fixed sequence of stages, each reachable only if the one
+   before it succeeded. Showing where each attempt stopped is the diagnosis:
+   "37 attempts stopped at gateway select" says far more than 400 log lines. */
+function GpFlow({ data }: { data: GpData }) {
+  const [openIdx, setOpenIdx] = useState<number | null>(null);
+  const attempts = data.attempts;
+  if (attempts.length === 0) return null;
+
+  const stopCounts = new Map<string, number>();
+  let connected = 0;
+  for (const a of attempts) {
+    if (a.outcome === "connected") connected++;
+    else if (a.stop_at) stopCounts.set(a.stop_at, (stopCounts.get(a.stop_at) ?? 0) + 1);
+  }
+  const worst = [...stopCounts.entries()].sort((x, y) => y[1] - x[1])[0];
+  const stages = data.stages.length ? data.stages : attempts[0].stages.map((s) => s.stage);
+
+  return (
+    <div className="gp-flow">
+      <div className="gp-verdict">
+        <strong>
+          {attempts.length} attempt{attempts.length === 1 ? "" : "s"}
+        </strong>
+        {connected > 0 ? (
+          <span className="gp-chip gp-chip-ok">{connected} connected</span>
+        ) : (
+          <span className="gp-chip gp-chip-fail">never connected</span>
+        )}
+        {worst && (
+          <span className="gp-chip gp-chip-warn">
+            {worst[1]} stopped at {worst[0]}
+          </span>
+        )}
+      </div>
+
+      <div className="gp-stagehead">
+        {stages.map((s) => (
+          <span key={s} title={s}>{s}</span>
+        ))}
+      </div>
+      <div className="gp-attempts">
+        {attempts.map((a, i) => (
+          <div key={i}>
+            <button
+              className={"gp-attempt gp-attempt-" + a.outcome}
+              onClick={() => setOpenIdx(openIdx === i ? null : i)}
+              title={a.reason || a.outcome}
+            >
+              <span className="gp-attempt-ts">{a.start.replace("T", " ").slice(0, 19)}</span>
+              <span className="gp-bar">
+                {stages.map((s) => {
+                  const r = a.stages.find((x) => x.stage === s);
+                  const st = r?.status ?? "not reached";
+                  return (
+                    <i
+                      key={s}
+                      className={"gp-cell gp-cell-" + st.replace(" ", "-")}
+                      title={`${s}: ${st}${r?.detail ? " — " + r.detail : ""}`}
+                    />
+                  );
+                })}
+              </span>
+              <span className="gp-attempt-outcome">{a.outcome}</span>
+            </button>
+            {openIdx === i && (
+              <div className="gp-attempt-detail">
+                {a.reason && <p className="gp-attempt-reason">{a.reason}</p>}
+                <table className="kv">
+                  <tbody>
+                    {a.portal && <tr><th>Portal</th><td>{a.portal}</td></tr>}
+                    {a.gateway && <tr><th>Gateway</th><td>{a.gateway}</td></tr>}
+                    {a.user && <tr><th>User</th><td>{a.user}</td></tr>}
+                    <tr><th>Furthest stage</th><td>{a.reached || "—"}</td></tr>
+                    <tr><th>Events</th><td>{a.events}</td></tr>
+                  </tbody>
+                </table>
+                <ol className="gp-stagelist">
+                  {a.stages.map((s) => (
+                    <li key={s.stage} className={"gp-st-" + s.status.replace(" ", "-")}>
+                      <span className="gp-st-name">{s.stage}</span>
+                      <span className="gp-st-status">{s.status}</span>
+                      {s.detail && <span className="gp-st-detail">{s.detail}</span>}
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {data.gateways && data.gateways.gateways.length > 0 && (
+        <GpGateways sel={data.gateways} />
+      )}
+    </div>
+  );
+}
+
+/* Gateway scoring. The agent's error for every failure here is the same
+   unhelpful sentence about the network being unreachable, so the priority,
+   region and response-time columns are what actually explain it. */
+function GpGateways({ sel }: { sel: GpGatewaySelection }) {
+  return (
+    <div className="gp-gateways">
+      <h3 className="gp-h3">Gateway selection</h3>
+      <p className="muted">
+        Selection is {sel.type ?? "unknown"}
+        {sel.external_count !== undefined && ` · ${sel.external_count} external`}
+        {sel.internal_count !== undefined && ` · ${sel.internal_count} internal`}
+        {sel.cutoff_secs !== undefined && ` · cutoff ${sel.cutoff_secs}s`}
+        {sel.best && ` · chose ${sel.best}`}
+      </p>
+      <table className="gp-gw-table">
+        <thead>
+          <tr>
+            <th>Gateway</th><th>Name</th><th>Address</th>
+            <th>Priority</th><th>Region</th><th>TCP</th><th>SSL</th>
+            <th title="Composite score: priority combined with response time. Lowest wins.">Weight</th>
+            <th>Manual</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {sel.gateways.map((g) => (
+            <tr key={g.fqdn} className={g.selected ? "gp-gw-sel" : ""}>
+              <td>{g.fqdn}</td>
+              <td>{g.name || "—"}</td>
+              <td>{g.ipv4 || g.ipv6 || "—"}</td>
+              <td className={g.priority !== undefined && g.priority < 0 ? "gp-neg" : ""}>
+                {g.priority ?? "—"}
+              </td>
+              <td className={g.region_match === false ? "gp-neg" : ""}>
+                {g.region_match === false
+                  ? "no match"
+                  : g.region_match === true
+                  ? "match"
+                  : "—"}
+                {g.region && <div className="gp-gw-region">{g.region}</div>}
+              </td>
+              <td>{g.tcp_ms !== undefined ? `${g.tcp_ms} ms` : "—"}</td>
+              <td>{g.ssl_ms !== undefined ? `${g.ssl_ms} ms` : "—"}</td>
+              <td className={g.selected ? "gp-best-weight" : ""}>
+                {g.weight !== undefined ? g.weight : "—"}
+              </td>
+              <td>{g.manual === undefined ? "—" : g.manual ? "yes" : "no"}</td>
+              <td>{g.selected ? <span className="gp-chip gp-chip-ok">selected</span> : ""}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {(sel.notes ?? []).map((n, i) => (
+        <p key={i} className="gp-note">{n}</p>
+      ))}
+    </div>
+  );
+}
+
+const GP_PHASES = [
+  "service", "prelogin", "auth", "portal", "gateway",
+  "hip", "discovery", "tunnel", "captive-portal",
+];
+
+function GpConnectionTab({ fileId }: { fileId: string }) {
+  const { data, error } = useGp(fileId);
+  const [phase, setPhase] = useState<string>("");
+  const [onlyProblems, setOnlyProblems] = useState(false);
+
+  const shown = useMemo(() => {
+    const all = data?.timeline ?? [];
+    return all.filter(
+      (e) =>
+        (!phase || e.phase === phase) &&
+        (!onlyProblems || e.outcome === "fail" || e.severity.toLowerCase() === "error")
+    );
+  }, [data, phase, onlyProblems]);
+
+  if (error) return <p className="error">Could not load: {error}</p>;
+  if (!data) return <p className="muted">Loading…</p>;
+
+  const counts = new Map<string, number>();
+  for (const e of data.timeline) counts.set(e.phase, (counts.get(e.phase) ?? 0) + 1);
+
+  return (
+    <div className="gp-timeline-wrap">
+      <h2>Connection</h2>
+      <GpFlow data={data} />
+      <h3 className="gp-h3">Event log</h3>
+      <p className="muted">
+        The service's own narrative of each attempt, in order. PanGPS does the work;
+        PanGPA relays it to the user, so both sides' event logs are merged here.
+      </p>
+      <div className="gp-filters">
+        <button className={phase === "" ? "active" : ""} onClick={() => setPhase("")}>
+          All ({data.timeline.length})
+        </button>
+        {GP_PHASES.filter((p) => counts.get(p)).map((p) => (
+          <button key={p} className={phase === p ? "active" : ""} onClick={() => setPhase(p)}>
+            {p} ({counts.get(p)})
+          </button>
+        ))}
+        <label className="gp-only-problems">
+          <input
+            type="checkbox"
+            checked={onlyProblems}
+            onChange={(e) => setOnlyProblems(e.target.checked)}
+          />
+          failures only
+        </label>
+      </div>
+      <div className="gp-timeline">
+        {shown.map((e, i) => (
+          <div
+            key={i}
+            className={
+              "gp-ev" +
+              (e.outcome === "fail" ? " gp-ev-fail" : e.outcome === "ok" ? " gp-ev-ok" : "")
+            }
+          >
+            <span className="gp-ev-ts">{e.ts.replace("T", " ").slice(0, 19)}</span>
+            <span className="gp-ev-phase">{e.phase || "—"}</span>
+            <span className="gp-ev-msg" title={e.source}>{e.message}</span>
+          </div>
+        ))}
+        {shown.length === 0 && <p className="muted">No events match this filter.</p>}
+      </div>
+    </div>
+  );
+}
+
+function GpPending({ title, what }: { title: string; what: string }) {
+  return (
+    <div className="gp-pending">
+      <h2>{title}</h2>
+      <p>{what}</p>
+      <p className="muted">
+        Not built yet. The archive is already indexed, so <strong>Log Files</strong> works
+        now: every log in the bundle is browsable and searchable with the full query
+        language, including <code>-A</code>/<code>-B</code> context and the{" "}
+        <code>| $2 &gt; n</code> field filter.
+      </p>
     </div>
   );
 }
@@ -247,16 +1259,23 @@ function StatusIcon({ status, error }: { status: string; error?: string }) {
 
 function FileView({ id }: { id: string }) {
   const [file, setFile] = useState<TsFile | null>(null);
-  const [tab, setTab] = useState<Tab>("system");
+  const [tab, setTab] = useState<Tab | null>(null);
   const [missing, setMissing] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
 
   useEffect(() => {
     fetch(`/api/v1/files/${id}`)
       .then((r) => (r.ok ? r.json() : Promise.reject()))
-      .then(setFile)
+      .then((f: TsFile) => {
+        setFile(f);
+        // the landing tab depends on what the file is, so it waits for the
+        // record rather than defaulting to a firewall tab and jumping
+        setTab((cur) => cur ?? tabsFor(f.kind)[0].id);
+      })
       .catch(() => setMissing(true));
   }, [id]);
+
+  const tabs = tabsFor(file?.kind);
 
   if (missing) {
     return (
@@ -288,9 +1307,14 @@ function FileView({ id }: { id: string }) {
         {!collapsed && (
           <div className="sidebar-file" title={file?.filename}>
             {file?.filename ?? "…"}
+            {file?.kind && (
+              <span className={"kind-badge kind-" + file.kind} title={kindTitle(file)}>
+                {KIND_LABEL[file.kind]}
+              </span>
+            )}
           </div>
         )}
-        {TABS.map((t) => (
+        {tabs.map((t) => (
           <button
             key={t.id}
             className={tab === t.id ? "active" : ""}
@@ -308,6 +1332,11 @@ function FileView({ id }: { id: string }) {
         {tab === "appstats" && <AppStatsTab fileId={id} />}
         {tab === "licenses" && <LicensesTab fileId={id} />}
         {tab === "config" && <ConfigTab fileId={id} />}
+        {tab === "gp-overview" && <GpOverviewTab fileId={id} />}
+        {tab === "gp-connection" && <GpConnectionTab fileId={id} />}
+        {tab === "gp-auth" && <GpAuthTab fileId={id} />}
+        {tab === "gp-hip" && <GpHipTab fileId={id} />}
+        {tab === "gp-anomalies" && <GpPending title="Anomalies" what={GP_PENDING.anomalies} />}
       </main>
     </div>
   );
@@ -4068,14 +5097,48 @@ function LogContent({
     return out;
   }, [shownEntries]);
 
-  // the highlight indexes into the unfiltered list, so it only applies when
-  // the in-file search is not narrowing the view
-  const hlEntryIdx =
-    query.empty && highlightLine !== undefined ? highlightLine - 1 - offset : -1;
+  // Find the highlighted row by its source line number.
+  //
+  // Using the entry's index here was wrong: blank lines are dropped,
+  // continuation lines are kept, and a GlobalProtect log can put two entries on
+  // one physical line, so index and file line drift apart — by thousands of
+  // rows in a large log. A search hit reports a *file* line, so the entry
+  // carrying that line is what has to be found. The nearest entry at or before
+  // the target is used, since the hit may land on a line the structured view
+  // folded into the entry above it.
+  const hlEntryIdx = useMemo(() => {
+    if (!query.empty || highlightLine === undefined || !shownEntries) return -1;
+    let best = -1;
+    for (let i = 0; i < shownEntries.length; i++) {
+      const ln = shownEntries[i].e.line;
+      if (ln === undefined) continue;
+      if (ln === highlightLine) return i;
+      if (ln < highlightLine) best = i;
+      else break; // line numbers only increase
+    }
+    return best;
+  }, [query.empty, highlightLine, shownEntries]);
   const hlRowIdx = useMemo(
     () => (hlEntryIdx < 0 ? -1 : rows.findIndex((r) => r.entryIdx === hlEntryIdx && r.first)),
     [rows, hlEntryIdx]
   );
+
+  // The page offset counts *entries* while highlightLine is a *file* line, so
+  // the initial guess above can land on the wrong page. Once a page is loaded,
+  // compare the target against the lines it actually contains and step towards
+  // it; entries and lines are close enough that this settles in a hop or two.
+  useEffect(() => {
+    if (query.empty !== true || highlightLine === undefined) return;
+    if (!entries || entries.length === 0 || total <= PAGE_LIMIT) return;
+    const firstLine = entries.find((e) => e.line !== undefined)?.line;
+    const lastLine = [...entries].reverse().find((e) => e.line !== undefined)?.line;
+    if (firstLine === undefined || lastLine === undefined) return;
+    if (highlightLine > lastLine && offset + PAGE_LIMIT < total) {
+      setOffset(offset + PAGE_LIMIT);
+    } else if (highlightLine < firstLine && offset > 0) {
+      setOffset(Math.max(0, offset - PAGE_LIMIT));
+    }
+  }, [entries, highlightLine, offset, total, query.empty]);
 
   // jump to the highlighted row once rows are available
   useEffect(() => {
