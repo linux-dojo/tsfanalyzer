@@ -432,11 +432,78 @@ interface GpAuthEvent {
   user?: string;
   target: "portal" | "gateway";
   address?: string;
+  /* the portal this authentication belongs to, on gateway rows too, so the
+     table can be scoped the same way every other GP tab is */
+  portal?: string;
   method?: string;
   outcome: string;
   detail?: string;
   wait_secs?: number;
   single_sign_on?: boolean;
+}
+
+/* Facts from the service trace (PanGPS.log) rather than the event log. */
+interface GpCertCheck {
+  at: string;
+  portal?: string;
+  code: string;
+  verify?: string;
+  proceeded: boolean;
+  skipped?: boolean;
+  failed: boolean;
+  detail?: string;
+}
+interface GpPrelogin {
+  at: string;
+  portal?: string;
+  status?: string;
+  cc_username?: string;
+  connected_ip?: string;
+  auth_message?: string;
+  saml_default_browser?: string;
+  panos_version?: string;
+}
+interface GpEnforcer {
+  present: boolean;
+  at?: string;
+  exceptions?: number;
+  domains?: number;
+  wildcards?: number;
+  evidence?: string[];
+}
+interface GpHostDetection {
+  configured: boolean;
+  at?: string;
+  ip?: string;
+  host?: string;
+  lookup?: string;
+  resolved?: string;
+  err?: string;
+  ok: boolean;
+  detail?: string;
+}
+interface GpConfigField { name: string; value: string }
+interface GpGatewayConfig {
+  gateway: string;
+  at: string;
+  config_name?: string;
+  user?: string;
+  fields?: GpConfigField[];
+  access_routes?: string[];
+  exclude_routes?: string[];
+  dns?: string[];
+  dns_suffix?: string[];
+  wins?: string[];
+  truncated?: boolean;
+}
+interface GpTraceStage { at: string; name: string; stage: string }
+interface GpFacts {
+  enforcer: GpEnforcer;
+  host_detection: GpHostDetection;
+  cert_checks?: GpCertCheck[];
+  prelogins?: GpPrelogin[];
+  gateway_configs?: GpGatewayConfig[];
+  stages?: GpTraceStage[];
 }
 
 interface GpData {
@@ -448,6 +515,7 @@ interface GpData {
   gateways: GpGatewaySelection | null;
   portals: GpPortal[];
   stages: string[];
+  facts: GpFacts | null;
 }
 
 function useGp(fileId: string) {
@@ -468,6 +536,7 @@ function useGp(fileId: string) {
           gateways: d.gateways ?? null,
           portals: d.portals ?? [],
           stages: d.stages ?? [],
+          facts: d.facts ?? null,
         });
       })
       .catch((e: Error) => { if (live) setError(e.message); });
@@ -476,37 +545,201 @@ function useGp(fileId: string) {
   return { data, error };
 }
 
-/* An endpoint often talks to more than one portal, and each has its own
-   gateway list, user, region and authentication method. Showing one flat list
-   mixed them and undercounted the gateways, so everything is scoped to the
-   portal chosen here. */
-function GpPortals({ portals }: { portals: GpPortal[] }) {
-  const [sel, setSel] = useState(0);
+/* The collection holds one HIP report, not one per portal: the agent generates
+   it for the endpoint and sends the same report to whichever gateway it is
+   connected to. So the picker cannot filter this tab — it can only say which
+   portal the report was most likely sent to, judged by which portal held a
+   tunnel when the report was generated. Saying that plainly beats silently
+   showing the same rows whatever is selected. */
+function hipPortalNote(data: GpData, portal: string): string {
+  if (!portal) {
+    const sent = data.portals.filter((p) => p.hip_submitted > 0).map((p) => p.address);
+    return sent.length
+      ? `submitted to ${sent.join(", ")}`
+      : "one report per endpoint, not per portal";
+  }
+  const p = data.portals.find((x) => x.address === portal);
+  if (!p) return "one report per endpoint, not per portal";
+  return p.hip_submitted > 0
+    ? `${p.hip_submitted} report${p.hip_submitted === 1 ? "" : "s"} submitted to this portal's gateway`
+    : "no HIP report was submitted to this portal in these logs";
+}
+
+/* Anomalies for a GlobalProtect bundle. The firewall side has a grouping engine
+   over system logs and counters; the agent equivalent is not written yet, so
+   rather than an empty pane this shows the failures the connection model has
+   already established, grouped by cause and scoped to the chosen portal. */
+/* Portal certificate check, raised only when it actually blocked a pre-login.
+
+   The tempting rule is "flag any CheckServerCert code that is not success",
+   and it is wrong. In the sample collections 0x1002 came back 63 times and
+   every one of them was followed immediately by the pre-login request; it
+   accompanies a local trust-store miss while the hostname still matches the
+   certificate's subject alternative name. 0x2000 is followed by the agent
+   logging "Skip CheckServerCert result". Flagging on the code would have put
+   dozens of certificate alarms on connections that worked, which is how an
+   anomalies tab stops being read. */
+function GpCertAnomaly({ facts, portal }: { facts: GpFacts | null; portal: string }) {
+  const certs = (facts?.cert_checks ?? []).filter((c) => !portal || c.portal === portal);
+  const failed = certs.filter((c) => c.failed);
+  if (!certs.length) return null;
+  if (!failed.length) {
+    return (
+      <p className="muted">
+        Portal certificate check: {certs.length} result{certs.length === 1 ? "" : "s"}, none
+        blocking. A non-zero return code is not itself a rejection — each of these was
+        followed by a pre-login, so the portal certificate was accepted.
+      </p>
+    );
+  }
+  return (
+    <div className="gp-anom-cert">
+      <h3 className="gp-h3">Portal certificate check failed</h3>
+      <p className="gp-note">
+        {failed.length} certificate check{failed.length === 1 ? "" : "s"} were not followed by a
+        pre-login, so the portal connection stopped at certificate verification.
+      </p>
+      <table className="gp-gw-table">
+        <thead>
+          <tr><th>When</th><th>Portal</th><th>Code</th><th>Verify</th></tr>
+        </thead>
+        <tbody>
+          {failed.slice(0, 20).map((c, i) => (
+            <tr key={i}>
+              <td>{c.at.replace("T", " ").slice(0, 19)}</td>
+              <td>{c.portal || "—"}</td>
+              <td><code>{c.code}</code></td>
+              <td>{c.verify ? `verifyportalcert=${c.verify}` : "—"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function GpAnomaliesTab({ fileId, portal, setPortal }: GpTabProps) {
+  const { data, error } = useGp(fileId);
+  if (error) return <p className="error">Could not load: {error}</p>;
+  if (!data) return <p className="muted">Loading…</p>;
+
+  const attempts = portal ? data.attempts.filter((a) => a.portal === portal) : data.attempts;
+  const groups = new Map<string, { count: number; first: string; last: string; stage: string }>();
+  for (const a of attempts) {
+    if (a.outcome === "connected") continue;
+    const key = a.reason || `stopped at ${a.stop_at || a.reached || "an unknown stage"}`;
+    const g = groups.get(key);
+    if (g) {
+      g.count++;
+      g.last = a.start;
+    } else {
+      groups.set(key, { count: 1, first: a.start, last: a.start, stage: a.stop_at || a.reached });
+    }
+  }
+  const rows = [...groups.entries()].sort((x, y) => y[1].count - x[1].count);
+
+  return (
+    <div className="gp-anomalies">
+      <h2>Anomalies</h2>
+      <GpPortalPicker portals={data.portals} portal={portal} setPortal={setPortal} />
+      <GpCertAnomaly facts={data.facts} portal={portal} />
+      <p className="muted">
+        Repeated failures across {attempts.length} attempt{attempts.length === 1 ? "" : "s"},
+        grouped by cause. Further agent-specific signatures — HIP rejections and
+        client-config mismatches — are still to be added.
+      </p>
+      <table className="gp-gw-table">
+        <thead>
+          <tr><th>Occurrences</th><th>Stage</th><th>Cause</th><th>First</th><th>Last</th></tr>
+        </thead>
+        <tbody>
+          {rows.map(([cause, g]) => (
+            <tr key={cause}>
+              <td className={g.count > 5 ? "gp-neg" : ""}>{g.count}</td>
+              <td>{g.stage || "—"}</td>
+              <td>{cause}</td>
+              <td className="hip-val">{g.first.replace("T", " ").slice(0, 19)}</td>
+              <td className="hip-val">{g.last.replace("T", " ").slice(0, 19)}</td>
+            </tr>
+          ))}
+          {rows.length === 0 && (
+            <tr><td colSpan={5} className="muted">No failed attempts for this portal.</td></tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* Every GlobalProtect tab takes the same three props, so the portal chosen in
+   one is the portal shown in all of them. */
+interface GpTabProps {
+  fileId: string;
+  portal: string;
+  setPortal: (a: string) => void;
+}
+
+/* The picker itself. An endpoint often talks to more than one portal, each with
+   its own gateways, user, region and authentication method; scoping every view
+   to one portal is what stops those being mixed together. An empty selection
+   means "all portals", which is the honest default when a bundle has only one
+   or when an event could not be attributed. */
+function GpPortalPicker({
+  portals,
+  portal,
+  setPortal,
+  note,
+}: {
+  portals: GpPortal[];
+  portal: string;
+  setPortal: (a: string) => void;
+  note?: string;
+}) {
   if (portals.length === 0) return null;
-  const p = portals[Math.min(sel, portals.length - 1)];
+  return (
+    <div className="gp-portal-pick">
+      <label htmlFor="gp-portal-scope">Portal</label>
+      <select
+        id="gp-portal-scope"
+        value={portal}
+        onChange={(e) => setPortal(e.target.value)}
+      >
+        <option value="">All portals ({portals.length})</option>
+        {portals.map((x) => (
+          <option key={x.address} value={x.address}>
+            {x.address}
+            {x.auth_success ? "" : " (never authenticated)"}
+            {` — ${x.gateway_count} gateway${x.gateway_count === 1 ? "" : "s"}`}
+            {x.user ? ` — ${decodeURIComponent(x.user)}` : ""}
+          </option>
+        ))}
+      </select>
+      {note && <span className="muted">{note}</span>}
+    </div>
+  );
+}
+
+function GpPortals({
+  portals,
+  portal,
+  setPortal,
+}: {
+  portals: GpPortal[];
+  portal: string;
+  setPortal: (a: string) => void;
+}) {
+  if (portals.length === 0) return null;
+  const idx = Math.max(0, portals.findIndex((x) => x.address === portal));
+  const p = portals[idx];
 
   return (
     <div className="gp-portals">
-      <div className="gp-portal-pick">
-        <label htmlFor="gp-portal-select">Portal</label>
-        <select
-          id="gp-portal-select"
-          value={sel}
-          onChange={(e) => setSel(parseInt(e.target.value, 10) || 0)}
-        >
-          {portals.map((x, i) => (
-            <option key={x.address} value={i}>
-              {x.address}
-              {x.auth_success ? "" : " (never authenticated)"}
-              {` — ${x.gateway_count} gateway${x.gateway_count === 1 ? "" : "s"}`}
-              {x.user ? ` — ${decodeURIComponent(x.user)}` : ""}
-            </option>
-          ))}
-        </select>
-        <span className="muted">
-          {portals.length} portal{portals.length === 1 ? "" : "s"} found in these logs
-        </span>
-      </div>
+      <GpPortalPicker
+        portals={portals}
+        portal={p.address}
+        setPortal={setPortal}
+        note={`${portals.length} portal${portals.length === 1 ? "" : "s"} found in these logs`}
+      />
 
       <div className="gp-cards">
         <section className="gp-card">
@@ -598,13 +831,16 @@ function GpPortals({ portals }: { portals: GpPortal[] }) {
    which prompts, and the gateway, which should be satisfied by the cookie the
    portal issued — so seeing both on adjacent rows is what tells you whether
    single sign-on is working or the user is being asked twice. */
-function GpAuthTab({ fileId }: { fileId: string }) {
+function GpAuthTab({ fileId, portal, setPortal }: GpTabProps) {
   const { data, error } = useGp(fileId);
   const [q, setQ] = useState("");
   const [only, setOnly] = useState<"" | "portal" | "gateway" | "failed">("");
 
   const rows = useMemo(() => {
-    const all = data?.auth ?? [];
+    const scoped = portal
+      ? (data?.auth ?? []).filter((r) => r.portal === portal)
+      : data?.auth ?? [];
+    const all = scoped;
     const needle = q.trim().toLowerCase();
     return all.filter((r) => {
       if (only === "portal" || only === "gateway") {
@@ -618,18 +854,19 @@ function GpAuthTab({ fileId }: { fileId: string }) {
         .toLowerCase()
         .includes(needle);
     });
-  }, [data, q, only]);
+  }, [data, q, only, portal]);
 
   if (error) return <p className="error">Could not load: {error}</p>;
   if (!data) return <p className="muted">Loading…</p>;
 
-  const all = data.auth;
+  const all = portal ? data.auth.filter((r) => r.portal === portal) : data.auth;
   const failed = all.filter((r) => r.outcome === "failed").length;
   const sso = all.filter((r) => r.single_sign_on).length;
 
   return (
     <div className="gp-auth">
       <h2>Authentication</h2>
+      <GpPortalPicker portals={data.portals} portal={portal} setPortal={setPortal} />
       <div className="gp-verdict">
         <strong>{all.length} authentication{all.length === 1 ? "" : "s"}</strong>
         {failed > 0 && <span className="gp-chip gp-chip-fail">{failed} failed</span>}
@@ -725,7 +962,7 @@ function GpAuthTab({ fileId }: { fileId: string }) {
    field, value) view. The single filter box below runs over every field of
    every table, so "4.18.26070.9", "KB5122104" or a MAC address all find their
    row without the user knowing which category holds it. */
-function GpHipTab({ fileId }: { fileId: string }) {
+function GpHipTab({ fileId, portal, setPortal }: GpTabProps) {
   const { data, error } = useGp(fileId);
   const [q, setQ] = useState("");
   const [flat, setFlat] = useState(false);
@@ -772,6 +1009,12 @@ function GpHipTab({ fileId }: { fileId: string }) {
   return (
     <div className="gp-hip">
       <h2>HIP report</h2>
+      <GpPortalPicker
+        portals={data.portals}
+        portal={portal}
+        setPortal={setPortal}
+        note={hipPortalNote(data, portal)}
+      />
       <p className="muted">
         Generated {hip.generated_at || "—"} · version {hip.version || "—"}
         {hip.source ? ` · read from ${hip.source}` : ""}
@@ -929,7 +1172,7 @@ function GpHipTab({ fileId }: { fileId: string }) {
   );
 }
 
-function GpOverviewTab({ fileId }: { fileId: string }) {
+function GpOverviewTab({ fileId, portal, setPortal }: GpTabProps) {
   const { data, error } = useGp(fileId);
   if (error) return <p className="error">Could not load: {error}</p>;
   if (!data) return <p className="muted">Loading…</p>;
@@ -966,7 +1209,7 @@ function GpOverviewTab({ fileId }: { fileId: string }) {
   return (
     <div className="gp-overview">
       <h2>Overview</h2>
-      <GpPortals portals={data.portals} />
+      <GpPortals portals={data.portals} portal={portal} setPortal={setPortal} />
       {o.first_seen && (
         <p className="muted">
           Logs cover {o.first_seen} → {o.last_seen}
@@ -1000,17 +1243,254 @@ function GpOverviewTab({ fileId }: { fileId: string }) {
           </section>
         ))}
       </div>
+      <GpPosture facts={data.facts} />
+      <GpGatewayConfigs facts={data.facts} portal={portal} />
     </div>
+  );
+}
+
+/* Enforcer and internal host detection: two facts that change what a failed
+   connection means, and neither is a step in the connection itself.
+
+   The enforcer is what blocks traffic while the agent is disconnected, so with
+   it in place a failure costs the user their access rather than just their
+   tunnel. Internal host detection is how the agent decides it is already
+   inside the network — the portal names an IP and the hostname it should
+   reverse-resolve to. A lookup that fails on a machine that really is internal
+   sends it out to an external gateway instead, which is a genuinely confusing
+   state to debug, so the query and its error code are shown rather than a bare
+   yes/no. */
+function GpPosture({ facts }: { facts: GpFacts | null }) {
+  if (!facts) return null;
+  const e = facts.enforcer;
+  const h = facts.host_detection;
+  const certs = facts.cert_checks ?? [];
+  const failed = certs.filter((c) => c.failed);
+  const codes = [...new Set(certs.map((c) => c.code))];
+
+  return (
+    <div className="gp-cards">
+      <section className="gp-card">
+        <h3>GlobalProtect enforcer</h3>
+        <p className={e.present ? "gp-yes" : "gp-no"}>{e.present ? "Yes" : "No"}</p>
+        {e.present ? (
+          <>
+            <p className="muted">
+              Traffic is blocked while the agent is disconnected, so a failed
+              connection costs this endpoint its access, not just its tunnel.
+            </p>
+            <table className="kv">
+              <tbody>
+                {!!e.exceptions && (
+                  <tr><th>Exceptions</th><td>{e.exceptions.toLocaleString()}</td></tr>
+                )}
+                {(!!e.domains || !!e.wildcards) && (
+                  <tr>
+                    <th>Domain entries</th>
+                    <td>{e.domains ?? 0} single, {e.wildcards ?? 0} wildcard</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+            {!!e.evidence?.length && (
+              <details className="gp-details">
+                <summary>Evidence</summary>
+                <pre className="gp-pre">{e.evidence.join("\n")}</pre>
+              </details>
+            )}
+          </>
+        ) : (
+          <p className="muted">No enforcer lines appear in the service trace.</p>
+        )}
+      </section>
+
+      <section className="gp-card">
+        <h3>Internal host detection</h3>
+        {h.configured ? (
+          <>
+            <p className={h.ok ? "gp-yes" : "gp-no"}>
+              {h.ok ? "Configured — host detected as internal" : "Configured — detection failed"}
+            </p>
+            <table className="kv">
+              <tbody>
+                {h.ip && <tr><th>IP from portal</th><td>{h.ip}</td></tr>}
+                {h.host && <tr><th>Expected host</th><td>{h.host}</td></tr>}
+                {h.lookup && <tr><th>Reverse lookup</th><td><code>{h.lookup}</code></td></tr>}
+                <tr>
+                  <th>Result</th>
+                  <td>{h.resolved ? h.resolved : <span className="muted">no hostname returned</span>}{h.err ? ` (error ${h.err})` : ""}</td>
+                </tr>
+              </tbody>
+            </table>
+            {!h.ok && (
+              <p className="gp-note">
+                The reverse lookup did not resolve, so the agent could not confirm it
+                is inside the network and will treat this as an external connection.
+              </p>
+            )}
+          </>
+        ) : (
+          <p className="muted">
+            Not configured on the portal — the agent has no internal/external test
+            and always connects to an external gateway.
+          </p>
+        )}
+      </section>
+
+      <section className="gp-card">
+        <h3>Portal certificate check</h3>
+        {certs.length === 0 ? (
+          <p className="muted">No CheckServerCert results in the service trace.</p>
+        ) : failed.length ? (
+          <>
+            <p className="gp-no">{failed.length} check{failed.length === 1 ? "" : "s"} stopped the pre-login</p>
+            <table className="kv">
+              <tbody>
+                {failed.slice(0, 6).map((c, i) => (
+                  <tr key={i}>
+                    <th>{c.at.slice(0, 19).replace("T", " ")}</th>
+                    <td><code>{c.code}</code>{c.portal ? ` · ${c.portal}` : ""}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
+        ) : (
+          <>
+            <p className="gp-yes">Passed &mdash; every check was followed by a pre-login</p>
+            {/* The return code on its own is not a verdict. 0x1002 in
+                particular reads like a failure but accompanies a local trust
+                store miss while the hostname still matches the certificate;
+                in the sample collections all 63 of them were followed by a
+                successful pre-login. So the flow decides, and the codes are
+                shown for reference rather than flagged. */}
+            <p className="muted">
+              {certs.length} check{certs.length === 1 ? "" : "s"}, returning{" "}
+              {codes.map((c) => <code key={c}>{c} </code>)}. A return code alone does not
+              mean the certificate was rejected &mdash; what matters is whether the
+              pre-login went ahead, and here it always did.
+            </p>
+          </>
+        )}
+      </section>
+    </div>
+  );
+}
+
+/* The configuration the gateway pushed after login: what the tunnel will
+   actually carry. Access routes and exclusions are the part people come here
+   for, so they lead. */
+function GpGatewayConfigs({ facts, portal }: { facts: GpFacts | null; portal: string }) {
+  const configs = facts?.gateway_configs ?? [];
+  const [sel, setSel] = useState(0);
+  if (!configs.length) return null;
+  // Keep the newest configuration per gateway; the agent re-fetches it on
+  // every login and the older copies say nothing new.
+  const latest = [...new Map(configs.map((c) => [c.gateway, c])).values()];
+  const shown = portal
+    ? latest.filter((c) => configs.some((x) => x.gateway === c.gateway))
+    : latest;
+  const c = shown[Math.min(sel, shown.length - 1)];
+  if (!c) return null;
+
+  return (
+    <section className="gp-card gp-card-wide">
+      <h3>Gateway configuration</h3>
+      {shown.length > 1 && (
+        <select className="gp-picker" value={sel} onChange={(e) => setSel(Number(e.target.value))}>
+          {shown.map((g, i) => (
+            <option key={g.gateway} value={i}>{g.gateway}</option>
+          ))}
+        </select>
+      )}
+      <table className="kv">
+        <tbody>
+          <tr><th>Gateway</th><td>{c.gateway}</td></tr>
+          {c.config_name && (
+            <tr>
+              <th>Agent config</th>
+              <td title="The name of the agent configuration the gateway matched — not a portal address">
+                {c.config_name}
+              </td>
+            </tr>
+          )}
+          {c.user && <tr><th>User</th><td>{c.user}</td></tr>}
+          <tr>
+            <th>Tunnel</th>
+            <td>
+              {(c.exclude_routes?.length ?? 0) > 0 ||
+              !(c.access_routes ?? []).some((r) => r === "0.0.0.0/0" || r === "::/0")
+                ? "Split tunnel"
+                : "Full tunnel (all traffic)"}
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div className="gp-routes">
+        <div>
+          <h4>Access routes {!!c.access_routes?.length && <span className="muted">({c.access_routes.length})</span>}</h4>
+          {c.access_routes?.length ? (
+            <ul className="gp-routelist">{c.access_routes.map((r) => <li key={r}>{r}</li>)}</ul>
+          ) : <p className="muted">None sent.</p>}
+        </div>
+        <div>
+          <h4>Excluded routes {!!c.exclude_routes?.length && <span className="muted">({c.exclude_routes.length})</span>}</h4>
+          {c.exclude_routes?.length ? (
+            <ul className="gp-routelist">{c.exclude_routes.map((r) => <li key={r}>{r}</li>)}</ul>
+          ) : <p className="muted">None &mdash; nothing bypasses the tunnel.</p>}
+        </div>
+      </div>
+
+      {(!!c.dns?.length || !!c.dns_suffix?.length) && (
+        <table className="kv">
+          <tbody>
+            {!!c.dns?.length && <tr><th>DNS</th><td>{c.dns.join(", ")}</td></tr>}
+            {!!c.dns_suffix?.length && <tr><th>DNS suffix</th><td>{c.dns_suffix.join(", ")}</td></tr>}
+          </tbody>
+        </table>
+      )}
+
+      {!!c.fields?.length && (
+        <details className="gp-details">
+          <summary>All {c.fields.length} configuration fields</summary>
+          <table className="kv">
+            <tbody>
+              {c.fields.map((f, i) => (
+                <tr key={`${f.name}-${i}`}><th>{f.name}</th><td>{f.value}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </details>
+      )}
+
+      {/* The agent writes this XML into a bounded log line, so a large
+          configuration is cut off — usually inside <ipsec>. Saying so is
+          better than presenting a partial config as the whole one. */}
+      {c.truncated && (
+        <p className="gp-note">
+          The agent cut this configuration off at its log-line limit, so the
+          later elements (typically the <code>ipsec</code> block) are missing
+          from the log itself.
+        </p>
+      )}
+    </section>
   );
 }
 
 /* A connection is a fixed sequence of stages, each reachable only if the one
    before it succeeded. Showing where each attempt stopped is the diagnosis:
    "37 attempts stopped at gateway select" says far more than 400 log lines. */
-function GpFlow({ data }: { data: GpData }) {
+function GpFlow({ data, portal }: { data: GpData; portal: string }) {
   const [openIdx, setOpenIdx] = useState<number | null>(null);
-  const attempts = data.attempts;
-  if (attempts.length === 0) return null;
+  // A reconnect names no portal of its own; it inherits the last one used, so
+  // filtering by portal keeps those runs with the portal they belong to.
+  const attempts = portal
+    ? data.attempts.filter((a) => a.portal === portal)
+    : data.attempts;
+  if (attempts.length === 0) {
+    return <p className="muted">No connection attempts recorded for this portal.</p>;
+  }
 
   const stopCounts = new Map<string, number>();
   let connected = 0;
@@ -1095,8 +1575,140 @@ function GpFlow({ data }: { data: GpData }) {
         ))}
       </div>
 
+      <GpTraceRuns facts={data.facts} />
+
       {data.gateways && data.gateways.gateways.length > 0 && (
         <GpGateways sel={data.gateways} />
+      )}
+    </div>
+  );
+}
+
+/* The stage sequence as the service itself wrote it.
+
+   The grid above is built from pan_gp_event.log, the user-facing narrative.
+   PanGPS.log is the service's own trace and it brackets each step explicitly —
+   "----Portal Pre-login starts----", "----Portal Login starts----", and so on —
+   so it says which step the agent believed it was on, and how far a run got
+   before it stopped. Where the two disagree, this is the more literal record.
+
+   Runs are cut at each Portal Pre-login, since that is where the agent starts
+   over. Teardown boundaries ("Disable", "Tunnel User Diconnecting" — the
+   agent's own spelling) carry no stage and are shown as what ended the run. */
+const TRACE_SEQUENCE = [
+  "portal pre-login",
+  "portal auth",
+  "portal config",
+  "network discovery",
+  "gateway select",
+  "gateway auth",
+  "tunnel",
+];
+
+function GpTraceRuns({ facts }: { facts: GpFacts | null }) {
+  const [open, setOpen] = useState(false);
+  const stages = facts?.stages ?? [];
+  if (!stages.length) return null;
+
+  type Run = { start: string; steps: GpTraceStage[] };
+  const runs: Run[] = [];
+  for (const s of stages) {
+    if (!runs.length || s.stage === "portal pre-login") {
+      runs.push({ start: s.at, steps: [] });
+    }
+    runs[runs.length - 1].steps.push(s);
+  }
+
+  const certs = facts?.cert_checks ?? [];
+  const prelogins = facts?.prelogins ?? [];
+  const within = <T extends { at: string }>(items: T[], run: Run, next?: Run) =>
+    items.filter((x) => x.at >= run.start && (!next || x.at < next.start));
+
+  const reached = (r: Run) => {
+    const named = r.steps.map((s) => s.stage).filter(Boolean);
+    let far = -1;
+    for (const s of named) far = Math.max(far, TRACE_SEQUENCE.indexOf(s));
+    return far;
+  };
+  const complete = runs.filter((r) => reached(r) === TRACE_SEQUENCE.length - 1).length;
+
+  return (
+    <div className="gp-trace">
+      <h3 className="gp-h3">
+        Stage sequence from the service trace
+        <button className="view-toggle" onClick={() => setOpen(!open)}>
+          {open ? "Hide" : `Show ${runs.length} run${runs.length === 1 ? "" : "s"}`}
+        </button>
+      </h3>
+      <p className="muted">
+        {runs.length} run{runs.length === 1 ? "" : "s"} bracketed by the agent&rsquo;s own
+        <code>----X starts----</code> markers; {complete} reached tunnel creation.
+      </p>
+      {open && (
+        <div className="gp-trace-runs">
+          {runs.map((r, i) => {
+            const next = runs[i + 1];
+            const rc = within(certs, r, next);
+            const rp = within(prelogins, r, next);
+            const far = reached(r);
+            const end = r.steps.find((s) => !s.stage && s !== r.steps[0]);
+            return (
+              <div key={i} className="gp-trace-run">
+                <div className="gp-trace-when">{r.start.replace("T", " ").slice(0, 19)}</div>
+                <ol className="gp-trace-steps">
+                  {TRACE_SEQUENCE.map((name, k) => {
+                    const hit = r.steps.find((s) => s.stage === name);
+                    return (
+                      <li
+                        key={name}
+                        className={hit ? "gp-tr-hit" : k <= far ? "gp-tr-skip" : "gp-tr-miss"}
+                        title={
+                          hit
+                            ? `${hit.name} — ${hit.at.replace("T", " ").slice(0, 19)}`
+                            : k <= far
+                            ? `${name}: no boundary written, but a later stage was reached`
+                            : `${name}: never reached`
+                        }
+                      >
+                        {name}
+                      </li>
+                    );
+                  })}
+                </ol>
+                <div className="gp-trace-facts">
+                  {rp.map((p, j) => (
+                    <span key={`p${j}`} className={"gp-chip " + (p.status === "Success" ? "gp-chip-ok" : "gp-chip-warn")}>
+                      pre-login {p.status || "no status"}
+                      {p.connected_ip ? ` · ${p.connected_ip}` : ""}
+                      {/* A populated <ccusername> means the portal accepted a
+                          client certificate and read the identity out of it,
+                          so any password prompt after this is a second factor
+                          rather than the only one. */}
+                      {p.cc_username ? ` · cert user ${p.cc_username}` : ""}
+                    </span>
+                  ))}
+                  {rc.map((c, j) => (
+                    <span
+                      key={`c${j}`}
+                      className={"gp-chip " + (c.failed ? "gp-chip-fail" : "gp-chip-mute")}
+                      title={
+                        c.failed
+                          ? "No pre-login followed this check"
+                          : c.skipped
+                          ? "The agent was told to skip this result"
+                          : "The pre-login went ahead, so this code did not stop anything"
+                      }
+                    >
+                      cert {c.code}
+                      {c.failed ? " — blocked" : ""}
+                    </span>
+                  ))}
+                  {end && <span className="gp-chip gp-chip-mute">ended: {end.name}</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
       )}
     </div>
   );
@@ -1165,7 +1777,7 @@ const GP_PHASES = [
   "hip", "discovery", "tunnel", "captive-portal",
 ];
 
-function GpConnectionTab({ fileId }: { fileId: string }) {
+function GpConnectionTab({ fileId, portal, setPortal }: GpTabProps) {
   const { data, error } = useGp(fileId);
   const [phase, setPhase] = useState<string>("");
   const [onlyProblems, setOnlyProblems] = useState(false);
@@ -1188,7 +1800,8 @@ function GpConnectionTab({ fileId }: { fileId: string }) {
   return (
     <div className="gp-timeline-wrap">
       <h2>Connection</h2>
-      <GpFlow data={data} />
+      <GpPortalPicker portals={data.portals} portal={portal} setPortal={setPortal} />
+      <GpFlow data={data} portal={portal} />
       <h3 className="gp-h3">Event log</h3>
       <p className="muted">
         The service's own narrative of each attempt, in order. PanGPS does the work;
@@ -1262,6 +1875,11 @@ function FileView({ id }: { id: string }) {
   const [tab, setTab] = useState<Tab | null>(null);
   const [missing, setMissing] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
+  // Which portal the GlobalProtect tabs are scoped to. It lives here rather
+  // than inside a tab so the choice survives moving between them: a collection
+  // can hold several portals, and mixing their gateways, logins and events
+  // together is what made the counts wrong in the first place.
+  const [gpPortal, setGpPortal] = useState("");
 
   useEffect(() => {
     fetch(`/api/v1/files/${id}`)
@@ -1332,11 +1950,17 @@ function FileView({ id }: { id: string }) {
         {tab === "appstats" && <AppStatsTab fileId={id} />}
         {tab === "licenses" && <LicensesTab fileId={id} />}
         {tab === "config" && <ConfigTab fileId={id} />}
-        {tab === "gp-overview" && <GpOverviewTab fileId={id} />}
-        {tab === "gp-connection" && <GpConnectionTab fileId={id} />}
-        {tab === "gp-auth" && <GpAuthTab fileId={id} />}
-        {tab === "gp-hip" && <GpHipTab fileId={id} />}
-        {tab === "gp-anomalies" && <GpPending title="Anomalies" what={GP_PENDING.anomalies} />}
+        {tab === "gp-overview" && (
+          <GpOverviewTab fileId={id} portal={gpPortal} setPortal={setGpPortal} />
+        )}
+        {tab === "gp-connection" && (
+          <GpConnectionTab fileId={id} portal={gpPortal} setPortal={setGpPortal} />
+        )}
+        {tab === "gp-auth" && <GpAuthTab fileId={id} portal={gpPortal} setPortal={setGpPortal} />}
+        {tab === "gp-hip" && <GpHipTab fileId={id} portal={gpPortal} setPortal={setGpPortal} />}
+        {tab === "gp-anomalies" && (
+          <GpAnomaliesTab fileId={id} portal={gpPortal} setPortal={setGpPortal} />
+        )}
       </main>
     </div>
   );
@@ -2399,6 +3023,7 @@ function AnomaliesView({ fileId, visible }: { fileId: string; visible: boolean }
             title={
               'Boolean search over the event name, category, severity and every raw log message.\n\n' +
               'AND / OR / NOT (also && || !), parentheses, and "quoted phrases".\n' +
+              '/regex/ for a pattern that itself uses ( ) | or !.\n' +
               'Adjacent words are ANDed implicitly, so `ospf down` == `ospf AND down`.\n\n' +
               'Examples:\n' +
               '  ospf AND down\n' +
@@ -4207,7 +4832,7 @@ function parseLineQuery(rawInput: string): LineQuery {
   const noMatch = { empty: true, before, after, match: () => false, ...extras };
   if (!body) return noMatch;
 
-  type Tok = { k: string; v?: string; quot?: boolean };
+  type Tok = { k: string; v?: string; quot?: boolean; rx?: boolean };
   const toks: Tok[] = [];
   let i = 0;
   while (i < body.length) {
@@ -4217,6 +4842,29 @@ function parseLineQuery(rawInput: string): LineQuery {
     if (c === "!") { toks.push({ k: "not" }); i++; continue; }
     if (c === "&") { i += body[i + 1] === "&" ? 2 : 1; toks.push({ k: "and" }); continue; }
     if (c === "|") { i += body[i + 1] === "|" ? 2 : 1; toks.push({ k: "or" }); continue; }
+    // A /slash-delimited/ term is a regex taken whole. Bare terms are regexes
+    // too, but "(", ")", "|" and "!" are boolean operators, so an undelimited
+    // (?:a|b)\d+ was torn into a group containing an OR of two words and the
+    // pattern was never compiled. Mirrors tokenizeQuery in the Go parser.
+    if (c === "/") {
+      let end = -1;
+      for (let j = i + 1; j < body.length; j++) {
+        if (body[j] === "\\") { j++; continue; }
+        if (body[j] === "/") { end = j; break; }
+      }
+      if (end < 0) {
+        // no closing slash: read it as a word, so a path still searches
+        let j = i;
+        while (j < body.length && !" \t()!&|".includes(body[j])) j++;
+        toks.push({ k: "term", v: body.slice(i, j) });
+        i = j;
+        continue;
+      }
+      const v = body.slice(i + 1, end);
+      if (v) toks.push({ k: "term", v, rx: true });
+      i = end + 1;
+      continue;
+    }
     if (c === '"' || c === "'") {
       const end = body.indexOf(c, i + 1);
       const v = end < 0 ? body.slice(i + 1) : body.slice(i + 1, end);
@@ -4829,7 +5477,7 @@ function ArchiveSearch({
         placeholder={placeholder ?? 'Search…  ospf AND down · "phrase" · -A 3 -B 2 · | $2 > 10000'}
         title={
           "AND / OR / NOT (also && || !), parentheses\n" +
-          'bare terms are regexes, "quoted" terms match literally\n' +
+          'bare terms are regexes, "quoted" terms match literally\n/regex/ for a pattern using ( ) | or ! — e.g. /(?:up|down)\\d+/\n' +
           "-A n / -B n / -C n show lines after / before / around each match\n\n" +
           "| $2 > 10000   filter by field value, like piping to awk\n" +
           "   $1, $2, … count from the message (timestamp and label skipped)\n" +
@@ -4963,6 +5611,11 @@ function LogContent({
   const [text, setText] = useState<string | null>(null);
   const [entries, setEntries] = useState<LogEntryRow[] | null>(null);
   const [total, setTotal] = useState(0);
+  // File-wide figures that travel with the page, so an empty result can say
+  // whether the filter excluded everything or the timestamps were never parsed.
+  const [span, setSpan] = useState<
+    { fileTotal: number; timestamped: number; first: string; last: string } | null
+  >(null);
   const [offset, setOffset] = useState(() =>
     highlightLine ? Math.floor((highlightLine - 1) / PAGE_LIMIT) * PAGE_LIMIT : 0
   );
@@ -4973,6 +5626,62 @@ function LogContent({
   // -A/-B/-C), so a loaded file can be narrowed without another round trip
   const [q, setQ] = useState("");
   const query = useMemo(() => parseLineQuery(q), [q]);
+
+  // Where the matches actually are in the whole file.
+  //
+  // The structured view holds one page of entries, so filtering it in the
+  // browser only ever searched that page: a term whose hits lie past the page
+  // boundary looked almost absent, while the archive-wide search reported the
+  // real number. The server's search is indexed and can be scoped to a single
+  // path, so it is asked for the true positions and the page count is shown as
+  // what it is — a subset.
+  const [fileMatches, setFileMatches] = useState<
+    { lines: number[]; total: number; truncated: boolean } | null
+  >(null);
+  const [seekLine, setSeekLine] = useState<number | undefined>(undefined);
+
+  useEffect(() => {
+    const trimmed = q.trim();
+    if (trimmed.length < 2) {
+      setFileMatches(null);
+      return;
+    }
+    const ac = new AbortController();
+    const timer = setTimeout(() => {
+      const params = new URLSearchParams({ q: trimmed, paths: path, limit: "2000" });
+      fetch(`/api/v1/files/${fileId}/search?${params.toString()}`, { signal: ac.signal })
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+        .then((d) => {
+          const lines: number[] = (d.results ?? [])
+            .filter((r: SearchResult) => r.type === "line" && r.line_no)
+            .map((r: SearchResult) => r.line_no as number)
+            .sort((a: number, b: number) => a - b);
+          setFileMatches({ lines, total: lines.length, truncated: Boolean(d.truncated) });
+        })
+        .catch(() => {
+          // leave the page-local count as the only figure rather than a wrong one
+        });
+    }, 400);
+    return () => {
+      clearTimeout(timer);
+      ac.abort();
+    };
+  }, [q, fileId, path]);
+
+  // Where the view should be pointed: an explicit jump from the in-file match
+  // navigation wins, otherwise the hit that opened this file.
+  const seekTarget = seekLine ?? highlightLine;
+
+  const gotoMatch = (dir: 1 | -1) => {
+    const lines = fileMatches?.lines ?? [];
+    if (lines.length === 0) return;
+    const cur = seekTarget ?? 0;
+    const next =
+      dir === 1
+        ? lines.find((l) => l > cur) ?? lines[0]
+        : [...lines].reverse().find((l) => l < cur) ?? lines[lines.length - 1];
+    setSeekLine(next);
+  };
   const viewRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -5003,6 +5712,12 @@ function LogContent({
           cachePut(cacheKey, { entries, total });
           setEntries(entries);
           setTotal(total);
+          setSpan({
+            fileTotal: Number(d.file_total) || entries.length,
+            timestamped: Number(d.timestamped) || 0,
+            first: String(d.first ?? ""),
+            last: String(d.last ?? ""),
+          });
         })
         .catch(() => setErr("Could not load file."));
     } else {
@@ -5019,10 +5734,10 @@ function LogContent({
   // follow the highlight to the right page when a new search hit targets
   // an already-open file
   useEffect(() => {
-    if (highlightLine !== undefined) {
-      setOffset(Math.floor((highlightLine - 1) / PAGE_LIMIT) * PAGE_LIMIT);
+    if (seekTarget !== undefined) {
+      setOffset(Math.floor((seekTarget - 1) / PAGE_LIMIT) * PAGE_LIMIT);
     }
-  }, [highlightLine]);
+  }, [seekTarget]);
 
   // flatten entries into uniform-height display rows (long messages become
   // continuation rows with blank ts/label)
@@ -5030,7 +5745,27 @@ function LogContent({
   // entry records whether it was a match (rather than context) and whether a
   // gap precedes it, so non-adjacent blocks can be separated the way grep
   // separates them with "--" instead of running together.
+  // Raw view is the same list with one column.
+  //
+  // It used to be a bare <pre> of the whole file, which meant the search bar
+  // and its context flags disappeared the moment you switched to it — exactly
+  // when they are most wanted, since Raw view is where you go when the
+  // structured columns are not showing what you need. Feeding raw lines through
+  // the same pipeline as structured entries gets search, -A/-B context, block
+  // separators, virtualisation and the maximized height for free, instead of
+  // scrolling an unbounded blob.
+  const rawEntries = useMemo<LogEntryRow[] | null>(() => {
+    if (text === null) return null;
+    const lines = text.split("\n");
+    // a trailing newline yields one empty final line that is not a row
+    if (lines.length && lines[lines.length - 1] === "") lines.pop();
+    return lines.map((msg, i) => ({ ts: "", label: "", msg, line: i + 1 }));
+  }, [text]);
+
+  const viewEntries = structured ? entries : rawEntries;
+
   const shownEntries = useMemo(() => {
+    const entries = viewEntries;
     if (!entries) return null;
     if (query.empty) {
       return entries.map((e) => ({ e, match: false, gap: false }));
@@ -5056,17 +5791,17 @@ function LogContent({
       prev = i;
     }
     return out;
-  }, [entries, query]);
+  }, [viewEntries, query]);
 
   const matchCount = useMemo(() => {
-    if (!entries || query.empty) return 0;
+    if (!viewEntries || query.empty) return 0;
     let n = 0;
-    for (const e of entries) {
+    for (const e of viewEntries) {
       const line = `${e.ts} ${e.label} ${e.msg}`;
       if (query.match(line) && query.keep(line)) n++;
     }
     return n;
-  }, [entries, query]);
+  }, [viewEntries, query]);
 
   const rows: FlatRow[] = useMemo(() => {
     const shown = shownEntries;
@@ -5107,17 +5842,22 @@ function LogContent({
   // the target is used, since the hit may land on a line the structured view
   // folded into the entry above it.
   const hlEntryIdx = useMemo(() => {
-    if (!query.empty || highlightLine === undefined || !shownEntries) return -1;
+    // An explicit jump from the match navigation applies even while the
+    // in-file filter is narrowing the view; the hit that opened the file only
+    // applies when nothing is filtered, or the row would be hidden anyway.
+    const target = seekLine ?? (query.empty ? highlightLine : undefined);
+    if (target === undefined || !shownEntries) return -1;
+    const highlightLine2 = target;
     let best = -1;
     for (let i = 0; i < shownEntries.length; i++) {
       const ln = shownEntries[i].e.line;
       if (ln === undefined) continue;
-      if (ln === highlightLine) return i;
-      if (ln < highlightLine) best = i;
+      if (ln === highlightLine2) return i;
+      if (ln < highlightLine2) best = i;
       else break; // line numbers only increase
     }
     return best;
-  }, [query.empty, highlightLine, shownEntries]);
+  }, [query.empty, highlightLine, seekLine, shownEntries]);
   const hlRowIdx = useMemo(
     () => (hlEntryIdx < 0 ? -1 : rows.findIndex((r) => r.entryIdx === hlEntryIdx && r.first)),
     [rows, hlEntryIdx]
@@ -5128,17 +5868,17 @@ function LogContent({
   // compare the target against the lines it actually contains and step towards
   // it; entries and lines are close enough that this settles in a hop or two.
   useEffect(() => {
-    if (query.empty !== true || highlightLine === undefined) return;
+    if (seekTarget === undefined) return;
     if (!entries || entries.length === 0 || total <= PAGE_LIMIT) return;
     const firstLine = entries.find((e) => e.line !== undefined)?.line;
     const lastLine = [...entries].reverse().find((e) => e.line !== undefined)?.line;
     if (firstLine === undefined || lastLine === undefined) return;
-    if (highlightLine > lastLine && offset + PAGE_LIMIT < total) {
+    if (seekTarget > lastLine && offset + PAGE_LIMIT < total) {
       setOffset(offset + PAGE_LIMIT);
-    } else if (highlightLine < firstLine && offset > 0) {
+    } else if (seekTarget < firstLine && offset > 0) {
       setOffset(Math.max(0, offset - PAGE_LIMIT));
     }
-  }, [entries, highlightLine, offset, total, query.empty]);
+  }, [entries, seekTarget, offset, total]);
 
   // jump to the highlighted row once rows are available
   useEffect(() => {
@@ -5161,7 +5901,7 @@ function LogContent({
       <h3 className="log-title">
         <span className="log-title-path">{path}</span>
         <span className="log-title-actions">
-          {structured && (
+          {(
             <input
               className="log-search"
               type="search"
@@ -5169,7 +5909,7 @@ function LogContent({
               title={
                 "Same syntax as the archive search:\n" +
                 "  AND / OR / NOT (also && || !), parentheses\n" +
-                '  bare terms are regexes, "quoted" terms are literal\n' +
+                '  bare terms are regexes, "quoted" terms are literal\n  /regex/ for a pattern using ( ) | or ! — e.g. /(?:up|down)\\d+/\n' +
                 "  -A n / -B n / -C n for lines after / before / around a match\n" +
                 "  | $2 > 10000   filter by field value, like piping to awk\n" +
                 "     $1, $2, … count from the message (timestamp and label skipped)\n" +
@@ -5182,17 +5922,39 @@ function LogContent({
               onChange={(e) => setQ(e.target.value)}
             />
           )}
-          {structured && !query.empty && (
-            <span className="log-search-count">
-              {matchCount} match{matchCount === 1 ? "" : "es"}
-            </span>
+          {!query.empty && (
+            <>
+              <span className="log-search-count">
+                {fileMatches
+                  ? `${fileMatches.truncated ? "first " : ""}${fileMatches.total} in file`
+                  : `${matchCount} match${matchCount === 1 ? "" : "es"}`}
+              </span>
+              {/* The page count is shown separately when it differs, so a small
+                  number on screen is never mistaken for the file's total. */}
+              {fileMatches && fileMatches.total !== matchCount && (
+                <span className="log-search-count log-search-page" title={
+                  `This page holds ${matchCount} of the ${fileMatches.total} matches in the file. ` +
+                  `Use \u2039 \u203a to step through all of them.`
+                }>
+                  {matchCount} on this page
+                </span>
+              )}
+              {fileMatches && fileMatches.total > 0 && (
+                <>
+                  <button className="view-toggle" title="Previous match in this file"
+                    onClick={() => gotoMatch(-1)}>&#8249;</button>
+                  <button className="view-toggle" title="Next match in this file"
+                    onClick={() => gotoMatch(1)}>&#8250;</button>
+                </>
+              )}
+            </>
           )}
-          {structured && query.filterText && (
+          {query.filterText && (
             <span className="log-filter-tag" title="Field filter applied to matches and context alike">
               | {query.filterText}
             </span>
           )}
-          {structured && query.filterError && (
+          {query.filterError && (
             <span className="log-filter-bad" title={query.filterError}>
               filter ignored
             </span>
@@ -5209,12 +5971,9 @@ function LogContent({
       </h3>
       {err && <p className="error">{err}</p>}
       {text === null && entries === null && !err && <p className="muted">Loading…</p>}
-      {!structured && text !== null && (
-        <pre className="log-pre">{text || "(empty after filtering)"}</pre>
-      )}
-      {structured && entries !== null && (
-        <div className="vt-wrap">
-          {total > PAGE_LIMIT && (
+      {viewEntries !== null && (
+        <div className={"vt-wrap" + (structured ? "" : " vt-raw")}>
+          {structured && total > PAGE_LIMIT && (
             <div className="pager">
               <button disabled={offset === 0} onClick={() => setOffset(offset - PAGE_LIMIT)}>
                 ‹ Prev
@@ -5230,11 +5989,17 @@ function LogContent({
               </button>
             </div>
           )}
-          <div className="vt-head">
-            <span>Timestamp</span>
-            <span>Label</span>
-            <span>Message</span>
-          </div>
+          {structured ? (
+            <div className="vt-head">
+              <span>Timestamp</span>
+              <span>Label</span>
+              <span>Message</span>
+            </div>
+          ) : (
+            <div className="vt-head vt-head-raw">
+              <span>{path} &mdash; raw</span>
+            </div>
+          )}
           <div
             className="vt-body"
             ref={viewRef}
@@ -5263,7 +6028,24 @@ function LogContent({
             )}
             <div style={{ height: padBottom }} />
             {rows.length === 0 && (
-              <p className="muted">(no entries — try Raw view or clear the time filter)</p>
+              <p className="muted">
+                {!structured ? (
+                  <>(nothing matches &mdash; clear the search)</>
+                ) : span && span.timestamped === 0 && span.fileTotal > 0 ? (
+                  <>
+                    None of this file&rsquo;s {span.fileTotal.toLocaleString()} lines carry a
+                    timestamp the parser recognises, so a time filter cannot match any of them.
+                    Clear the filter, or use Raw view.
+                  </>
+                ) : span && (from || to) && span.first ? (
+                  <>
+                    No entries between {from || "the start"} and {to || "the end"}. This file holds{" "}
+                    {span.fileTotal.toLocaleString()} entries spanning {span.first} to {span.last}.
+                  </>
+                ) : (
+                  <>(no entries — try Raw view or clear the time filter)</>
+                )}
+              </p>
             )}
           </div>
         </div>

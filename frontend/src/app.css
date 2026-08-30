@@ -168,6 +168,14 @@ select {
 }
 .vt-row:nth-child(odd) { background: #fbfcfe; }
 .vt-row .lt-msg { overflow: hidden; }
+
+/* Raw view shares the virtualized list so it gets search, context flags and
+   the maximized height; it just collapses to a single column, since a raw
+   line has no timestamp or label of its own. */
+.vt-raw .vt-row, .vt-raw .vt-head { grid-template-columns: 1fr; }
+.vt-raw .lt-ts, .vt-raw .lt-label { display: none; }
+.vt-head-raw { color: #5a6675; font-weight: 600; }
+.vt-raw .lt-msg { overflow-x: visible; }
 .hl-vt { background: #fff3cd !important; }
 
 /* file filter inside picker */
@@ -966,3 +974,42 @@ td button { border: 0; background: #fdecea; color: #c0392b; padding: 5px 10px; b
 
 .gp-auth-fail { background: #fff5f5; }
 .gp-auth .gp-chip { margin-right: 4px; }
+
+.log-search-page { opacity: .7; }
+
+/* ---- GlobalProtect: service-trace facts and stage runs ---- */
+.gp-yes { color: #1a7f45; font-weight: 700; margin: 2px 0 6px; }
+.gp-no  { color: #b02a2a; font-weight: 700; margin: 2px 0 6px; }
+.gp-card-wide { grid-column: 1 / -1; }
+.gp-details { margin-top: 8px; }
+.gp-details summary { cursor: pointer; color: #2455c3; font-size: 12.5px; }
+.gp-pre {
+  margin: 6px 0 0; padding: 8px; background: #f7f8fa; border-radius: 4px;
+  font-family: ui-monospace, monospace; font-size: 11.5px; white-space: pre-wrap;
+}
+.gp-picker { margin-bottom: 8px; padding: 4px 6px; font-size: 12.5px; }
+.gp-routes { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 10px; }
+.gp-routes h4 { margin: 0 0 4px; font-size: 12.5px; color: #3c4654; }
+.gp-routelist {
+  margin: 0; padding: 0 0 0 16px; max-height: 190px; overflow: auto;
+  font-family: ui-monospace, monospace; font-size: 12px; color: #26313f;
+}
+
+.gp-trace { margin-top: 18px; }
+.gp-trace .gp-h3 { display: flex; align-items: center; gap: 10px; }
+.gp-trace-runs { max-height: 460px; overflow: auto; margin-top: 8px; }
+.gp-trace-run {
+  border: 1px solid #e6e9ee; border-radius: 6px; padding: 8px 10px; margin-bottom: 6px;
+}
+.gp-trace-when { font-family: ui-monospace, monospace; font-size: 12px; color: #5a6675; }
+.gp-trace-steps {
+  display: flex; flex-wrap: wrap; gap: 4px; list-style: none; margin: 6px 0 0; padding: 0;
+}
+.gp-trace-steps li {
+  font-size: 11.5px; padding: 2px 7px; border-radius: 10px; white-space: nowrap;
+}
+.gp-tr-hit  { background: #dff3e6; color: #1a5c36; }
+.gp-tr-skip { background: #fdf3d8; color: #7a5b12; }
+.gp-tr-miss { background: #f1f3f6; color: #97a1ad; }
+.gp-trace-facts { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.gp-chip-mute { background: #eef1f5; color: #4a5563; }

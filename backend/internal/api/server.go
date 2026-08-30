@@ -290,6 +290,14 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 			fg.Close()
 		}
 		if fg, gerr := os.Open(rec.StoragePath); gerr == nil {
+			if fx, ferr := parser.ExtractGPFacts(fg); ferr == nil {
+				rep.Facts = fx
+			} else {
+				log.Printf("parse %s: gp facts: %v", rec.ID, ferr)
+			}
+			fg.Close()
+		}
+		if fg, gerr := os.Open(rec.StoragePath); gerr == nil {
 			if h, herr := parser.ExtractHIPReport(fg); herr == nil {
 				rep.HIP = h
 			} else {
@@ -521,9 +529,14 @@ func (s *Server) handleContent(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("format") == "structured" {
 		const pageLimit = 50000
 		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-		entries, total := parser.StructureLogPage(entry, from, to, offset, pageLimit)
+		entries, st := parser.StructureLogPageStats(entry, from, to, offset, pageLimit)
+		// The file-wide figures travel with the page so an empty result can
+		// explain itself: a filter that excludes everything and a file whose
+		// timestamps were never parsed look identical without them.
 		writeJSON(w, http.StatusOK, map[string]any{
-			"entries": entries, "total": total, "offset": offset, "limit": pageLimit,
+			"entries": entries, "total": st.Total, "offset": offset, "limit": pageLimit,
+			"file_total": st.FileTotal, "timestamped": st.Timestamped,
+			"first": st.First, "last": st.Last,
 		})
 		return
 	}
@@ -671,6 +684,7 @@ func (s *Server) handleGP(w http.ResponseWriter, r *http.Request) {
 		"timeline": rep.Timeline,
 		"attempts": rep.Attempts,
 		"gateways": rep.Gateways,
+		"facts":    rep.Facts,
 		"portals":  rep.Portals,
 		"hip":      rep.HIP,
 		"auth":     rep.Auth,

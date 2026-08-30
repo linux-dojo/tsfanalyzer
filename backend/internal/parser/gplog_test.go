@@ -25,8 +25,56 @@ const (
 (P11496-T14080)debug08/18/26 09:41:41:742 (152): [CP_DETECT] CaptivePortalDetectionThread: wait`
 )
 
+// The macOS agent's layout, verbatim from a collection where the time filter
+// returned nothing at all: unbracketed process/thread, four-digit year, and the
+// severity after the timestamp instead of before it. None of the other three
+// patterns match these, so every line fell through as an untimestamped
+// continuation — and a line with no timestamp cannot satisfy a time range, so
+// the whole file looked empty the moment a filter was set.
+const gpMacSample = `P3094-T64395 08/24/2026 14:59:55:832 Debug(4036): DLSA: monitor: RTM_MISS: Lookup failed on this address: 2001:4860:4860::8888 --  --
+P3094-T16899 08/24/2026 15:12:04:876 Info (2710): gpa system ext action 0x8 returns success
+P3094-T259   08/24/2026 15:20:23:216 Debug(6398): StopServer() SetVpnStatus to GP_VPN_STATUS_DISCONNECTED`
+
+func TestGPMacFormat(t *testing.T) {
+	got := StructureGPLog(strings.NewReader(gpMacSample), time.Time{}, time.Time{})
+	if len(got) != 3 {
+		t.Fatalf("got %d entries, want 3: %+v", len(got), got)
+	}
+	if got[0].Label != "Debug" || got[1].Label != "Info" {
+		t.Errorf("labels = %q/%q, want Debug/Info", got[0].Label, got[1].Label)
+	}
+	if got[0].Ts != "2026-08-24 14:59:55.832" {
+		t.Errorf("ts = %q, want 2026-08-24 14:59:55.832", got[0].Ts)
+	}
+	if !strings.HasPrefix(got[2].Msg, "P3094-T259 ") {
+		t.Errorf("the process/thread should lead the message: %q", got[2].Msg)
+	}
+	if !strings.Contains(got[2].Msg, "GP_VPN_STATUS_DISCONNECTED") {
+		t.Errorf("message not preserved: %q", got[2].Msg)
+	}
+}
+
+// The bug this format caused: a time range that plainly covers the log
+// returned nothing, because untimestamped lines cannot be placed in a range.
+func TestGPMacFormatTimeFilter(t *testing.T) {
+	from, _ := time.Parse("2006-01-02 15:04:05", "2026-08-24 15:00:00")
+	to, _ := time.Parse("2006-01-02 15:04:05", "2026-08-24 15:15:00")
+	got := StructureGPLog(strings.NewReader(gpMacSample), from, to)
+	if len(got) != 1 {
+		t.Fatalf("got %d entries, want the single line inside 15:00–15:15: %+v", len(got), got)
+	}
+	if !strings.Contains(got[0].Msg, "gpa system ext action") {
+		t.Errorf("wrong line survived the filter: %q", got[0].Msg)
+	}
+	// and the paged entry point must route to the GP parser on its own
+	page, total := StructureLogPage(strings.NewReader(gpMacSample), from, to, 0, 100)
+	if total != 1 || len(page) != 1 {
+		t.Errorf("StructureLogPage gave %d of %d, want 1 of 1", len(page), total)
+	}
+}
+
 func TestGPLineFormatsRecognised(t *testing.T) {
-	for _, block := range []string{gpEventSample, gpTraceSample, gpCpSample} {
+	for _, block := range []string{gpEventSample, gpTraceSample, gpCpSample, gpMacSample} {
 		for _, line := range strings.Split(block, "\n") {
 			if !IsGPLogLine(line) {
 				t.Errorf("not recognised as a GlobalProtect line:\n  %s", line)

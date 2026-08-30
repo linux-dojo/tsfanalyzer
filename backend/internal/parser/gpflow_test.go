@@ -231,6 +231,139 @@ func TestGPSamlGatewayPromptsAgain(t *testing.T) {
 	}
 }
 
+// Gateway-side activity long after a successful connection. There is no portal
+// pre-login in front of it, so keying attempts solely on that marker folded
+// these lines into the *already connected* attempt above — which then still
+// reported "connected", and the later failure disappeared from the timeline.
+const gpReconnectAfterConnect = `08/24/2026 13:09:49:000 [Info ]: Started the Portal pre-login
+08/24/2026 13:09:50:000 [Info ]: Portal pre-login result received
+08/24/2026 13:09:51:000 [Info ]: Logging into portal
+08/24/2026 13:09:52:000 [Info ]: portal status is Connected.
+08/24/2026 13:09:53:000 [Info ]: Portal login completed with address bfs.example.com and conect method of user-logon.
+08/24/2026 13:09:54:000 [Info ]: Gateway pre-Login Starts to bfs.example.com
+08/24/2026 13:09:56:000 [Info ]: Auto Gateway login finished with address bfs.example.com and user someone.
+08/24/2026 13:09:57:000 [Info ]: Trying to create tunnel with gateway bfs.example.com
+08/24/2026 13:10:02:000 [Info ]: IPSec tunnel creation finished with Gateway bfs.example.com.
+08/24/2026 15:10:23:000 [Info ]: Preferred gateway bfs.example.com: Checking network availability and restoring VPN connection when network is available.
+08/24/2026 15:10:53:000 [Info ]: Preferred gateway bfs.example.com: Checking network availability and restoring VPN connection when network is available.
+08/24/2026 15:11:23:000 [Error]: The network connection is unreachable or the gateway is unresponsive. Check the network connection and reconnect.`
+
+func TestGPReconnectIsItsOwnAttempt(t *testing.T) {
+	at, err := ExtractGPAttempts(bytes.NewReader(gpTgz(t, gpReconnectAfterConnect, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(at) != 2 {
+		t.Fatalf("got %d attempts, want 2 (the connection, then the reconnect): %+v", len(at), at)
+	}
+
+	first, second := at[0], at[1]
+	if first.Outcome != "connected" {
+		t.Errorf("first attempt outcome = %q, want connected", first.Outcome)
+	}
+	if first.Trigger != "portal" {
+		t.Errorf("first attempt trigger = %q, want portal", first.Trigger)
+	}
+	// it must end at the tunnel, not swallow the retry two hours later
+	if first.End.Hour() != 13 {
+		t.Errorf("the connected attempt ran to %v; it should end when the tunnel came up", first.End)
+	}
+
+	if second.Trigger != "reconnect" {
+		t.Errorf("second attempt trigger = %q, want reconnect", second.Trigger)
+	}
+	if second.Outcome != "failed" {
+		t.Errorf("second attempt outcome = %q, want failed", second.Outcome)
+	}
+	if second.StopAt != StageGatewaySelect {
+		t.Errorf("second attempt stop_at = %q, want %q", second.StopAt, StageGatewaySelect)
+	}
+	if second.Start.Hour() != 15 {
+		t.Errorf("the reconnect should start at 15:10, got %v", second.Start)
+	}
+	// a reconnect names no portal of its own, so it inherits the last one used
+	if second.Portal != "bfs.example.com" {
+		t.Errorf("reconnect portal = %q, want it carried over from the portal login", second.Portal)
+	}
+	// the portal stages were never touched on a gateway-only run
+	for _, s := range second.Stages {
+		if s.Stage == StagePortalAuth && s.Status != "not reached" {
+			t.Errorf("portal auth = %q on a reconnect, want not reached", s.Status)
+		}
+	}
+}
+
+// A flapping tunnel, verbatim from a macOS collection: the tunnel comes up,
+// then drops and restores every few seconds while the agent retries the
+// gateway. Two things have to hold — the successful connection must still read
+// as connected, and each retry cycle must appear rather than being swallowed by
+// the attempt that already succeeded.
+const gpFlappingTunnel = `08/24/2026 13:09:49:000 [Info ]: Started the Portal pre-login
+08/24/2026 13:09:50:000 [Info ]: Portal pre-login result received
+08/24/2026 13:09:51:000 [Info ]: Logging into portal
+08/24/2026 13:09:52:000 [Info ]: portal status is Connected.
+08/24/2026 13:09:53:000 [Info ]: Portal login completed with address connect.example.com and conect method of user-logon.
+08/24/2026 13:09:54:000 [Info ]: Gateway pre-Login Starts to bfs.example.com
+08/24/2026 13:10:28:000 [Info ]: IPSec tunnel creation finished with Gateway bfs.example.com.
+08/24/2026 15:14:08:000 [Info ]: Tunnel is restored.
+08/24/2026 15:14:08:000 [Info ]: Tunnel is down due to packet sending failure.
+08/24/2026 15:14:08:000 [Error]: Preferred gateway bfs.example.com: Checking network availability and restoring VPN connection when network is available.
+08/24/2026 15:14:11:000 [Info ]: Tunnel is restored.
+08/24/2026 15:14:11:000 [Info ]: Tunnel is down due to packet sending failure.
+08/24/2026 15:14:11:000 [Error]: Preferred gateway bfs.example.com: Checking network availability and restoring VPN connection when network is available.`
+
+func TestGPFlappingTunnelKeepsTheConnectionAndShowsTheRetries(t *testing.T) {
+	at, err := ExtractGPAttempts(bytes.NewReader(gpTgz(t, gpFlappingTunnel, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var connected, reconnects int
+	for _, a := range at {
+		if a.Outcome == "connected" {
+			connected++
+		}
+		if a.Trigger == "reconnect" {
+			reconnects++
+		}
+	}
+	// The tunnel did come up. A drop two hours later must not reach back and
+	// mark that attempt failed.
+	if connected != 1 {
+		t.Errorf("connected attempts = %d, want 1: %+v", connected, at)
+	}
+	if at[0].Outcome != "connected" || at[0].Trigger != "portal" {
+		t.Errorf("first attempt = %s/%s, want connected/portal", at[0].Outcome, at[0].Trigger)
+	}
+	// ...and the retry cycles must be visible rather than absorbed into it.
+	if reconnects < 2 {
+		t.Errorf("reconnect attempts = %d, want one per retry cycle: %+v", reconnects, at)
+	}
+	for _, a := range at {
+		if a.Trigger == "reconnect" && a.Outcome != "failed" {
+			t.Errorf("a retry cycle should read as failed, got %q", a.Outcome)
+		}
+	}
+}
+
+// A burst of retry lines is one attempt, not one per line.
+func TestGPReconnectBurstStaysOneAttempt(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("08/24/2026 15:10:00:000 [Info ]: Preferred gateway g.example.com: Checking network availability and restoring VPN connection when network is available.\n")
+	for i := 1; i < 6; i++ {
+		sb.WriteString("08/24/2026 15:10:" + string(rune('0'+i)) + "0:000 [Info ]: Preferred gateway g.example.com: Checking network availability and restoring VPN connection when network is available.\n")
+	}
+	at, err := ExtractGPAttempts(bytes.NewReader(gpTgz(t, sb.String(), nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(at) != 1 {
+		t.Fatalf("got %d attempts, want 1 for a single retry burst", len(at))
+	}
+	if at[0].Events < 6 {
+		t.Errorf("the burst should be one attempt of 6 events, got %d", at[0].Events)
+	}
+}
+
 /* ---------- gateway selection ---------- */
 
 // Real PanGPS lines. The region mismatch is the quiet cause of "portal fine,

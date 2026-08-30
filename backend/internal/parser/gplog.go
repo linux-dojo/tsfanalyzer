@@ -1,8 +1,12 @@
-// Package parser: gplog.go reads the two line formats a GlobalProtect agent
+// Package parser: gplog.go reads the line formats a GlobalProtect agent
 // collection uses, so its logs display and filter like every other log in the
 // tool rather than as undifferentiated text.
 //
-// # The two formats
+// # The five formats
+//
+// Every one of these was found by measuring parser coverage against a real
+// collection rather than by assuming, and each of the last four was a file
+// that would otherwise have been unreadable.
 //
 // The event logs (pan_gp_event.log, pan_gpa_event.log, pan_cp_events.log,
 // pan_gpa_cp_event.log) are the user-facing narrative, one line per event:
@@ -14,6 +18,19 @@
 // line and the source line number:
 //
 //	(P11496-T6520)Info (11298): 08/18/26 13:55:40:474 Connect method is user-logon
+//
+// The captive-portal log reorders those fields, and the macOS agent drops the
+// brackets and uses a four-digit year with the severity after the timestamp:
+//
+//	(P11496-T14080)debug08/18/26 09:41:41:742 (152): [CP_DETECT] …
+//	P3094-T64395 08/24/2026 14:59:55:832 Debug(4036): DLSA: monitor: …
+//
+// and the virtual-adapter driver log uses microseconds and a merged bracket:
+//
+//	08/24/2026 11:47:13.455179[Info   318]: ----Driver Control is being started----
+//
+// Lines matching none of these are continuations — plist and JSON dumps make up
+// most of PanGPA.log — and inherit the timestamp of the entry above them.
 //
 // # Why the process and thread are kept
 //
@@ -53,6 +70,32 @@ var (
 	// split correctly.
 	gpCpLineRe = regexp.MustCompile(
 		`^\s*\(P(\d+)-T(\d+)\)([A-Za-z]+)\s*(\d{2}/\d{2}/\d{2}) (\d{2}:\d{2}:\d{2}):(\d{3})\s*\(\s*(\d+)\):\s?(.*)$`)
+
+	// The macOS agent lays the same fields out differently: the process and
+	// thread are not bracketed, the year is four digits, and the severity comes
+	// *after* the timestamp rather than before it:
+	//
+	//	P3094-T64395 08/24/2026 14:59:55:832 Debug(4036): DLSA: monitor: …
+	//	P3094-T259   08/24/2026 15:20:23:216 Debug(6398): StopServer() …
+	//
+	// Both the process and thread fields are space-padded to a fixed width, so
+	// a low process id appears as "P 915-T61619" — the network-extension log
+	// is written by a short-pid process and was 0% parsed until the padding
+	// was allowed for. The gap before the date varies for the same reason.
+	//
+	// Without this whole pattern, every line in a macOS collection fell through
+	// as an untimestamped continuation, which made the file invisible to the
+	// time filter: a line with no timestamp cannot be placed in a range.
+	gpMacLineRe = regexp.MustCompile(
+		`^\s*P\s*(\d+)-T\s*(\d+)\s+(\d{2}/\d{2}/\d{4}) (\d{2}:\d{2}:\d{2}):(\d{3})\s+([A-Za-z]+)\s*\(\s*(\d+)\):\s?(.*)$`)
+
+	// The virtual-adapter driver log uses a fifth shape: microseconds after a
+	// dot rather than milliseconds after a colon, and the severity and source
+	// line share one bracket with no separator before it.
+	//
+	//	08/24/2026 11:47:13.455179[Info   318]: ----Driver Control is being started----
+	gpDrvLineRe = regexp.MustCompile(
+		`^(\d{2}/\d{2}/\d{4}) (\d{2}:\d{2}:\d{2})\.(\d+)\s*\[([A-Za-z]+)\s*(\d+)\]:\s?(.*)$`)
 )
 
 // gpEmbeddedEntryRe finds a second entry written onto the same physical line,
@@ -86,27 +129,40 @@ func splitGPEmbedded(line string) []string {
 func IsGPLogLine(line string) bool {
 	return gpEventLineRe.MatchString(line) ||
 		gpTraceLineRe.MatchString(line) ||
-		gpCpLineRe.MatchString(line)
+		gpCpLineRe.MatchString(line) ||
+		gpMacLineRe.MatchString(line) ||
+		gpDrvLineRe.MatchString(line)
 }
 
-// looksLikeGPLog decides the format of a whole file from its opening lines.
-// A handful is enough: these logs are uniform, and the first line of a
-// component log is often a banner rather than a timestamped entry.
+// looksLikeGPLog decides which parser a file needs.
+//
+// The rule is a comparison, not a threshold: whichever family recognises more
+// of the sampled lines wins. An earlier version asked whether at least half of
+// the first twenty lines were GlobalProtect lines, and that failed badly on a
+// file whose opening happens to be a plist or JSON dump — PanGPA.log is 89%
+// such continuation lines. A file that opened mid-dump was sent to the monitor
+// parser, which understands none of its timestamps, so *every* row lost its
+// timestamp and label and the time filter matched nothing at all.
+//
+// The two families never overlap: a monitor log's "2026-06-09 11:27:40 -0700
+// --- panio" matches no GlobalProtect pattern, and a GlobalProtect line
+// matches no monitor pattern. So counting each and taking the larger is both
+// safe and insensitive to how the sample happens to start.
 func looksLikeGPLog(head []string) bool {
-	checked, matched := 0, 0
+	gp, monitor, checked := 0, 0, 0
 	for _, l := range head {
 		if strings.TrimSpace(l) == "" {
 			continue
 		}
 		checked++
-		if IsGPLogLine(l) {
-			matched++
-		}
-		if checked >= 20 {
-			break
+		switch {
+		case IsGPLogLine(l):
+			gp++
+		case isMonitorLogLine(l):
+			monitor++
 		}
 	}
-	return checked > 0 && matched*2 >= checked
+	return checked > 0 && gp > monitor
 }
 
 // parseGPTime builds a timestamp from the date and time parts. Both formats
@@ -211,6 +267,36 @@ func (s *gpScanState) add(out []LogEntry, line string, from, to time.Time) []Log
 	if m := gpCpLineRe.FindStringSubmatch(line); m != nil {
 		s.stamp(m[4], m[5], m[6])
 		s.label = strings.TrimSpace(m[3])
+		if s.inRange(from, to) {
+			out = append(out, LogEntry{
+				Ts: s.ts, Label: s.label, Msg: "P" + m[1] + "-T" + m[2] + " " + m[8],
+				Line: s.line,
+			})
+		}
+		return out
+	}
+
+	// driver log: microseconds after a dot, severity and source line in one
+	// bracket. Checked before the macOS pattern only for clarity; the two
+	// cannot both match a line.
+	if m := gpDrvLineRe.FindStringSubmatch(line); m != nil {
+		// microseconds are truncated to the milliseconds the display uses
+		ms := m[3]
+		if len(ms) > 3 {
+			ms = ms[:3]
+		}
+		s.stamp(m[1], m[2], ms)
+		s.label = strings.TrimSpace(m[4])
+		if s.inRange(from, to) {
+			out = append(out, LogEntry{Ts: s.ts, Label: s.label, Msg: m[6], Line: s.line})
+		}
+		return out
+	}
+
+	// macOS layout: severity follows the timestamp rather than preceding it
+	if m := gpMacLineRe.FindStringSubmatch(line); m != nil {
+		s.stamp(m[3], m[4], m[5])
+		s.label = strings.TrimSpace(m[6])
 		if s.inRange(from, to) {
 			out = append(out, LogEntry{
 				Ts: s.ts, Label: s.label, Msg: "P" + m[1] + "-T" + m[2] + " " + m[8],

@@ -69,6 +69,11 @@ type GPReport struct {
 	Portals  []parser.GPPortal          `json:"portals"`
 	HIP      *parser.HIPReport          `json:"hip"`
 	Auth     []parser.GPAuthEvent       `json:"auth"`
+	// Facts come from the service trace (PanGPS.log) rather than the event
+	// log: the stage boundaries, the certificate check, the portal's pre-login
+	// response, the enforcer, internal host detection, and the configuration
+	// the gateway pushed back.
+	Facts *parser.GPFacts `json:"facts"`
 }
 
 // MemoryReport is the memory/OOM verdict for a file: one analysis per

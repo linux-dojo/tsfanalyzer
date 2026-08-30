@@ -38,18 +38,96 @@ var (
 	subSectionRe  = regexp.MustCompile(`^:([A-Za-z][A-Za-z0-9 _-]*):$`)
 )
 
-// StructureLogPage returns one page of structured entries plus the total
-// in-range entry count, so very large logs can be served in slices.
+// isMonitorLogLine reports whether a line carries a monitor-style timestamp:
+// either a "--- <proc>" block header or a plain leading date. It is the
+// counterpart to IsGPLogLine, used to decide which parser a file needs.
+func isMonitorLogLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return blockHdrRe.MatchString(trimmed) || leadTsRe.MatchString(trimmed)
+}
+
+// LogPageStats describes the file as a whole, independently of any time
+// filter. Without it an empty result is a dead end: "no entries" cannot
+// distinguish a filter that excludes everything from a file whose timestamps
+// were not understood, and both look identical on screen.
+type LogPageStats struct {
+	// Total is the number of entries after filtering; FileTotal is how many
+	// the file holds in all.
+	Total     int `json:"total"`
+	FileTotal int `json:"file_total"`
+	// Timestamped is how many entries carry a parsed timestamp. A file where
+	// this is zero has a line format the parser does not recognise, which is
+	// why a time filter would return nothing from it.
+	Timestamped int `json:"timestamped"`
+	// First and Last bound the timestamps actually present.
+	First string `json:"first,omitempty"`
+	Last  string `json:"last,omitempty"`
+}
+
+// StructureLogPage returns one page of entries in range, plus the in-range
+// total. StructureLogPageStats gives the same thing with the file-wide figures.
 func StructureLogPage(r io.Reader, from, to time.Time, offset, limit int) ([]LogEntry, int) {
-	// A GlobalProtect agent log has its own line format; sniffing the opening
+	page, st := StructureLogPageStats(r, from, to, offset, limit)
+	return page, st.Total
+}
+
+// StructureLogPageStats parses the file once without a time filter, so the
+// file's real span is known, then applies the filter in memory. Parsing
+// unfiltered costs nothing extra — the entries were being built in full
+// either way — and it is what lets the caller say *why* a page is empty.
+func StructureLogPageStats(r io.Reader, from, to time.Time, offset, limit int) ([]LogEntry, LogPageStats) {
+	// A GlobalProtect agent log has its own line formats; sniffing the opening
 	// lines picks the right parser without the caller needing to know which
 	// kind of archive the file came out of.
-	head, rest := headLines(r, 20)
-	var all []LogEntry
+	head, rest := headLines(r, logSniffLines)
+	var everything []LogEntry
 	if looksLikeGPLog(head) {
-		all = StructureGPLog(rest, from, to)
+		everything = StructureGPLog(rest, time.Time{}, time.Time{})
 	} else {
-		all = StructureLog(rest, from, to)
+		everything = StructureLog(rest, time.Time{}, time.Time{})
+	}
+
+	st := LogPageStats{FileTotal: len(everything)}
+	for _, e := range everything {
+		if e.Ts == "" {
+			continue
+		}
+		st.Timestamped++
+		if st.First == "" || e.Ts < st.First {
+			st.First = e.Ts
+		}
+		if e.Ts > st.Last {
+			st.Last = e.Ts
+		}
+	}
+
+	// The display timestamp sorts lexicographically in chronological order, so
+	// the filter is a string comparison — but only once the separators agree:
+	// the monitor parser writes 2026/08/24 and the GlobalProtect parser
+	// 2026-08-24, and comparing those raw would drop every monitor entry,
+	// because '/' sorts above '-'.
+	all := everything
+	if !from.IsZero() || !to.IsZero() {
+		lo := from.Format(logTsLayout)
+		hi := to.Format(logTsLayout)
+		kept := everything[:0:0]
+		for _, e := range everything {
+			if e.Ts == "" {
+				continue // cannot be placed in time
+			}
+			ts := normalizeLogTs(e.Ts)
+			if !from.IsZero() && ts < lo {
+				continue
+			}
+			// The bound is exact to the second: "to = 15:15" means 15:15:00,
+			// so 15:15:30 is outside it. That matches the firewall path's
+			// previous behaviour, so the two kinds of log filter alike.
+			if !to.IsZero() && len(ts) >= len(hi) && ts[:len(hi)] > hi {
+				continue
+			}
+			kept = append(kept, e)
+		}
+		all = kept
 	}
 	total := len(all)
 	if offset < 0 {
@@ -62,7 +140,27 @@ func StructureLogPage(r io.Reader, from, to time.Time, offset, limit int) ([]Log
 	if limit > 0 && offset+limit < total {
 		end = offset + limit
 	}
-	return all[offset:end], total
+	st.Total = total
+	return all[offset:end], st
+}
+
+// logTsLayout is the display timestamp format shared by both parsers. It sorts
+// lexicographically in chronological order, which is what lets the time filter
+// be a string comparison.
+const logTsLayout = "2006-01-02 15:04:05"
+
+// logSniffLines is how many opening lines are sampled to choose a parser.
+// Twenty was far too few: a file that opens with a long dump looked like it
+// had no recognisable format at all.
+const logSniffLines = 400
+
+// normalizeLogTs puts a display timestamp into logTsLayout's separator form so
+// entries from either parser compare consistently.
+func normalizeLogTs(ts string) string {
+	if len(ts) >= 10 && ts[4] == '/' {
+		return ts[:4] + "-" + ts[5:7] + "-" + ts[8:]
+	}
+	return ts
 }
 
 // StructureLog converts a monitor-style log into labeled, timestamped

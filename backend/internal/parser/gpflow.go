@@ -88,6 +88,10 @@ type GPAttempt struct {
 	Start   time.Time       `json:"start"`
 	End     time.Time       `json:"end"`
 	Stages  []GPStageResult `json:"stages"`
+	// Trigger says how the attempt began: "portal" for a full login starting
+	// at portal pre-login, "reconnect" for a gateway-side run after a network
+	// change or tunnel drop, which never touches the portal at all.
+	Trigger string          `json:"trigger,omitempty"`
 	Reached GPStage         `json:"reached"`  // furthest stage touched
 	StopAt  GPStage         `json:"stop_at"`  // where it stopped, if it did
 	Outcome string          `json:"outcome"`  // connected | failed | incomplete
@@ -117,6 +121,7 @@ type GPAttempt struct {
 	browserAt     time.Time
 	cookieWritten bool
 	cookieMissing bool
+	settled       bool // the attempt reached a terminal state
 	// awaitingAuth is set while an interactive login is outstanding. The agent
 	// re-issues a portal pre-login when the browser hands control back, so a
 	// pre-login arriving in this state continues the attempt rather than
@@ -155,12 +160,18 @@ var gpStageMarkers = []stageMarker{
 	{regexp.MustCompile(`(?i)network discovery started|discovering (internal|external) network`), StageDiscovery, "reached", ""},
 
 	// gateway selection and login
+	{regexp.MustCompile(`(?i)preferred gateway .*?(checking network availability|restoring vpn connection)`),
+		StageGatewaySelect, "failed",
+		"the preferred gateway was not reachable; the agent is waiting for the network to come back"},
 	{regexp.MustCompile(`(?i)gateway pre-?login starts to|prelogin to gateway`), StageGatewaySelect, "ok", ""},
 	{regexp.MustCompile(`(?i)gateway login (finished|starts) `), StageGatewayAuth, "reached", ""},
 	{regexp.MustCompile(`(?i)(auto |manual )?gateway login finished with address`), StageGatewayAuth, "ok", ""},
 
 	// tunnel
-	{regexp.MustCompile(`(?i)(ipsec|ssl) tunnel creation finished`), StageTunnel, "ok", ""},
+	{regexp.MustCompile(`(?i)tunnel is down due to packet sending failure`), StageTunnel, "failed",
+		"the tunnel dropped on a packet-send failure — the tunnel was up, so this is a data-path problem rather than a login one"},
+	{regexp.MustCompile(`(?i)tunnel is down due to (.+?)\.?$`), StageTunnel, "failed", ""},
+	{regexp.MustCompile(`(?i)(ipsec|ssl) tunnel creation finished|tunnel is restored`), StageTunnel, "ok", ""},
 	{regexp.MustCompile(`(?i)trying to create tunnel with gateway`), StageTunnel, "reached", ""},
 	{regexp.MustCompile(`(?i)tunnel creation failed|failed to create tunnel`), StageTunnel, "failed", "the tunnel could not be established"},
 
@@ -171,6 +182,30 @@ var gpStageMarkers = []stageMarker{
 
 var (
 	gpAttemptStartRe = regexp.MustCompile(`(?i)^(started the portal pre ?- ?login|SSO starts)`)
+
+	// Not every attempt begins at the portal. Once the agent holds a valid
+	// portal config it will go straight back to a gateway — on a network
+	// change, after a tunnel drop, or while waiting for connectivity to
+	// return. Those runs never emit a portal pre-login, so keying attempts
+	// solely on that marker dropped them from the timeline entirely, which is
+	// exactly the activity you are looking for when a connection is flapping.
+	// Only events that genuinely *begin* work belong here. A tunnel going down
+	// or a gateway logout ends an attempt rather than starting one, so they
+	// settle the current attempt instead (see gpSettledRe); listing them here
+	// as well produced a rash of one-event attempts.
+	gpReconnectStartRe = regexp.MustCompile(`(?i)` +
+		`gateway pre-?login starts to|` +
+		`trying to create tunnel with gateway|` +
+		`preferred gateway .*?(checking network availability|restoring vpn connection)|` +
+		`network connection is unreachable or the gateway is unresponsive`)
+
+	// gpSettledRe marks the end of an attempt: past this the next gateway-side
+	// event belongs to a new one rather than extending this one forever.
+	gpSettledRe = regexp.MustCompile(`(?i)` +
+		`(ipsec|ssl) tunnel creation finished|` +
+		`tunnel is down|` +
+		`user was logged out of gateway|` +
+		`portal status is (User authentication failed|Invalid portal)`)
 	// The one error the agent emits for "no gateway could be used", whatever
 	// the underlying cause. On its own it is unhelpful, so the gateway
 	// analysis below supplies the reason.
@@ -243,6 +278,8 @@ type gpFlowLine struct {
 func attemptsFromLines(lines []gpFlowLine) []GPAttempt {
 	var out []GPAttempt
 	var cur *GPAttempt
+	// A reconnect names no portal, so the last one seen is carried forward.
+	var lastPortal, lastGateway string
 	best := map[GPStage]GPStageResult{}
 
 	flush := func() {
@@ -272,7 +309,21 @@ func attemptsFromLines(lines []gpFlowLine) []GPAttempt {
 			waiting := cur != nil && cur.awaitingAuth
 			if cur == nil || (!waiting && l.ts.Sub(cur.Start) > 2*time.Second) {
 				flush()
-				cur = &GPAttempt{Start: l.ts}
+				cur = &GPAttempt{Start: l.ts, Trigger: "portal", Portal: lastPortal, Gateway: lastGateway}
+			}
+		} else if gpReconnectStartRe.MatchString(l.msg) {
+			// A gateway-side run with no portal login in front of it. Start one
+			// only when nothing is open or the open one has already settled, so
+			// a burst of retry lines stays a single attempt rather than one per
+			// line; a long silence also ends it.
+			stale := cur != nil && (cur.settled || l.ts.Sub(cur.End) > 90*time.Second)
+			if cur == nil || stale {
+				flush()
+				cur = &GPAttempt{
+					Start: l.ts, Trigger: "reconnect",
+					// a reconnect belongs to whatever portal was last used
+					Portal: lastPortal, Gateway: lastGateway,
+				}
 			}
 		}
 		if cur == nil {
@@ -281,11 +332,14 @@ func attemptsFromLines(lines []gpFlowLine) []GPAttempt {
 		cur.End = l.ts
 		cur.Events++
 
-		if cur.Portal == "" {
-			if m := gpFlowPortalRe.FindStringSubmatch(l.msg); m != nil {
-				cur.Portal = m[1]
-			}
+		if m := gpFlowPortalRe.FindStringSubmatch(l.msg); m != nil {
+			cur.Portal, lastPortal = m[1], m[1]
 		}
+		// Whether this line ends the attempt. It is applied *after* the stage
+		// markers below, because the settling line is itself the verdict —
+		// closing on it first would discard the very "tunnel creation finished"
+		// that makes the attempt a success.
+		settling := gpSettledRe.MatchString(l.msg)
 		if m := gpFlowUserRe.FindStringSubmatch(l.msg); m != nil &&
 			!strings.EqualFold(m[1], "pre-logon") && cur.User == "" {
 			cur.User = strings.TrimSuffix(m[1], ".")
@@ -336,6 +390,14 @@ func attemptsFromLines(lines []gpFlowLine) []GPAttempt {
 			}
 		}
 
+		// A settled attempt has reached its verdict. Anything after it belongs
+		// to whatever comes next, not to this one — without this a tunnel that
+		// came up cleanly was retroactively marked failed by the drop that
+		// followed it minutes later.
+		if cur.settled {
+			continue
+		}
+
 		matched := false
 		for _, mk := range gpStageMarkers {
 			if !mk.re.MatchString(l.msg) {
@@ -352,9 +414,10 @@ func attemptsFromLines(lines []gpFlowLine) []GPAttempt {
 			if prev, ok := best[mk.stage]; !ok || rank(mk.status) >= rank(prev.Status) {
 				best[mk.stage] = res
 			}
-			if mk.stage == StageGatewayAuth || mk.stage == StageTunnel || mk.stage == StageHIP {
+			if mk.stage == StageGatewaySelect || mk.stage == StageGatewayAuth ||
+				mk.stage == StageTunnel || mk.stage == StageHIP {
 				if g := gpFlowGatewayRe.FindStringSubmatch(l.msg); g != nil {
-					cur.Gateway = g[1]
+					cur.Gateway, lastGateway = g[1], g[1]
 				}
 			}
 			break
@@ -378,6 +441,11 @@ func attemptsFromLines(lines []gpFlowLine) []GPAttempt {
 				}
 			}
 		}
+
+		// now that this line has been recorded, let it close the attempt
+		if settling {
+			cur.settled = true
+		}
 	}
 	flush()
 	return out
@@ -398,7 +466,14 @@ func rank(status string) int {
 // finishAttempt derives the verdict from the stages that were recorded.
 func finishAttempt(a *GPAttempt) {
 	furthest := -1
+	// The root cause is the failure that happened *first in time*, not the one
+	// earliest in the stage order. On a flapping tunnel the drop and the
+	// gateway retry it provokes are logged in the same second, and ordering by
+	// stage would blame gateway selection for a tunnel that was plainly
+	// already up. Where the times tie, the later stage wins for the same
+	// reason: reaching it means the earlier stages had succeeded.
 	firstFail := -1
+	var failAt time.Time
 	for _, s := range a.Stages {
 		i := stageIndex(s.Stage)
 		if s.Status == "not reached" {
@@ -407,8 +482,14 @@ func finishAttempt(a *GPAttempt) {
 		if i > furthest {
 			furthest = i
 		}
-		if s.Status == "failed" && (firstFail < 0 || i < firstFail) {
-			firstFail = i
+		if s.Status != "failed" {
+			continue
+		}
+		switch {
+		case firstFail < 0,
+			s.At.Before(failAt),
+			s.At.Equal(failAt) && i > firstFail:
+			firstFail, failAt = i, s.At
 			a.Reason = s.Detail
 		}
 	}
@@ -451,6 +532,9 @@ type GPAuthEvent struct {
 	User    string    `json:"user,omitempty"`
 	Target  string    `json:"target"`  // portal | gateway
 	Address string    `json:"address,omitempty"`
+	// Portal is the portal this authentication belongs to, on gateway rows as
+	// well as portal ones, so the whole table can be filtered by portal.
+	Portal string `json:"portal,omitempty"`
 	Method  string    `json:"method,omitempty"`  // browser | cookie | credentials
 	Outcome string    `json:"outcome"`           // success | failed | not reached
 	Detail  string    `json:"detail,omitempty"`
@@ -499,7 +583,7 @@ func GPAuthEvents(attempts []GPAttempt) []GPAuthEvent {
 		}
 		if st != "not reached" || a.PortalAuth != "" {
 			out = append(out, GPAuthEvent{
-				Ts: at, User: a.User, Target: "portal", Address: a.Portal,
+				Ts: at, User: a.User, Target: "portal", Address: a.Portal, Portal: a.Portal,
 				Method: methodLabel(a.PortalAuth), Outcome: outcomeWord(st),
 				Detail: detail, WaitSecs: a.CookieWaitSecs,
 			})
@@ -512,7 +596,7 @@ func GPAuthEvents(attempts []GPAttempt) []GPAuthEvent {
 				gat = at
 			}
 			out = append(out, GPAuthEvent{
-				Ts: gat, User: a.User, Target: "gateway", Address: a.Gateway,
+				Ts: gat, User: a.User, Target: "gateway", Address: a.Gateway, Portal: a.Portal,
 				Method: methodLabel(a.GatewayAuth), Outcome: outcomeWord(gst),
 				Detail: gdetail, SingleSignOn: a.SingleSignOn,
 			})

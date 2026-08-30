@@ -63,7 +63,12 @@ const (
 	// generous now that the index makes a scan cheap.
 	defaultMaxResults  = 2000
 	maxLineHitsPerFile = 500
-	maxContextLines    = 30
+	// maxContextLines bounds -A/-B/-C. It was 30, which silently rewrote a
+	// larger request rather than refusing it, so "-A 200" looked like the flag
+	// was being ignored. Context lines are cheap — they are read from the same
+	// blob the match came from — so the ceiling only needs to stop a runaway
+	// response, not ration the feature.
+	maxContextLines = 5000
 )
 
 // SearchOutcome is the result set plus what was left out, so the UI can say
@@ -208,6 +213,7 @@ type qtok struct {
 	kind string // and | or | not | ( | ) | term
 	val  string
 	quot bool // the term was quoted, so match literally
+	rx   bool // the term was /slash-delimited/, so it is a regex taken whole
 }
 
 func tokenizeQuery(q string) []qtok {
@@ -238,6 +244,41 @@ func tokenizeQuery(q string) []qtok {
 				i++
 			}
 			out = append(out, qtok{kind: "or"})
+		// A /slash-delimited/ term is a regex taken whole.
+		//
+		// Bare terms are compiled as regexes too, but they never survive the
+		// tokenizer: '(', ')', '|' and '!' are boolean operators, so a query
+		// like (?:alpha|beta)\d+[Ss] was torn into a group containing an OR of
+		// two bare words and the regex was never compiled at all. There is no
+		// way to tell the two readings apart from the characters alone, so the
+		// user says which they mean by delimiting it.
+		case c == '/':
+			end := -1
+			for j := i + 1; j < len(q); j++ {
+				if q[j] == '\\' { // \/ is a literal slash inside the pattern
+					j++
+					continue
+				}
+				if q[j] == '/' {
+					end = j
+					break
+				}
+			}
+			if end < 0 {
+				// no closing slash: not a regex term, fall through to the
+				// bare-word reading so a path like var/log still searches
+				j := i
+				for j < len(q) && !strings.ContainsRune(" \t()!&|", rune(q[j])) {
+					j++
+				}
+				out = append(out, qtok{kind: "term", val: q[i:j]})
+				i = j
+				continue
+			}
+			if v := q[i+1 : end]; v != "" {
+				out = append(out, qtok{kind: "term", val: v, rx: true})
+			}
+			i = end + 1
 		case c == '"' || c == '\'':
 			end := strings.IndexByte(q[i+1:], c)
 			var v string
@@ -355,6 +396,17 @@ func (p *queryParser) parseNot() queryNode {
 // is matched literally so that punctuation-heavy phrases need no escaping.
 // Each term also carries the trigrams a file must contain for it to match.
 func makeTerm(t qtok) queryNode {
+	if t.rx {
+		re, err := regexp.Compile("(?i)" + t.val)
+		if err != nil {
+			// An explicit regex that will not compile is a mistake worth
+			// surfacing, but the search still has to return something, so it
+			// degrades to a literal exactly as a bare term does.
+			lower := strings.ToLower(t.val)
+			return termNode{literal: lower, tq: triFromLiteral(lower)}
+		}
+		return termNode{re: re, tq: triFromRegexp(t.val)}
+	}
 	if t.quot {
 		lower := strings.ToLower(t.val)
 		return termNode{literal: lower, tq: triFromLiteral(lower)}
