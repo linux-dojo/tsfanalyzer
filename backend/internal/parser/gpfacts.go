@@ -83,21 +83,54 @@ type GPPrelogin struct {
 // certificate, which is exactly the question "is <ccusername> populated".
 func (p GPPrelogin) ClientCert() bool { return strings.TrimSpace(p.CCUsername) != "" }
 
-// GPEnforcer says whether the GlobalProtect enforcer is active on the
-// endpoint. The enforcer is what stops traffic when the agent is not
-// connected, so its presence changes what a failed connection means for the
-// user: with it in place they lose access, without it they merely lose the
-// tunnel.
+// GPEnforcer is the state of the GlobalProtect traffic enforcer.
+//
+// The enforcer is what blocks traffic while the agent is disconnected, so
+// whether it is on changes what a failed connection costs the user: their
+// access, or merely their tunnel.
+//
+// Deciding this from "does the word enforcer appear" is wrong, and that is the
+// mistake this type exists to prevent. The service logs enforcer *exception*
+// configuration constantly whether or not enforcement is on — exception lists
+// pushed from the portal, exclude routes programmed into the driver, FQDN and
+// app lists — and several of those lines say the opposite of what they seem
+// to. In the sample collections:
+//
+//   - "Enforcer already loaded." is preceded by "Enforcer is not found".
+//   - "Enforcer,Always On, 401 entries found in filter objects" is a filter
+//     *category* being enumerated during "Enforcer,RemoveAllFilters", i.e.
+//     during teardown.
+//   - "enforcer exception: no app list defined." and "No enforcer ip exception
+//     list defined!" report the absence of a list.
+//   - "enforcer is blocking(only if Enforcer is enabled)" is conditional on
+//     the very thing being asked.
+//
+// Both sample collections were in fact disabled — "GetEnforcer state = 0"
+// followed by "GetEnforcer disabled", 132 times, with no contradicting
+// statement anywhere — while an earlier version of this parser reported the
+// enforcer as present in both.
+//
+// So only explicit statements of state count, the last one wins, and
+// configuration is recorded separately as configuration.
 type GPEnforcer struct {
-	Present bool      `json:"present"`
-	At      time.Time `json:"at,omitempty"`
-	// Exceptions is how many exception entries were installed, and Evidence
-	// keeps a few of the lines that decided it so the answer is checkable.
+	// State is "enabled", "disabled" or "unknown". Unknown is a real and
+	// common answer: a collection can carry exception configuration without
+	// ever stating whether enforcement is on.
+	State string    `json:"state"`
+	At    time.Time `json:"at,omitempty"`
+	// Deciding is the line that settled it, so the answer is checkable.
+	Deciding string `json:"deciding,omitempty"`
+	// Configured counts exception lines seen. It says the portal pushed
+	// enforcer configuration; it does not say enforcement is active.
+	Configured int      `json:"configured,omitempty"`
 	Exceptions int      `json:"exceptions,omitempty"`
 	Domains    int      `json:"domains,omitempty"`
 	Wildcards  int      `json:"wildcards,omitempty"`
 	Evidence   []string `json:"evidence,omitempty"`
 }
+
+// Present reports whether enforcement is actually on.
+func (e GPEnforcer) Present() bool { return e.State == "enabled" }
 
 // GPHostDetection is the internal host detection result.
 //
@@ -217,12 +250,40 @@ var (
 	// unambiguous place the portal address appears at pre-login time.
 	gpReqPortalRe = regexp.MustCompile(`REQID=\d+,IPADDR=([^,]+),PORT=`)
 
-	// Enforcer evidence. Several different lines say the same thing, so any of
-	// them is enough to answer "is the enforcer in place".
-	gpEnforcerRe = regexp.MustCompile(`(?i)` +
-		`enforcer already loaded|` +
+	// Enforcer state. Only these lines are statements about whether
+	// enforcement is on; everything else mentioning the enforcer is
+	// configuration. See the note on GPEnforcer for why that distinction
+	// matters — the configuration lines appear in their hundreds on endpoints
+	// where the enforcer is switched off.
+	gpEnforcerOffRe = regexp.MustCompile(`(?i)` +
+		`enforcer is not enabled|` +
+		`getenforcer disabled|` +
+		`getenforcer state = 0\b|` +
+		`enforcer is unloaded|` +
+		`enforcer needs to be loaded first|` +
+		`turn off traffic enforcer|` +
+		`stop-enforcer`)
+	// A non-zero state, or the service saying plainly that it is enabled.
+	// "Enforcer,Always On" is deliberately absent: it names a filter-object
+	// category during RemoveAllFilters, not a state.
+	gpEnforcerOnRe = regexp.MustCompile(`(?i)` +
+		`getenforcer state = [1-9]\d*\b|` +
+		`enforcer is enabled(?:\.|$|[^)])`)
+
+	// Configuration, counted but never treated as evidence of enforcement.
+	gpEnforcerCfgRe = regexp.MustCompile(`(?i)` +
 		`enforcer exception|` +
-		`enforcer set exceptions`)
+		`set enforcer exclude route|` +
+		`enforcer ip exception|` +
+		`traffic enforcement:`)
+	// ...except the lines that announce an *empty* list, which say the
+	// opposite and must not be counted as configuration either.
+	gpEnforcerEmptyRe = regexp.MustCompile(`(?i)` +
+		`no enforcer ip exception list defined|` +
+		`no fqdn ist defined|` + // the agent's own spelling
+		`no app list defined|` +
+		`no trusted host list defined|` +
+		`is not enabled`)
 	gpEnforcerCountRe = regexp.MustCompile(`(?i)[Ee]nforcer set exceptions (\d+)-(\d+)`)
 	gpEnforcerDomRe   = regexp.MustCompile(`(?i)parsed (\d+) single and (\d+) wildcard domain entries`)
 
@@ -298,12 +359,18 @@ func ExtractGPFacts(r io.ReadSeeker) (*GPFacts, error) {
 		return rotationIndex(files[i].name) > rotationIndex(files[j].name)
 	})
 
-	f := &gpFactScan{facts: &GPFacts{}}
+	f := newGPFactScan()
 	for _, nb := range files {
 		f.feed(nb.lines)
 	}
 	f.close()
 	return f.facts, nil
+}
+
+// newGPFactScan starts a scan with the enforcer unknown rather than absent:
+// "we were never told" and "it is off" are different answers.
+func newGPFactScan() *gpFactScan {
+	return &gpFactScan{facts: &GPFacts{Enforcer: GPEnforcer{State: "unknown"}}}
 }
 
 // gpFactScan folds the trace into GPFacts. It is a small state machine because
@@ -407,12 +474,22 @@ func (s *gpFactScan) line(ts time.Time, msg string, all []string, idx int) {
 		return
 	}
 
-	// enforcer
-	if gpEnforcerRe.MatchString(trimmed) {
+	// enforcer: state statements first, and they are the only thing that
+	// decides it. The last statement wins, since the enforcer can be turned
+	// on or off during the life of the log.
+	if gpEnforcerOffRe.MatchString(trimmed) {
 		e := &s.facts.Enforcer
-		if !e.Present {
-			e.Present, e.At = true, ts
-		}
+		e.State, e.At, e.Deciding = "disabled", ts, trimmed
+		return
+	}
+	if gpEnforcerOnRe.MatchString(trimmed) {
+		e := &s.facts.Enforcer
+		e.State, e.At, e.Deciding = "enabled", ts, trimmed
+		return
+	}
+	if gpEnforcerCfgRe.MatchString(trimmed) && !gpEnforcerEmptyRe.MatchString(trimmed) {
+		e := &s.facts.Enforcer
+		e.Configured++
 		if len(e.Evidence) < 5 {
 			e.Evidence = append(e.Evidence, trimmed)
 		}

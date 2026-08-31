@@ -7,7 +7,7 @@ import (
 
 // scanTrace runs the fact scanner over trace lines without needing an archive.
 func scanTrace(body string) *GPFacts {
-	s := &gpFactScan{facts: &GPFacts{}}
+	s := newGPFactScan()
 	s.feed(strings.Split(strings.TrimPrefix(body, "\n"), "\n"))
 	s.close()
 	return s.facts
@@ -149,32 +149,115 @@ func TestPreloginClientCertificateUsername(t *testing.T) {
 	}
 }
 
-func TestEnforcerDetectedFromAnyOfItsLines(t *testing.T) {
+// The enforcer must not be inferred from the word "enforcer".
+//
+// The service logs exception configuration constantly regardless of whether
+// enforcement is on, and several of those lines say the opposite of what they
+// appear to. An earlier version keyed on any enforcer mention and reported
+// both sample collections as enforced when both were in fact disabled.
+func TestEnforcerConfigurationIsNotEnforcement(t *testing.T) {
 	for name, line := range map[string]string{
-		"already loaded": "Enforcer already loaded.",
-		"exception":      "enforcer exception IPv4 255.255.192.0 - 255.255.255.255",
-		"set exceptions": "Enforcer set exceptions 8-388",
-		"domain parse":   "enforcer exception: parsed 14 single and 26 wildcard domain entries for enforcer exception",
+		"ip exception list":  "enforcer ip exception is 8.8.8.8,192.168.0.0/16,192.168.31.0/24",
+		"fqdn list":          "enforcer exception: FQDN is *.google.com,*.gmail.com,*.openai.com",
+		"exclude route":      "ST,Set enforcer exclude route fe80:0000:0000:0000:0000:0000:0000:0000/64",
+		"traffic enforce":    "Traffic Enforcement: TrfSetParameters:EXCLUDE ROUTE: des=8.8.8.8, mask prefixLen=32",
+		"ipv4 exception":     "enforcer exception IPv4 8.8.8.8 - 8.8.8.8",
+		"set exceptions":     "Enforcer set exceptions 8-388",
+		"already loaded":     "Enforcer already loaded.",
+		"always on category": "Enforcer,Always On, 401 entries found in filter objects",
 	} {
-		if !scanTrace("\n" + tl("11:47:18", line)).Enforcer.Present {
-			t.Errorf("%s: the enforcer should have been detected", name)
+		f := scanTrace("\n" + tl("11:47:18", line))
+		if f.Enforcer.Present() {
+			t.Errorf("%s: %q is configuration or a category name, not a statement "+
+				"that enforcement is on", name, line)
 		}
-	}
-	if scanTrace("\n" + tl("11:47:18", "nothing to see here")).Enforcer.Present {
-		t.Error("the enforcer should not be claimed without evidence")
+		if f.Enforcer.State != "unknown" {
+			t.Errorf("%s: state = %q, want unknown", name, f.Enforcer.State)
+		}
 	}
 }
 
-func TestEnforcerCounts(t *testing.T) {
+// Lines announcing an empty list are not configuration either.
+func TestEnforcerEmptyListsAreNotConfiguration(t *testing.T) {
+	for _, line := range []string{
+		"No enforcer ip exception list defined!",
+		"enforcer exception: No fqdn ist defined.",
+		"enforcer exception: no app list defined.",
+		"No trusted host list defined!enforcer exception: no app list defined",
+	} {
+		f := scanTrace("\n" + tl("11:47:18", line))
+		if f.Enforcer.Configured != 0 {
+			t.Errorf("%q reports an absent list; it should not count as configuration", line)
+		}
+		if f.Enforcer.Present() {
+			t.Errorf("%q should not imply enforcement", line)
+		}
+	}
+}
+
+// Only explicit state statements decide it, and the last one wins.
+func TestEnforcerStateStatements(t *testing.T) {
+	off := []string{
+		"Enforcer is not enabled",
+		"GetEnforcer disabled",
+		"GetEnforcer state = 0",
+		"PanMSService::UpdateGPEnforcer() - enforcer is unloaded, and cannot enforce!",
+		"PanMSService::UpdateGPEnforcer() - enforcer needs to be loaded first!",
+		"ST,Turn off traffic enforcer in driver!",
+		"ST,argc=2, stop-enforcer",
+	}
+	for _, line := range off {
+		f := scanTrace("\n" + tl("11:47:18", line))
+		if f.Enforcer.State != "disabled" {
+			t.Errorf("%q: state = %q, want disabled", line, f.Enforcer.State)
+		}
+	}
+	for _, line := range []string{"GetEnforcer state = 1", "Enforcer is enabled."} {
+		f := scanTrace("\n" + tl("11:47:18", line))
+		if !f.Enforcer.Present() {
+			t.Errorf("%q: state = %q, want enabled", line, f.Enforcer.State)
+		}
+	}
+}
+
+// "enforcer is blocking(only if Enforcer is enabled)" is conditional on the
+// very question being asked, so it settles nothing.
+func TestEnforcerConditionalLineDecidesNothing(t *testing.T) {
+	f := scanTrace("\n" + tl("11:47:18",
+		"PanMSService::UpdateGPEnforcer() - enforcer is blocking(only if Enforcer is enabled)."))
+	if f.Enforcer.State != "unknown" {
+		t.Errorf("state = %q, want unknown", f.Enforcer.State)
+	}
+}
+
+func TestEnforcerLastStatementWins(t *testing.T) {
+	f := scanTrace(`
+` + tl("11:47:18", "GetEnforcer state = 1") + `
+` + tl("11:48:18", "GetEnforcer state = 0") + `
+` + tl("11:48:18", "GetEnforcer disabled") + `
+`)
+	if f.Enforcer.State != "disabled" {
+		t.Errorf("state = %q; the enforcer can be turned off during the log", f.Enforcer.State)
+	}
+}
+
+// Configuration is still worth counting — just separately from enforcement.
+func TestEnforcerConfigurationIsCounted(t *testing.T) {
 	f := scanTrace(`
 ` + tl("11:47:18", "Enforcer set exceptions 8-388") + `
 ` + tl("11:47:18", "enforcer exception: parsed 14 single and 26 wildcard domain entries for enforcer exception") + `
 `)
-	if got := f.Enforcer.Exceptions; got != 381 {
-		t.Errorf("exceptions = %d, want 381 (8..388 inclusive)", got)
+	if f.Enforcer.Configured != 2 {
+		t.Errorf("configured = %d, want 2", f.Enforcer.Configured)
+	}
+	if f.Enforcer.Exceptions != 381 {
+		t.Errorf("exceptions = %d, want 381", f.Enforcer.Exceptions)
 	}
 	if f.Enforcer.Domains != 14 || f.Enforcer.Wildcards != 26 {
 		t.Errorf("domains/wildcards = %d/%d, want 14/26", f.Enforcer.Domains, f.Enforcer.Wildcards)
+	}
+	if f.Enforcer.Present() {
+		t.Error("configuration alone must never report enforcement as on")
 	}
 }
 

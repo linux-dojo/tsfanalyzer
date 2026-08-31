@@ -464,8 +464,12 @@ interface GpPrelogin {
   panos_version?: string;
 }
 interface GpEnforcer {
-  present: boolean;
+  /* "enabled" | "disabled" | "unknown" — see the Go type for why the word
+     "enforcer" appearing in a line is not evidence of either. */
+  state: string;
   at?: string;
+  deciding?: string;
+  configured?: number;
   exceptions?: number;
   domains?: number;
   wildcards?: number;
@@ -1272,17 +1276,49 @@ function GpPosture({ facts }: { facts: GpFacts | null }) {
     <div className="gp-cards">
       <section className="gp-card">
         <h3>GlobalProtect enforcer</h3>
-        <p className={e.present ? "gp-yes" : "gp-no"}>{e.present ? "Yes" : "No"}</p>
-        {e.present ? (
+        {/* Three states, not two. "We were never told" is a real answer and a
+            different one from "it is off" — a collection can carry hundreds of
+            enforcer exception lines without ever stating whether enforcement
+            is on, and reading those lines as evidence is how this card
+            previously reported both sample bundles as enforced when the
+            service had logged "GetEnforcer disabled" 132 times. */}
+        <p className={e.state === "enabled" ? "gp-no" : e.state === "disabled" ? "gp-yes" : "muted"}>
+          {e.state === "enabled" ? "Enabled" : e.state === "disabled" ? "Not enabled" : "Not stated in these logs"}
+        </p>
+        {e.state === "enabled" && (
+          <p className="muted">
+            Traffic is blocked while the agent is disconnected, so a failed
+            connection costs this endpoint its access, not just its tunnel.
+          </p>
+        )}
+        {e.state === "unknown" && (
+          <p className="muted">
+            No line in the service trace states whether enforcement is on.
+            Exception configuration alone does not settle it.
+          </p>
+        )}
+        {e.deciding && (
+          <table className="kv">
+            <tbody>
+              <tr>
+                <th>Decided by</th>
+                <td><code className="gp-decide">{e.deciding}</code></td>
+              </tr>
+            </tbody>
+          </table>
+        )}
+        {!!e.configured && (
           <>
             <p className="muted">
-              Traffic is blocked while the agent is disconnected, so a failed
-              connection costs this endpoint its access, not just its tunnel.
+              {e.configured.toLocaleString()} enforcer exception line
+              {e.configured === 1 ? "" : "s"} — IP ranges, FQDNs, applications or
+              exclude routes pushed to the driver. This is configuration; it is
+              present whether or not enforcement is switched on.
             </p>
             <table className="kv">
               <tbody>
                 {!!e.exceptions && (
-                  <tr><th>Exceptions</th><td>{e.exceptions.toLocaleString()}</td></tr>
+                  <tr><th>Exception entries</th><td>{e.exceptions.toLocaleString()}</td></tr>
                 )}
                 {(!!e.domains || !!e.wildcards) && (
                   <tr>
@@ -1294,13 +1330,11 @@ function GpPosture({ facts }: { facts: GpFacts | null }) {
             </table>
             {!!e.evidence?.length && (
               <details className="gp-details">
-                <summary>Evidence</summary>
+                <summary>Configuration lines</summary>
                 <pre className="gp-pre">{e.evidence.join("\n")}</pre>
               </details>
             )}
           </>
-        ) : (
-          <p className="muted">No enforcer lines appear in the service trace.</p>
         )}
       </section>
 
@@ -1560,14 +1594,37 @@ function GpFlow({ data, portal }: { data: GpData; portal: string }) {
                     <tr><th>Events</th><td>{a.events}</td></tr>
                   </tbody>
                 </table>
+                {/* Each stage carries the time the agent reached it. Without
+                    it the list says the order but not the pace, and the pace
+                    is usually the tell: a gateway stage thirty seconds after
+                    the one before it is a timeout, the same stage a
+                    millisecond later is a rejection. */}
                 <ol className="gp-stagelist">
-                  {a.stages.map((s) => (
-                    <li key={s.stage} className={"gp-st-" + s.status.replace(" ", "-")}>
-                      <span className="gp-st-name">{s.stage}</span>
-                      <span className="gp-st-status">{s.status}</span>
-                      {s.detail && <span className="gp-st-detail">{s.detail}</span>}
-                    </li>
-                  ))}
+                  {a.stages.map((s, si) => {
+                    const prev = si > 0 ? a.stages[si - 1] : undefined;
+                    const gap =
+                      s.at && prev?.at
+                        ? (new Date(s.at).getTime() - new Date(prev.at).getTime()) / 1000
+                        : null;
+                    return (
+                      <li key={s.stage} className={"gp-st-" + s.status.replace(" ", "-")}>
+                        <span className="gp-st-at">
+                          {s.at ? s.at.replace("T", " ").slice(11, 19) : "—"}
+                        </span>
+                        <span className="gp-st-name">{s.stage}</span>
+                        <span className="gp-st-status">{s.status}</span>
+                        {gap !== null && gap >= 1 && (
+                          <span
+                            className={"gp-st-gap" + (gap >= 10 ? " gp-st-gap-slow" : "")}
+                            title={`${gap.toFixed(1)}s after ${prev?.stage}`}
+                          >
+                            +{gap < 10 ? gap.toFixed(1) : Math.round(gap)}s
+                          </span>
+                        )}
+                        {s.detail && <span className="gp-st-detail">{s.detail}</span>}
+                      </li>
+                    );
+                  })}
                 </ol>
               </div>
             )}
@@ -1575,140 +1632,8 @@ function GpFlow({ data, portal }: { data: GpData; portal: string }) {
         ))}
       </div>
 
-      <GpTraceRuns facts={data.facts} />
-
       {data.gateways && data.gateways.gateways.length > 0 && (
         <GpGateways sel={data.gateways} />
-      )}
-    </div>
-  );
-}
-
-/* The stage sequence as the service itself wrote it.
-
-   The grid above is built from pan_gp_event.log, the user-facing narrative.
-   PanGPS.log is the service's own trace and it brackets each step explicitly —
-   "----Portal Pre-login starts----", "----Portal Login starts----", and so on —
-   so it says which step the agent believed it was on, and how far a run got
-   before it stopped. Where the two disagree, this is the more literal record.
-
-   Runs are cut at each Portal Pre-login, since that is where the agent starts
-   over. Teardown boundaries ("Disable", "Tunnel User Diconnecting" — the
-   agent's own spelling) carry no stage and are shown as what ended the run. */
-const TRACE_SEQUENCE = [
-  "portal pre-login",
-  "portal auth",
-  "portal config",
-  "network discovery",
-  "gateway select",
-  "gateway auth",
-  "tunnel",
-];
-
-function GpTraceRuns({ facts }: { facts: GpFacts | null }) {
-  const [open, setOpen] = useState(false);
-  const stages = facts?.stages ?? [];
-  if (!stages.length) return null;
-
-  type Run = { start: string; steps: GpTraceStage[] };
-  const runs: Run[] = [];
-  for (const s of stages) {
-    if (!runs.length || s.stage === "portal pre-login") {
-      runs.push({ start: s.at, steps: [] });
-    }
-    runs[runs.length - 1].steps.push(s);
-  }
-
-  const certs = facts?.cert_checks ?? [];
-  const prelogins = facts?.prelogins ?? [];
-  const within = <T extends { at: string }>(items: T[], run: Run, next?: Run) =>
-    items.filter((x) => x.at >= run.start && (!next || x.at < next.start));
-
-  const reached = (r: Run) => {
-    const named = r.steps.map((s) => s.stage).filter(Boolean);
-    let far = -1;
-    for (const s of named) far = Math.max(far, TRACE_SEQUENCE.indexOf(s));
-    return far;
-  };
-  const complete = runs.filter((r) => reached(r) === TRACE_SEQUENCE.length - 1).length;
-
-  return (
-    <div className="gp-trace">
-      <h3 className="gp-h3">
-        Stage sequence from the service trace
-        <button className="view-toggle" onClick={() => setOpen(!open)}>
-          {open ? "Hide" : `Show ${runs.length} run${runs.length === 1 ? "" : "s"}`}
-        </button>
-      </h3>
-      <p className="muted">
-        {runs.length} run{runs.length === 1 ? "" : "s"} bracketed by the agent&rsquo;s own
-        <code>----X starts----</code> markers; {complete} reached tunnel creation.
-      </p>
-      {open && (
-        <div className="gp-trace-runs">
-          {runs.map((r, i) => {
-            const next = runs[i + 1];
-            const rc = within(certs, r, next);
-            const rp = within(prelogins, r, next);
-            const far = reached(r);
-            const end = r.steps.find((s) => !s.stage && s !== r.steps[0]);
-            return (
-              <div key={i} className="gp-trace-run">
-                <div className="gp-trace-when">{r.start.replace("T", " ").slice(0, 19)}</div>
-                <ol className="gp-trace-steps">
-                  {TRACE_SEQUENCE.map((name, k) => {
-                    const hit = r.steps.find((s) => s.stage === name);
-                    return (
-                      <li
-                        key={name}
-                        className={hit ? "gp-tr-hit" : k <= far ? "gp-tr-skip" : "gp-tr-miss"}
-                        title={
-                          hit
-                            ? `${hit.name} — ${hit.at.replace("T", " ").slice(0, 19)}`
-                            : k <= far
-                            ? `${name}: no boundary written, but a later stage was reached`
-                            : `${name}: never reached`
-                        }
-                      >
-                        {name}
-                      </li>
-                    );
-                  })}
-                </ol>
-                <div className="gp-trace-facts">
-                  {rp.map((p, j) => (
-                    <span key={`p${j}`} className={"gp-chip " + (p.status === "Success" ? "gp-chip-ok" : "gp-chip-warn")}>
-                      pre-login {p.status || "no status"}
-                      {p.connected_ip ? ` · ${p.connected_ip}` : ""}
-                      {/* A populated <ccusername> means the portal accepted a
-                          client certificate and read the identity out of it,
-                          so any password prompt after this is a second factor
-                          rather than the only one. */}
-                      {p.cc_username ? ` · cert user ${p.cc_username}` : ""}
-                    </span>
-                  ))}
-                  {rc.map((c, j) => (
-                    <span
-                      key={`c${j}`}
-                      className={"gp-chip " + (c.failed ? "gp-chip-fail" : "gp-chip-mute")}
-                      title={
-                        c.failed
-                          ? "No pre-login followed this check"
-                          : c.skipped
-                          ? "The agent was told to skip this result"
-                          : "The pre-login went ahead, so this code did not stop anything"
-                      }
-                    >
-                      cert {c.code}
-                      {c.failed ? " — blocked" : ""}
-                    </span>
-                  ))}
-                  {end && <span className="gp-chip gp-chip-mute">ended: {end.name}</span>}
-                </div>
-              </div>
-            );
-          })}
-        </div>
       )}
     </div>
   );
@@ -4586,11 +4511,28 @@ function continuesPrevious(prev: SearchResult, cur: SearchResult): boolean {
   return curStart <= prevEnd + 1;
 }
 
+/* Two ways to search one box, chosen explicitly rather than guessed.
+
+   "Search" is the grep-style boolean language: words, AND/OR/NOT, parentheses,
+   quoted phrases. "Regex" treats the whole box as one regular expression.
+   They cannot be inferred from the text, because the same characters mean
+   different things in each — "(" opens a group in one and a precedence group
+   in the other, "|" is alternation in one and OR in the other. */
+type SearchMode = "search" | "regex";
+
 interface LineQuery {
   empty: boolean;
   before: number;
   after: number;
-  match: (line: string) => boolean;
+  /* msg is the message column alone. Regex mode matches against it, so "^"
+     anchors where the reader sees the line starting. Against the raw file a
+     GlobalProtect line begins "(P3872-T15540)Debug(3603): 08/31/26 …", so an
+     anchored pattern like ^enforcer can never match — which is silent and
+     baffling, and is exactly what a mode switch is for. */
+  match: (line: string, msg?: string) => boolean;
+  /* set when the pattern is anchored but could not match the full line, so
+     the UI can explain the miss instead of showing an empty result */
+  anchorHint?: string;
   /* the trailing "| $2 > 10" clause: keeps lines whose fields pass a test */
   keep: (line: string) => boolean;
   filterText: string;
@@ -4809,7 +4751,7 @@ function splitFieldClause(raw: string): [string, string] {
   return [raw, ""];
 }
 
-function parseLineQuery(rawInput: string): LineQuery {
+function parseLineQuery(rawInput: string, mode: SearchMode = "search"): LineQuery {
   const [raw, clause] = splitFieldClause(rawInput);
   const filter = parseFieldFilter(clause);
   let before = 0, after = 0;
@@ -4831,6 +4773,35 @@ function parseLineQuery(rawInput: string): LineQuery {
   };
   const noMatch = { empty: true, before, after, match: () => false, ...extras };
   if (!body) return noMatch;
+
+  if (mode === "regex") {
+    // The whole box is one pattern: no tokenizing, so ( ) | ! ^ $ all keep
+    // their regular-expression meaning.
+    let re: RegExp;
+    try {
+      re = new RegExp(body, "i");
+    } catch (e) {
+      return {
+        empty: true, before, after, match: () => false, ...extras,
+        filterError: `Invalid regular expression: ${(e as Error).message}`,
+      };
+    }
+    const anchored = /^\^|\$$/.test(body.trim());
+    return {
+      empty: false,
+      before,
+      after,
+      ...extras,
+      anchorHint: anchored
+        ? "This pattern is anchored with ^ or $, which binds to the message column. " +
+          "In the raw file the line also carries the agent's process/thread and " +
+          "timestamp prefix, so an anchored pattern will not match there."
+        : undefined,
+      // Prefer the message so ^ and $ mean what the table shows; fall back to
+      // the whole line when there is no separate message (raw view).
+      match: (line, msg) => re.test(msg ?? line),
+    };
+  }
 
   type Tok = { k: string; v?: string; quot?: boolean; rx?: boolean };
   const toks: Tok[] = [];
@@ -5625,7 +5596,8 @@ function LogContent({
   // in-file search, same query language as the archive search (including
   // -A/-B/-C), so a loaded file can be narrowed without another round trip
   const [q, setQ] = useState("");
-  const query = useMemo(() => parseLineQuery(q), [q]);
+  const [mode, setMode] = useState<SearchMode>("search");
+  const query = useMemo(() => parseLineQuery(q, mode), [q, mode]);
 
   // Where the matches actually are in the whole file.
   //
@@ -5773,7 +5745,7 @@ function LogContent({
     const matched = new Set<number>();
     const keep = new Set<number>();
     entries.forEach((e, i) => {
-      if (query.match(`${e.ts} ${e.label} ${e.msg}`)) {
+      if (query.match(`${e.ts} ${e.label} ${e.msg}`, e.msg)) {
         matched.add(i);
         keep.add(i);
         for (let k = 1; k <= query.before; k++) if (i - k >= 0) keep.add(i - k);
@@ -5798,7 +5770,7 @@ function LogContent({
     let n = 0;
     for (const e of viewEntries) {
       const line = `${e.ts} ${e.label} ${e.msg}`;
-      if (query.match(line) && query.keep(line)) n++;
+      if (query.match(line, e.msg) && query.keep(line)) n++;
     }
     return n;
   }, [viewEntries, query]);
@@ -5901,11 +5873,29 @@ function LogContent({
       <h3 className="log-title">
         <span className="log-title-path">{path}</span>
         <span className="log-title-actions">
+          <select
+            className="log-mode"
+            value={mode}
+            onChange={(e) => setMode(e.target.value as SearchMode)}
+            title={
+              "Search: words with AND / OR / NOT, parentheses and \"quoted phrases\".\n" +
+              "Regex: the whole box is one regular expression, so ( ) | ! ^ $ keep\n" +
+              "their regex meaning. The same characters mean different things in\n" +
+              "each, so the mode is chosen rather than guessed."
+            }
+          >
+            <option value="search">Search</option>
+            <option value="regex">Regex</option>
+          </select>
           {(
             <input
               className="log-search"
               type="search"
-              placeholder='search this file…  ospf AND down · -A 3 · | $2 > 10000'
+              placeholder={
+                mode === "regex"
+                  ? "regular expression…  ^enforcer exception IPv4 \\d{1,3}(?:\\.\\d{1,3}){3}"
+                  : "search this file…  ospf AND down · -A 3 · | $2 > 10000"
+              }
               title={
                 "Same syntax as the archive search:\n" +
                 "  AND / OR / NOT (also && || !), parentheses\n" +
@@ -5952,6 +5942,11 @@ function LogContent({
           {query.filterText && (
             <span className="log-filter-tag" title="Field filter applied to matches and context alike">
               | {query.filterText}
+            </span>
+          )}
+          {query.anchorHint && matchCount === 0 && (
+            <span className="log-filter-bad" title={query.anchorHint}>
+              anchored — see why
             </span>
           )}
           {query.filterError && (

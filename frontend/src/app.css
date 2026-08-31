@@ -995,21 +995,23 @@ td button { border: 0; background: #fdecea; color: #c0392b; padding: 5px 10px; b
   font-family: ui-monospace, monospace; font-size: 12px; color: #26313f;
 }
 
-.gp-trace { margin-top: 18px; }
-.gp-trace .gp-h3 { display: flex; align-items: center; gap: 10px; }
-.gp-trace-runs { max-height: 460px; overflow: auto; margin-top: 8px; }
-.gp-trace-run {
-  border: 1px solid #e6e9ee; border-radius: 6px; padding: 8px 10px; margin-bottom: 6px;
-}
-.gp-trace-when { font-family: ui-monospace, monospace; font-size: 12px; color: #5a6675; }
-.gp-trace-steps {
-  display: flex; flex-wrap: wrap; gap: 4px; list-style: none; margin: 6px 0 0; padding: 0;
-}
-.gp-trace-steps li {
-  font-size: 11.5px; padding: 2px 7px; border-radius: 10px; white-space: nowrap;
-}
-.gp-tr-hit  { background: #dff3e6; color: #1a5c36; }
-.gp-tr-skip { background: #fdf3d8; color: #7a5b12; }
-.gp-tr-miss { background: #f1f3f6; color: #97a1ad; }
-.gp-trace-facts { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
 .gp-chip-mute { background: #eef1f5; color: #4a5563; }
+
+/* search mode selector: sits beside the in-file search box */
+.log-mode {
+  margin: 0 6px 0 0; padding: 3px 6px; font-size: 12px; min-width: 0;
+  border: 1px solid #3c5168; background: #1b2a3c; color: #c4cdd8;
+  border-radius: 5px;
+}
+
+/* stage list inside an expanded connection attempt */
+.gp-st-at {
+  font-family: ui-monospace, monospace; font-size: 11.5px; color: #5a6675;
+  min-width: 62px; display: inline-block;
+}
+.gp-st-gap {
+  font-size: 11px; padding: 1px 6px; border-radius: 9px;
+  background: #eef1f5; color: #4a5563; margin-left: 6px;
+}
+.gp-st-gap-slow { background: #fdf3d8; color: #7a5b12; }
+.gp-decide { font-size: 11.5px; word-break: break-word; }
