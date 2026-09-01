@@ -88,3 +88,70 @@ func TestContextFlagsAcceptLargeValues(t *testing.T) {
 		t.Errorf("the context ceiling is %d; it should allow at least 1000", maxContextLines)
 	}
 }
+
+// The reported failure, end to end.
+//
+// "^\s*enforcer exception IPv4 ..." returned nothing, and the reason was not
+// the regex engine: a line on disk reads
+//
+//	P 823-T4099  08/24/2026 11:47:16:126 Info ( 224): enforcer exception IPv4 8.8.8.8 - 8.8.8.8
+//
+// so "^" is anchored to the process id, not to the text. grep would return
+// nothing too. An anchored pattern therefore gets a second attempt against the
+// line with its log prefix removed.
+func TestAnchoredRegexMatchesPastTheLogPrefix(t *testing.T) {
+	pattern := `/^\s*enforcer exception IPv4 \d{1,3}(?:\.\d{1,3}){3} - \d{1,3}(?:\.\d{1,3}){3}$/`
+	q := ParseSearchQuery(pattern)
+	for name, line := range map[string]string{
+		"macOS":   "p 823-t4099  08/24/2026 11:47:16:126 info ( 224): enforcer exception ipv4 8.8.8.8 - 8.8.8.8",
+		"trace":   "(p11496-t6520)info (11298): 08/18/26 13:55:40:474 enforcer exception ipv4 255.255.192.0 - 255.255.255.255",
+		"captive": "(p11496-t14080)debug08/18/26 09:41:41:742 (152): enforcer exception ipv4 255.252.0.0 - 255.255.255.255",
+		"event":   "08/18/2026 13:55:40:423 [info ]: enforcer exception ipv4 255.254.0.0 - 255.255.255.255",
+		"driver":  "08/24/2026 11:47:13.455179[info   318]: enforcer exception ipv4 255.255.255.255 - 255.255.255.255",
+	} {
+		if !q.root.match(line) {
+			t.Errorf("%s format: anchored pattern did not reach past the log prefix", name)
+		}
+	}
+}
+
+// The fallback must not turn an anchored pattern into a substring search.
+func TestAnchoredRegexStillDiscriminates(t *testing.T) {
+	q := ParseSearchQuery(`/^\s*enforcer exception IPv4 \d{1,3}(?:\.\d{1,3}){3} - \d{1,3}(?:\.\d{1,3}){3}$/`)
+	for _, line := range []string{
+		"p 823-t4099  08/24/2026 11:47:16:126 info ( 224): enforcer exception: no app list defined.",
+		"(p11496-t6520)info (11298): 08/18/26 13:55:40:474 st,set enforcer exclude route 8.8.8.8/32",
+		"p 823-t4099  08/24/2026 11:47:16:126 info ( 224): trailing text enforcer exception ipv4 8.8.8.8 - 8.8.8.8 more",
+		"2026-06-09 11:27:40.087 -0700  --- panio",
+	} {
+		if q.root.match(line) {
+			t.Errorf("should not match: %q", line)
+		}
+	}
+}
+
+// The prefix stripper runs on a case-folded line, so it cannot require the
+// uppercase "P"/"-T" the parsing patterns use. Reusing those patterns here
+// silently disabled the whole fallback.
+func TestStripLogPrefixIsCaseInsensitive(t *testing.T) {
+	line := "p 823-t4099  08/24/2026 11:47:16:126 info ( 224): enforcer exception ipv4 8.8.8.8 - 8.8.8.8"
+	msg, ok := stripLogPrefix(line)
+	if !ok {
+		t.Fatal("a lower-cased agent line should still have its prefix recognised")
+	}
+	if msg != "enforcer exception ipv4 8.8.8.8 - 8.8.8.8" {
+		t.Errorf("stripped to %q", msg)
+	}
+	if _, ok := stripLogPrefix("2026-06-09 11:27:40.087 -0700  --- panio"); ok {
+		t.Error("a monitor line has no agent prefix to strip")
+	}
+}
+
+// An unanchored pattern keeps plain whole-line semantics, so the extra work is
+// confined to the case that needs it.
+func TestUnanchoredRegexIsNotGivenTheFallback(t *testing.T) {
+	q := ParseSearchQuery(`/enforcer exception ipv4/`)
+	if !q.root.match("p 823-t4099  08/24/2026 11:47:16:126 info ( 224): enforcer exception ipv4 8.8.8.8 - 8.8.8.8") {
+		t.Error("an unanchored pattern should match the whole line as before")
+	}
+}

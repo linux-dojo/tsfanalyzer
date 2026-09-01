@@ -111,13 +111,76 @@ type termNode struct {
 	re      *regexp.Regexp // set for regex terms
 	literal string         // set for quoted terms (already lower-cased)
 	tq      triQuery       // what this term requires of a file
+	// anchored marks a pattern beginning with ^ or ending with $. Those are
+	// matched a second time against the line with its log prefix removed —
+	// see the comment in match.
+	anchored bool
 }
 
 func (t termNode) match(lower string) bool {
-	if t.re != nil {
-		return t.re.MatchString(lower)
+	if t.re == nil {
+		return strings.Contains(lower, t.literal)
 	}
-	return strings.Contains(lower, t.literal)
+	if t.re.MatchString(lower) {
+		return true
+	}
+	// An anchored pattern is almost never meant to anchor to the log prefix.
+	//
+	// A GlobalProtect line on disk reads
+	//
+	//	P 823-T4099  08/24/2026 11:47:16:126 Info ( 224): enforcer exception IPv4 8.8.8.8 - 8.8.8.8
+	//
+	// so "^enforcer exception IPv4 ..." cannot match, and returns nothing with
+	// no explanation. The reader is anchoring to the text they can see, not to
+	// the process, thread, timestamp and severity in front of it. So an
+	// anchored pattern gets a second attempt against the message alone.
+	//
+	// This is done only for anchored patterns because it costs a prefix parse
+	// per line, and an unanchored pattern gains nothing from it.
+	if t.anchored {
+		if msg, ok := stripLogPrefix(lower); ok {
+			return t.re.MatchString(msg)
+		}
+	}
+	return false
+}
+
+// logPrefixRe matches the bookkeeping an agent log puts in front of the text:
+// process and thread, timestamp, severity and source line, in any of the
+// shapes gplog.go knows.
+//
+// It is deliberately its own case-insensitive pattern rather than a call to
+// gpTraceParts. The line reaching match here has already been folded to lower
+// case so the index and the matcher agree, and gpTraceParts requires a literal
+// uppercase "P" and "-T" — so reusing it silently matched nothing and the
+// anchored fallback never fired. That is the same class of mistake as the
+// original bug: verifying against a string built by hand instead of the one
+// the code actually receives.
+var logPrefixRe = regexp.MustCompile(`(?i)^(?:` +
+	// P 823-T4099  08/24/2026 11:47:16:126 Info ( 224):
+	`\s*p\s*\d+-t\s*\d+\s+\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}:\d{3}\s+[a-z]+\s*\(\s*\d+\):|` +
+	// (P11496-T6520)Info (11298): 08/18/26 13:55:40:474
+	`\s*\(p\d+-t\d+\)[a-z]+\s*\(\s*\d+\):\s*\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}:\d{3}|` +
+	// (P11496-T14080)debug08/18/26 09:41:41:742 (152):
+	`\s*\(p\d+-t\d+\)[a-z]+\s*\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}:\d{3}\s*\(\s*\d+\):|` +
+	// 08/18/2026 13:55:40:423 [Info ]:
+	`\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}:\d{3}\s*\[[a-z]+\s*\]:|` +
+	// 08/24/2026 11:47:13.455179[Info   318]:
+	`\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}\.\d+\s*\[[a-z]+\s*\d+\]:` +
+	`)\s?`)
+
+// stripLogPrefix removes that bookkeeping, reporting whether there was any.
+func stripLogPrefix(line string) (string, bool) {
+	if loc := logPrefixRe.FindStringIndex(line); loc != nil {
+		return line[loc[1]:], true
+	}
+	return "", false
+}
+
+// anchoredPattern reports whether a regex is tied to the start or end of the
+// line, which is what makes the log prefix matter.
+func anchoredPattern(p string) bool {
+	return strings.HasPrefix(p, "^") || strings.HasSuffix(p, "$")
 }
 
 func (t termNode) plan() triQuery { return t.tq }
@@ -405,7 +468,7 @@ func makeTerm(t qtok) queryNode {
 			lower := strings.ToLower(t.val)
 			return termNode{literal: lower, tq: triFromLiteral(lower)}
 		}
-		return termNode{re: re, tq: triFromRegexp(t.val)}
+		return termNode{re: re, tq: triFromRegexp(t.val), anchored: anchoredPattern(t.val)}
 	}
 	if t.quot {
 		lower := strings.ToLower(t.val)
@@ -418,7 +481,7 @@ func makeTerm(t qtok) queryNode {
 		lower := strings.ToLower(t.val)
 		return termNode{literal: lower, tq: triFromLiteral(lower)}
 	}
-	return termNode{re: re, tq: triFromRegexp(t.val)}
+	return termNode{re: re, tq: triFromRegexp(t.val), anchored: anchoredPattern(t.val)}
 }
 
 // noteFilter records the field-filter clause on the outcome so the UI can

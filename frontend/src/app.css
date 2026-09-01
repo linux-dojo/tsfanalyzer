@@ -1015,3 +1015,11 @@ td button { border: 0; background: #fdecea; color: #c0392b; padding: 5px 10px; b
 }
 .gp-st-gap-slow { background: #fdf3d8; color: #7a5b12; }
 .gp-decide { font-size: 11.5px; word-break: break-word; }
+
+/* mode selector beside the archive-wide search box */
+.search-row { display: flex; gap: 8px; align-items: stretch; margin-bottom: 6px; }
+.search-row .search-input { margin-bottom: 0; flex: 1; }
+.search-mode {
+  margin-bottom: 0; min-width: 0; width: auto; padding: 0 10px;
+  font-size: 13px; border-radius: 6px;
+}

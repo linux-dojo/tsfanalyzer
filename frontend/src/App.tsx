@@ -4520,6 +4520,15 @@ function continuesPrevious(prev: SearchResult, cur: SearchResult): boolean {
    in the other, "|" is alternation in one and OR in the other. */
 type SearchMode = "search" | "regex";
 
+/* The agent's process/thread tag, kept at the front of a message so a thread's
+   story stays followable. It has to come off before an anchored pattern is
+   tried, or "^" can never reach the text the reader is looking at. */
+const PT_TAG_RE = /^\s*P\s*\d+\s*-\s*T\s*\d+\s+/;
+function stripPTTag(s: string): string {
+  return s.replace(PT_TAG_RE, "");
+}
+
+
 interface LineQuery {
   empty: boolean;
   before: number;
@@ -4751,6 +4760,26 @@ function splitFieldClause(raw: string): [string, string] {
   return [raw, ""];
 }
 
+/* What to send the backend for a given mode.
+
+   The Go query language already has a /regex/ term that is taken whole rather
+   than tokenized, so regex mode is expressed by wrapping the box contents in
+   slashes. Any unescaped slash inside the pattern has to be escaped first, or
+   it would close the term early. The trailing "| $2 > 10" field clause and the
+   -A/-B/-C flags stay outside the wrapper, since they are not part of the
+   pattern. */
+function asServerQuery(raw: string, mode: SearchMode): string {
+  if (mode !== "regex") return raw;
+  const [body, clause] = splitFieldClause(raw);
+  let pattern = body;
+  let flags = "";
+  // lift the context flags out so they keep working in regex mode
+  pattern = pattern.replace(CONTEXT_FLAG_RE, (m) => { flags += " " + m.trim(); return " "; }).trim();
+  if (!pattern) return raw;
+  const escaped = pattern.replace(/\\.|\//g, (m) => (m === "/" ? "\\/" : m));
+  return `/${escaped}/${flags}${clause ? " |" + clause : ""}`;
+}
+
 function parseLineQuery(rawInput: string, mode: SearchMode = "search"): LineQuery {
   const [raw, clause] = splitFieldClause(rawInput);
   const filter = parseFieldFilter(clause);
@@ -4793,13 +4822,24 @@ function parseLineQuery(rawInput: string, mode: SearchMode = "search"): LineQuer
       after,
       ...extras,
       anchorHint: anchored
-        ? "This pattern is anchored with ^ or $, which binds to the message column. " +
-          "In the raw file the line also carries the agent's process/thread and " +
-          "timestamp prefix, so an anchored pattern will not match there."
+        ? "Anchored patterns are matched against the message with the agent's " +
+          "P<pid>-T<tid> tag removed, so ^ binds to the start of the text. The " +
+          "whole line and the tagged message are tried too."
         : undefined,
-      // Prefer the message so ^ and $ mean what the table shows; fall back to
-      // the whole line when there is no separate message (raw view).
-      match: (line, msg) => re.test(msg ?? line),
+      // Three targets, tried in turn, because "the start of the line" means
+      // three different strings here.
+      //
+      // The raw file line is "P 823-T4099  08/24/2026 11:47:16:126 Info ( 224):
+      // enforcer exception IPv4 8.8.8.8 - 8.8.8.8". The parser lifts the
+      // timestamp and severity into their own columns but deliberately keeps
+      // the process/thread tag at the front of the message, so the message is
+      // "P823-T4099 enforcer exception IPv4 8.8.8.8 - 8.8.8.8". Neither starts
+      // where the reader thinks the line starts, so ^enforcer matches neither
+      // — which is silent, and was the whole complaint.
+      match: (line, msg) => {
+        const target = msg ?? line;
+        return re.test(target) || re.test(stripPTTag(target)) || re.test(line);
+      },
     };
   }
 
@@ -5266,6 +5306,7 @@ function ArchiveSearch({
 }) {
   const saved = logStateFor(fileId);
   const [query, setQuery] = useState(cacheKey === "global" ? saved.query : "");
+  const [mode, setMode] = useState<SearchMode>("search");
   const [results, setResults] = useState<SearchResult[] | null>(
     cacheKey === "global" ? saved.results : null
   );
@@ -5319,7 +5360,7 @@ function ArchiveSearch({
       abortRef.current = ac;
       const seq = ++seqRef.current;
 
-      const p = new URLSearchParams({ q: trimmed });
+      const p = new URLSearchParams({ q: asServerQuery(trimmed, mode) });
       if (scopeKey) p.set("paths", scopeKey);
 
       fetch(`/api/v1/files/${fileId}/search?${p.toString()}`, { signal: ac.signal })
@@ -5362,7 +5403,7 @@ function ArchiveSearch({
     }, 450);
 
     return () => clearTimeout(t);
-  }, [query, fileId, scopeKey]);
+  }, [query, mode, fileId, scopeKey]);
 
   const lineHits = (results ?? []).filter((r) => r.type === "line").length;
 
@@ -5442,10 +5483,29 @@ function ArchiveSearch({
           </>
         )}
       </div>
+      <div className="search-row">
+      <select
+        className="search-mode"
+        value={mode}
+        onChange={(e) => setMode(e.target.value as SearchMode)}
+        title={
+          "Search: words with AND / OR / NOT, parentheses and \"quoted phrases\".\n" +
+          "Regex: the whole box is one regular expression, so ( ) | ! ^ $ keep\n" +
+          "their regex meaning rather than being read as operators."
+        }
+      >
+        <option value="search">Search</option>
+        <option value="regex">Regex</option>
+      </select>
       <input
         className="search-input"
         type="search"
-        placeholder={placeholder ?? 'Search…  ospf AND down · "phrase" · -A 3 -B 2 · | $2 > 10000'}
+        placeholder={
+          placeholder ??
+          (mode === "regex"
+            ? "regular expression…  ^enforcer exception IPv4 \\d{1,3}(?:\\.\\d{1,3}){3}"
+            : 'Search…  ospf AND down · "phrase" · -A 3 -B 2 · | $2 > 10000')
+        }
         title={
           "AND / OR / NOT (also && || !), parentheses\n" +
           'bare terms are regexes, "quoted" terms match literally\n/regex/ for a pattern using ( ) | or ! — e.g. /(?:up|down)\\d+/\n' +
@@ -5462,6 +5522,7 @@ function ArchiveSearch({
         value={query}
         onChange={(e) => setQuery(e.target.value)}
       />
+      </div>
       {searching && <p className="muted">Searching the archive…</p>}
       {error && !searching && (
         <p className="error">
@@ -5620,7 +5681,7 @@ function LogContent({
     }
     const ac = new AbortController();
     const timer = setTimeout(() => {
-      const params = new URLSearchParams({ q: trimmed, paths: path, limit: "2000" });
+      const params = new URLSearchParams({ q: asServerQuery(trimmed, mode), paths: path, limit: "2000" });
       fetch(`/api/v1/files/${fileId}/search?${params.toString()}`, { signal: ac.signal })
         .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
         .then((d) => {
@@ -5638,7 +5699,7 @@ function LogContent({
       clearTimeout(timer);
       ac.abort();
     };
-  }, [q, fileId, path]);
+  }, [q, mode, fileId, path]);
 
   // Where the view should be pointed: an explicit jump from the in-file match
   // navigation wins, otherwise the hit that opened this file.
