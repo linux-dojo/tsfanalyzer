@@ -1023,3 +1023,77 @@ td button { border: 0; background: #fdecea; color: #c0392b; padding: 5px 10px; b
   margin-bottom: 0; min-width: 0; width: auto; padding: 0 10px;
   font-size: 13px; border-radius: 6px;
 }
+
+/* ---- Anomalies: signature findings ---- */
+/* Rows collapse to one per kind of event; the detail opens in a right-hand
+   drawer so the list never scrolls away while you read an event. */
+.sig-layout { display: grid; grid-template-columns: 1fr; gap: 16px; }
+.sig-layout-open { grid-template-columns: minmax(0, 1fr) 460px; }
+.sig-list { min-width: 0; }
+.sig-summary { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.sev-chip {
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 2px 8px; border-radius: 10px; white-space: nowrap;
+}
+.sev-critical { background: #fdeaea; color: #a02020; }
+.sev-warning  { background: #fdf3d8; color: #7a5b12; }
+.sev-info     { background: #e8eefb; color: #2455c3; }
+.sig-row { cursor: pointer; }
+.sig-row:hover { background: #f5f8fd; }
+.sig-row-open { background: #eef3fd; }
+.sig-num { text-align: right; font-variant-numeric: tabular-nums; }
+.sig-ts   { white-space: nowrap; font-family: ui-monospace, monospace; font-size: 11.5px; }
+.sig-path { font-size: 11.5px; color: #2455c3; word-break: break-all; }
+.sig-text { font-family: ui-monospace, monospace; font-size: 11.5px; word-break: break-word; }
+.sig-why { font-size: 12.5px; color: #5a6675; margin: 6px 0 10px; }
+.sig-clean { margin-top: 10px; }
+
+.sig-drawer {
+  position: sticky; top: 12px; align-self: start; max-height: calc(100vh - 120px);
+  overflow: auto; background: #fff; border: 1px solid #e6e9ee; border-radius: 8px;
+  padding: 12px 14px;
+}
+.sig-drawer header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.sig-close { margin-left: auto; border-color: #d4d9e0; color: #5a6675; }
+.sig-close:hover { background: #f1f4f8; }
+.sig-drawer-h { font-size: 12.5px; color: #3c4654; margin: 12px 0 6px; }
+.sig-events { margin: 0; padding-left: 18px; }
+.sig-events li { margin-bottom: 8px; font-size: 11.5px; }
+.sig-ev-loc {
+  display: block; color: #2455c3; font-family: ui-monospace, monospace; font-size: 11px;
+}
+.sig-ev-text {
+  display: block; font-family: ui-monospace, monospace; color: #26313f;
+  word-break: break-word; white-space: pre-wrap;
+}
+
+/* ---- device identity banner ---- */
+.dev-banner {
+  display: flex; flex-wrap: wrap; gap: 6px 22px; align-items: baseline;
+  background: #14202e; color: #e7ecf2; border-radius: 8px;
+  padding: 9px 16px; margin-bottom: 16px; font-size: 13px;
+}
+.dev-cell { display: flex; gap: 7px; align-items: baseline; }
+.dev-k {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: #8fa3ba;
+}
+.dev-v { font-family: ui-monospace, monospace; font-size: 12.5px; color: #fff; }
+
+/* "low" sits below info: on the page, but not drawing the eye. */
+.sev-low { background: #eef1f5; color: #5a6675; }
+
+/* A matched line is a link back to where it came from. */
+.sig-ev-jump {
+  display: block; width: 100%; text-align: left; border: 0; background: transparent;
+  padding: 3px 4px; margin: -3px -4px; border-radius: 4px; cursor: pointer; font: inherit;
+}
+.sig-ev-jump:hover { background: #eef3fd; }
+.sig-ev-jump:hover .sig-ev-loc { text-decoration: underline; }
+
+/* Structured (JSON-per-line) logs: band alternate *records*, not rows, since
+   one record wraps over several rows. Yellow/white so the boundary is obvious
+   without competing with the search highlight. */
+.vt-rec-a { background: #fffdf2 !important; }
+.vt-rec-b { background: #ffffff !important; }
+.vt-rec-a.vt-ctx, .vt-rec-b.vt-ctx { opacity: 0.62; }
+.hl-vt { background: #fff3cd !important; }

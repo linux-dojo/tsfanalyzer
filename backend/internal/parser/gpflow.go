@@ -644,6 +644,14 @@ type GPGateway struct {
 	SSLMillis *int `json:"ssl_ms,omitempty"`
 	Weight    *int `json:"weight,omitempty"`
 	Selected  bool `json:"selected"`
+	// Portal is the portal that offered this gateway.
+	//
+	// A collection can hold several portals, and each has its own gateway
+	// list. Without this the Connection tab showed every gateway in the
+	// archive under whichever portal was selected — a lab portal with one
+	// manual gateway appeared to own four Prisma Access gateways it had never
+	// contacted.
+	Portal string `json:"portal,omitempty"`
 	Internal  bool `json:"internal"`
 }
 
@@ -744,6 +752,9 @@ func ExtractGPGateways(r io.ReadSeeker) (*GPGatewaySelection, error) {
 		gwListRe, gwEntryRe, gwPriorityRe, gwRegionBadRe, gwRegionPrioRe,
 		gwTCPRe, gwSelTypeRe, gwBestRe, gwCountRe, gwIntCntRe, gwEmptyRe,
 		gwScoreLineRe,
+		// Not a gateway line, but it names the portal the following gateways
+		// belong to. Filtering it out here is what left them unattributed.
+		gpReqPortalRe,
 	}
 	byAge := map[int][]string{}
 	for {
@@ -798,20 +809,63 @@ func ExtractGPGateways(r io.ReadSeeker) (*GPGatewaySelection, error) {
 	sawEmpty := false
 	regionByName := map[string]string{}
 
+	// The portal in force. Gateway lines carry no portal of their own, so they
+	// inherit the last portal a pre-login was sent to.
+	curPortal := ""
+
 	// per-round state, reset whenever a new gateway list is parsed
 	byFQDN := map[string]*GPGateway{}
 	var order []string
 	var lastTCP *int
+
+	// Finished rounds, kept per portal.
+	//
+	// resetRound used to drop the round outright, so only the last one in the
+	// file survived to reach sel.Gateways. A collection with two portals holds
+	// a round per portal per connection attempt — nine in the sample bundle —
+	// and eight of them were discarded. The lab portal's gateway was in rounds
+	// one to eight, so it never appeared at all, which is why that portal
+	// showed no gateways however the view filtered.
+	//
+	// The newest round for a portal replaces that portal's previous one, since
+	// the newest is its current truth; rounds for *different* portals
+	// accumulate.
+	committed := map[string][]*GPGateway{}
+	var portalOrder []string
+	bestByPortal := map[string]string{}
+	roundPortal := ""
+
+	commitRound := func() {
+		if len(order) == 0 {
+			return
+		}
+		p := roundPortal
+		if _, seen := committed[p]; !seen {
+			portalOrder = append(portalOrder, p)
+		}
+		gs := make([]*GPGateway, 0, len(order))
+		for _, f := range order {
+			gs = append(gs, byFQDN[f])
+		}
+		committed[p] = gs
+		if sel.Best != "" {
+			bestByPortal[p] = sel.Best
+			sel.Best = "" // the next round decides its own
+		}
+	}
+
 	resetRound := func() {
+		commitRound()
 		byFQDN = map[string]*GPGateway{}
 		order = nil
 		lastTCP = nil
+		roundPortal = curPortal
 	}
 	get := func(fqdn string) *GPGateway {
 		if g, ok := byFQDN[fqdn]; ok {
 			return g
 		}
-		g := &GPGateway{FQDN: fqdn}
+		g := &GPGateway{FQDN: fqdn, Portal: roundPortal}
 		byFQDN[fqdn] = g
 		order = append(order, fqdn)
 		return g
@@ -820,6 +874,9 @@ func ExtractGPGateways(r io.ReadSeeker) (*GPGatewaySelection, error) {
 	for _, age := range ages {
 		for _, line := range byAge[age] {
 			switch {
+			case gpReqPortalRe.MatchString(line) && gpPreloginSentRe.MatchString(line):
+				curPortal = gpReqPortalRe.FindStringSubmatch(line)[1]
+
 			case gwListRe.MatchString(line):
 				resetRound()
 
@@ -927,13 +984,27 @@ func ExtractGPGateways(r io.ReadSeeker) (*GPGatewaySelection, error) {
 		}
 	}
 
-	for _, f := range order {
-		g := byFQDN[f]
-		if reg, ok := regionByName[g.Name]; ok {
-			g.Region = reg
+	commitRound() // the last round never hits resetRound
+
+	for _, p := range portalOrder {
+		best := bestByPortal[p]
+		for _, g := range committed[p] {
+			if reg, ok := regionByName[g.Name]; ok {
+				g.Region = reg
+			}
+			// Selection is per portal: each portal picks its own gateway, so a
+			// single global "best" would mark at most one of them.
+			g.Selected = best != "" && strings.EqualFold(best, g.FQDN)
+			sel.Gateways = append(sel.Gateways, *g)
 		}
-		g.Selected = sel.Best != "" && strings.EqualFold(sel.Best, g.FQDN)
-		sel.Gateways = append(sel.Gateways, *g)
+	}
+	// Keep the collection-wide Best for the unfiltered summary line.
+	if sel.Best == "" {
+		for _, p := range portalOrder {
+			if b := bestByPortal[p]; b != "" {
+				sel.Best = b
+			}
+		}
 	}
 	sel.Notes = gatewayNotes(sel, sawEmpty)
 	return sel, nil

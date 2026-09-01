@@ -36,17 +36,33 @@ const (
 
 /* ---------- counter name patterns ---------- */
 
+// planePat matches the plane prefix of a counter name, as a capturing group.
+//
+// Every one of the rules below used to spell this "(mp|dp)". On a high-end
+// chassis that excluded the control plane and every numbered dataplane, so a
+// PA-5250 running its control plane at 89% raised no CPU anomaly at all, and
+// nothing on dp0/dp1 was ever evaluated. The planes are:
+//
+//	mp                management plane
+//	dp                dataplane, single-dataplane platform
+//	cp, dp0, dp1 ...  high-end chassis without slots
+//	s1cp, s1dp0 ...   slotted chassis (PA-7000/7500)
+const planePat = `((?:s\d+)?(?:mp|cp|dp\d*))`
+
 var (
-	loadAvgAnomRe = regexp.MustCompile(`^(mp|dp)__cpu_load_avg__i_(1|5|15)$`)
-	iowaitAnomRe  = regexp.MustCompile(`^(mp|dp)__top__cpu__iowait_pct$`)
+	// Planes are mp, dp, cp (control plane, high-end only) and dp0..dpN
+	// (one per dataplane on a multi-dataplane chassis), so the plane part is
+	// matched rather than enumerated.
+	loadAvgAnomRe = regexp.MustCompile(`^` + planePat + `__cpu_load_avg__l_(1|5|15)$`)
+	iowaitAnomRe  = regexp.MustCompile(`^` + planePat + `__top__cpu__iowait_pct$`)
 	// plane CPU: the "Last 180 seconds" avg/max, and the per-core 15-minute table
-	cpuBlockAnomRe = regexp.MustCompile(`^(mp|dp)__cpu__last_3m_(avg|max)_pct$`)
-	cpuCoreAnomRe  = regexp.MustCompile(`^(mp|dp)__cpu__(\d+)_(avg|max)$`)
+	cpuBlockAnomRe = regexp.MustCompile(`^` + planePat + `__cpu__last_3m_(avg|max)_pct$`)
+	cpuCoreAnomRe  = regexp.MustCompile(`^` + planePat + `__cpu__(\d+)_(avg|max)$`)
 	// per-process CPU from the processes table and from top
-	procCPUAnomRe    = regexp.MustCompile(`^(mp|dp)__processes__(.+)_(\d+)_cpu$`)
-	topProcCPUAnomRe = regexp.MustCompile(`^(mp|dp)__topprocess__(.+)_(\d+)__cpu$`)
+	procCPUAnomRe    = regexp.MustCompile(`^` + planePat + `__processes__(.+)_(\d+)_cpu$`)
+	topProcCPUAnomRe = regexp.MustCompile(`^` + planePat + `__topprocess__(.+)_(\d+)__cpu$`)
 	// socket queues per proto+program
-	queueAnomRe = regexp.MustCompile(`^(mp|dp)__netstat_detail__(.+)_(recv_q|send_q)$`)
+	queueAnomRe = regexp.MustCompile(`^` + planePat + `__netstat_detail__(.+)_(recv_q|send_q)$`)
 )
 
 // band describes one severity step of a threshold rule. Bands are checked

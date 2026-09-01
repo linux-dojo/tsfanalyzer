@@ -583,3 +583,138 @@ func TestGPGatewayEmptyListNoted(t *testing.T) {
 		t.Errorf("an empty gateway list should point at the portal config: %v", sel.Notes)
 	}
 }
+
+// A collection can hold several portals, each publishing its own gateway list.
+// The gateway lines carry no portal of their own, so they have to inherit the
+// portal in force — and the pre-login request line naming that portal was
+// being filtered out before the fold ever saw it.
+//
+// Without this the Connection tab showed every gateway in the archive under
+// whichever portal was selected: a lab portal with one manual gateway appeared
+// to own the Prisma Access gateways it had never contacted.
+const gpsTwoPortals = `(P11496-T12424)Debug(3482): 08/31/26 18:37:07:100 REQID=1,IPADDR=gp.tpmlab.local,PORT=443,URL=/global-protect/prelogin.esp,POST=1
+(P11496-T12424)Debug( 349): 08/31/26 18:37:17:746 Parse gateway list for user abdul
+(P11496-T12424)Debug(6587): 08/31/26 18:37:17:746 Gateway gp.tpmlab.local(gp_gateway): ipv4 192.168.31.78, ipv6 , FQDN yes
+(P11496-T12424)Debug( 609): 08/31/26 18:37:17:746 One external gateway gp.tpmlab.local, priority=1, manual is 1
+(P11496-T12424)Debug(3482): 08/31/26 19:22:38:100 REQID=2,IPADDR=tpm.gpcloudservice.com,PORT=443,URL=/global-protect/prelogin.esp,POST=1
+(P11496-T12424)Debug( 349): 08/31/26 19:22:40:746 Parse gateway list for user abandey
+(P11496-T12424)Debug(6587): 08/31/26 19:22:40:746 Gateway india-west.gw.gpcloudservice.com(India West): ipv4 130.41.204.196, ipv6 , FQDN yes
+(P11496-T12424)Debug( 609): 08/31/26 19:22:40:746 One external gateway india-west.gw.gpcloudservice.com, priority=1, manual is 0
+(P11496-T12424)Debug(6587): 08/31/26 19:22:41:746 Gateway us-northwest.gw.gpcloudservice.com(US Northwest): ipv4 130.41.64.141, ipv6 , FQDN yes
+(P11496-T12424)Debug( 609): 08/31/26 19:22:41:746 One external gateway us-northwest.gw.gpcloudservice.com, priority=5, manual is 0`
+
+func TestGatewaysAreAttributedToThePortalInForce(t *testing.T) {
+	tgz := buildMultiTgz(t, map[string]string{"PanGPS.log": gpsTwoPortals})
+	sel, err := ExtractGPGateways(bytes.NewReader(tgz))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPortal := map[string][]string{}
+	for _, g := range sel.Gateways {
+		byPortal[g.Portal] = append(byPortal[g.Portal], g.FQDN)
+	}
+	lab := byPortal["gp.tpmlab.local"]
+	if len(lab) != 1 || lab[0] != "gp.tpmlab.local" {
+		t.Errorf("lab portal owns %v, want only its own gateway", lab)
+	}
+	if got := byPortal["tpm.gpcloudservice.com"]; len(got) != 2 {
+		t.Errorf("cloud portal owns %v, want 2", got)
+	}
+	for _, g := range lab {
+		if strings.Contains(g, "gpcloudservice") {
+			t.Errorf("a cloud gateway leaked onto the lab portal: %s", g)
+		}
+	}
+	// and nothing should be left unattributed
+	if orphan := byPortal[""]; len(orphan) != 0 {
+		t.Errorf("gateways with no portal: %v", orphan)
+	}
+}
+
+// The real defect behind "one portal shows no gateways at all".
+//
+// A collection holds a gateway round per portal per connection attempt — the
+// sample bundle has nine — and resetRound() used to discard the round outright
+// rather than commit it. Only the last round in the file survived to reach
+// sel.Gateways, so the portal whose rounds came earlier had no gateways in the
+// data at all, and no amount of filtering in the view could show them.
+const gpsRoundsAcrossPortals = `(P1-T1)Debug(3482): 08/31/26 18:37:07:100 REQID=1,IPADDR=gp.tpmlab.local,PORT=443,URL=/global-protect/prelogin.esp,POST=1
+(P1-T1)Debug( 349): 08/31/26 18:37:17:746 Parse gateway list for user abdul
+(P1-T1)Debug(6587): 08/31/26 18:37:17:746 Gateway gp.tpmlab.local(gp_gateway): ipv4 192.168.31.78, ipv6 , FQDN yes
+(P1-T1)Debug( 609): 08/31/26 18:37:17:746 One external gateway gp.tpmlab.local, priority=1, manual is 1
+(P1-T1)Debug(2020): 08/31/26 18:37:20:000 Calling AddGatewayEntryToResponse on m_pBestGateway=00001 (gateway=gp.tpmlab.local)
+(P1-T1)Debug(3482): 08/31/26 19:00:00:100 REQID=2,IPADDR=gp.tpmlab.local,PORT=443,URL=/global-protect/prelogin.esp,POST=1
+(P1-T1)Debug( 349): 08/31/26 19:00:10:746 Parse gateway list for user abdul
+(P1-T1)Debug(6587): 08/31/26 19:00:10:746 Gateway gp.tpmlab.local(gp_gateway): ipv4 192.168.31.78, ipv6 , FQDN yes
+(P1-T1)Debug( 609): 08/31/26 19:00:10:746 One external gateway gp.tpmlab.local, priority=1, manual is 1
+(P1-T1)Debug(3482): 08/31/26 19:48:00:100 REQID=3,IPADDR=tpm.gpcloudservice.com,PORT=443,URL=/global-protect/prelogin.esp,POST=1
+(P1-T1)Debug( 349): 08/31/26 19:48:11:000 Parse gateway list for user abandey
+(P1-T1)Debug(6587): 08/31/26 19:48:11:736 Gateway us-northwest.gw.gpcloudservice.com(US Northwest): ipv4 130.41.64.141, ipv6 , FQDN yes
+(P1-T1)Debug(6587): 08/31/26 19:48:11:914 Gateway india-west.gw.gpcloudservice.com(India West): ipv4 130.41.204.196, ipv6 , FQDN yes
+(P1-T1)Debug(2020): 08/31/26 19:48:20:000 Calling AddGatewayEntryToResponse on m_pBestGateway=00002 (gateway=india-west.gw.gpcloudservice.com)`
+
+func TestEveryGatewayRoundSurvivesNotJustTheLast(t *testing.T) {
+	tgz := buildMultiTgz(t, map[string]string{"PanGPS.log": gpsRoundsAcrossPortals})
+	sel, err := ExtractGPGateways(bytes.NewReader(tgz))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	byPortal := map[string][]GPGateway{}
+	for _, g := range sel.Gateways {
+		byPortal[g.Portal] = append(byPortal[g.Portal], g)
+	}
+
+	lab := byPortal["gp.tpmlab.local"]
+	if len(lab) != 1 {
+		t.Fatalf("lab portal has %d gateways, want 1 — its rounds came before the "+
+			"last one in the file and were being discarded", len(lab))
+	}
+	if lab[0].FQDN != "gp.tpmlab.local" {
+		t.Errorf("lab gateway = %q", lab[0].FQDN)
+	}
+	// The lab portal chose its own gateway, so it must be marked selected even
+	// though a later portal chose a different one.
+	if !lab[0].Selected {
+		t.Error("the lab portal's own choice should be marked selected; " +
+			"a single collection-wide Best marks at most one portal's")
+	}
+
+	cloud := byPortal["tpm.gpcloudservice.com"]
+	if len(cloud) != 2 {
+		t.Fatalf("cloud portal has %d gateways, want 2", len(cloud))
+	}
+	var chosen string
+	for _, g := range cloud {
+		if g.Selected {
+			chosen = g.FQDN
+		}
+	}
+	if chosen != "india-west.gw.gpcloudservice.com" {
+		t.Errorf("cloud portal selected %q, want india-west", chosen)
+	}
+	for _, g := range cloud {
+		if strings.Contains(g.FQDN, "tpmlab") {
+			t.Errorf("a lab gateway leaked into the cloud portal: %s", g.FQDN)
+		}
+	}
+}
+
+// Re-running the same portal replaces that portal's round rather than
+// accumulating duplicates: its newest round is its current truth.
+func TestRepeatedRoundsForOnePortalDoNotDuplicate(t *testing.T) {
+	tgz := buildMultiTgz(t, map[string]string{"PanGPS.log": gpsRoundsAcrossPortals})
+	sel, err := ExtractGPGateways(bytes.NewReader(tgz))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]int{}
+	for _, g := range sel.Gateways {
+		seen[g.Portal+"|"+g.FQDN]++
+	}
+	for k, n := range seen {
+		if n != 1 {
+			t.Errorf("%s appears %d times, want 1 — the lab portal ran two rounds", k, n)
+		}
+	}
+}

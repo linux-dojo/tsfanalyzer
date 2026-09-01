@@ -39,7 +39,59 @@ type Series map[string][]Point
 // sections at/above this elapsed time are collected.
 const gcMinElapsedSeconds = 120.0
 
-var monitorFileRe = regexp.MustCompile(`(?:^|/)(dp|mp)-monitor\.log(?:\.\d+)?$`)
+// monitorFileRe matches a monitor log and names the plane it belongs to.
+//
+// On a single-dataplane platform the plane is the filename prefix and the log
+// lives under /var/log/pan. A high-end chassis (PA-5200/5400/5500/7000/7500)
+// adds a control plane and one dataplane per slot, each with its own root
+// under /opt:
+//
+//	./var/log/pan/mp-monitor.log            -> mp
+//	opt/var.cp/log/pan/cp-monitor.log       -> cp
+//	opt/var.dp0/log/pan/dp-monitor.log      -> dp0
+//	opt/var.dp1/log/pan/dp-monitor.log      -> dp1
+//
+// The directory has to win over the filename, because every dataplane names
+// its log "dp-monitor.log". Keying on the filename alone — which is what this
+// did — silently merged dp0 and dp1 into one "dp" series, interleaving samples
+// from two different dataplanes, and ignored cp-monitor.log altogether.
+var monitorFileRe = regexp.MustCompile(`(?:^|/)(dp|mp|cp)-monitor\.log(?:\.\d+)?$`)
+
+// A high-end chassis keeps one root per plane under /opt, in one of two
+// layouts depending on platform:
+//
+//	opt/var.cp/log/pan/cp-monitor.log        -> cp     (PA-5250: no slots)
+//	opt/var.dp0/log/pan/dp-monitor.log       -> dp0
+//	opt/var/s1/cp/log/pan/cp-monitor.log     -> s1cp   (slotted chassis)
+//	opt/var/s1/dp0/log/pan/dp-monitor.log    -> s1dp0
+//
+// A PA-7000/7500 carries several slots, each with its own control plane and
+// its own set of dataplanes, so the slot has to be part of the name or two
+// slots' counters would merge — the same fault that merged dp0 and dp1.
+var (
+	planeDirRe = regexp.MustCompile(`(?:^|/)var\.([a-z]+[0-9]*)/`)
+	slotDirRe  = regexp.MustCompile(`(?:^|/)var/(s[0-9]+)/(cp|dp[0-9]*)(?:/|$)`)
+)
+
+// planeOf names the plane a monitor log belongs to.
+//
+// The directory wins over the filename, because every dataplane names its log
+// "dp-monitor.log". Keying on the filename alone — which is what this did —
+// silently merged dp0 and dp1 into a single "dp" series, interleaving samples
+// from two different dataplanes, and missed cp-monitor.log completely.
+//
+// Two plain patterns rather than one combined one: a combined version needed
+// two "(?:^|/)" in sequence, which requires a doubled slash and so matched no
+// low-end path at all — it would have dropped every existing mp and dp counter.
+func planeOf(path, fromName string) string {
+	if m := slotDirRe.FindStringSubmatch(path); m != nil {
+		return m[1] + m[2] // s1 + dp0 -> "s1dp0"
+	}
+	if d := planeDirRe.FindStringSubmatch(path); d != nil {
+		return d[1]
+	}
+	return fromName
+}
 
 // CollectAllCounters makes a single pass over the archive and extracts
 // counter time series from every dp-monitor.log* and mp-monitor.log* file.
@@ -62,11 +114,12 @@ func CollectAllCounters(r io.ReadSeeker, appNames map[int]string) (Series, error
 		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
-		m := monitorFileRe.FindStringSubmatch(normalizePath(hdr.Name))
+		path := normalizePath(hdr.Name)
+		m := monitorFileRe.FindStringSubmatch(path)
 		if m == nil {
 			continue
 		}
-		collectMonitor(tr, m[1], out, appNames)
+		collectMonitor(tr, planeOf(path, m[1]), out, appNames)
 	}
 	// rotated logs can be visited out of order, so normalize per series
 	for name := range out {
@@ -93,9 +146,17 @@ var (
 	cacheSecRe = regexp.MustCompile(`^:Cache-Type\b`)
 	cacheRowRe = regexp.MustCompile(`^:([A-Za-z][A-Za-z0-9_]*)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s*$`)
 
-	// "--- cpu" block
-	cpuAvgMaxRe = regexp.MustCompile(`^(\d+)\s+(\d+)\s*$`)
-	loadAvgRe   = regexp.MustCompile(`^([\d.]+)\s+([\d.]+)\s+([\d.]+)`)
+	// "--- cpu" block.
+	//
+	// The control plane reports Max as a full-precision float —
+	// "89         90.332360570687413" — while the dataplane reports integers.
+	// Requiring two integers dropped every control-plane CPU sample silently,
+	// so a control plane sitting at 89% was invisible.
+	cpuAvgMaxRe = regexp.MustCompile(`^([\d.]+)\s+([\d.]+)\s*$`)
+	// /proc/loadavg in full: "2.32 1.59 1.45 6/1462 319676" — the three load
+	// averages, then runnable/total scheduling entities, then the last PID the
+	// kernel assigned. The trailing two were previously dropped.
+	loadAvgRe = regexp.MustCompile(`^([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s+(\d+)/(\d+)\s+(\d+))?`)
 
 	// per pan-task (per core) global counters
 	perTaskSecRe = regexp.MustCompile(`^:\s*Per pan-task counter statistics`)
@@ -106,6 +167,19 @@ var (
 	ifaceHdrRe  = regexp.MustCompile(`^\d+:\s+([A-Za-z0-9._@-]+):`)
 	rxtxHdrRe   = regexp.MustCompile(`^(RX|TX):\s+([a-z][a-z /]*)$`)
 	numsOnlyRe  = regexp.MustCompile(`^[\d\s]+$`)
+
+	// "--- cp_stats" block: a nested, brace-delimited dump.
+	//
+	//	sw.mprelay.s1.cp.platform: {
+	//	  netmsg: {
+	//	    errors: { acl_delete: 0, ... },
+	//	    stats:  { acl_delete: 0, arp_update: 99774, ... },
+	//	  },
+	//	  stats: { arp_delete_fail: 0, ... },
+	//	}
+	cpsOpenRe = regexp.MustCompile(`^\s*([A-Za-z][\w.]*):\s*\{`)
+	cpsLeafRe = regexp.MustCompile(`^\s*([a-z][a-z0-9_]*):\s*(-?\d+)\s*,?\s*$`)
+	cpsCloseRe = regexp.MustCompile(`^\s*\}`)
 
 	// "--- memory" block
 	memRowRe  = regexp.MustCompile(`^Mem\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)`)
@@ -193,6 +267,11 @@ var (
 
 type counterCollector struct {
 	plane  string
+	// cpsPath is the object nesting inside a "--- cp_stats" block.
+	cpsPath []string
+	// fabricUnsupported records that the platform reported no fabric stats,
+	// which is normal below a 7000 and not a parse failure.
+	fabricUnsupported bool
 	ts     time.Time
 	haveTs bool
 	block  string
@@ -298,6 +377,7 @@ func (c *counterCollector) line(raw string) {
 		c.detKind, c.detName, c.ruLabel = "", "", ""
 		c.powThread = 0
 		c.appVsys = ""
+		c.cpsPath = c.cpsPath[:0]
 		if c.block == "netstat_detail" {
 			c.nsAcc = make(map[string]float64)
 			c.nsTs = c.ts
@@ -342,6 +422,12 @@ func (c *counterCollector) line(raw string) {
 		return
 	case "panio_infreq":
 		c.appStatsLine(trimmed)
+		return
+	case "cp_stats":
+		c.cpStatsLine(raw)
+		return
+	case "fabric_traffic_stats":
+		c.fabricLine(trimmed)
 		return
 	}
 
@@ -506,9 +592,19 @@ func (c *counterCollector) cpuBlockLine(trimmed string) {
 	}
 	if c.loadAvgNext {
 		if m := loadAvgRe.FindStringSubmatch(trimmed); m != nil {
-			c.emit(c.plane+"__cpu_load_avg__i_1", atofu(m[1]))
-			c.emit(c.plane+"__cpu_load_avg__i_5", atofu(m[2]))
-			c.emit(c.plane+"__cpu_load_avg__i_15", atofu(m[3]))
+			c.emit(c.plane+"__cpu_load_avg__l_1", atofu(m[1]))
+			c.emit(c.plane+"__cpu_load_avg__l_5", atofu(m[2]))
+			c.emit(c.plane+"__cpu_load_avg__l_15", atofu(m[3]))
+			if m[4] != "" {
+				// runnable now, and how many scheduling entities exist at all
+				c.emit(c.plane+"__cpu_load_avg__run_thread", atofu(m[4]))
+				c.emit(c.plane+"__cpu_load_avg__total_thread", atofu(m[5]))
+				// The last PID the kernel handed out. On its own it says
+				// nothing; the *difference* between two samples is the number
+				// of processes created in that interval, which is how a fork
+				// storm or a daemon in a respawn loop shows up.
+				c.emit(c.plane+"__cpu_load_avg__last_pid", atofu(m[6]))
+			}
 		}
 		c.loadAvgNext = false
 		return
@@ -1171,5 +1267,63 @@ func (c *counterCollector) vmpowLine(trimmed string) {
 	}
 	if m := vmpowRcvThreshRe.FindStringSubmatch(trimmed); m != nil {
 		c.emit(c.plane+"__vmpow__rcv_thresh", atofu(m[1]))
+	}
+}
+
+// cpStatsLine reads the "--- cp_stats" block on a high-end control plane.
+//
+// The block is a nested brace dump rather than the flat "key value" rows every
+// other block uses, so it needs its own small stack. Names follow the nesting:
+//
+//	netmsg: { errors: { acl_delete: 0 } }  ->  cp__cpstats__netmsg_errors_acl_delete
+//	netmsg: { stats:  { arp_update: 99774 } } -> cp__cpstats__netmsg_stats_arp_update
+//	stats:  { arp_update_fail: 0 }         ->  cp__cpstats__stats_arp_update_fail
+//
+// The outermost object is the platform path — "sw.mprelay.s1.cp.platform" —
+// and is dropped, which is what makes the names above match. Note the "s1":
+// that is the slot. Every sample in the PA-5250 archive carries exactly one
+// root, so dropping it is unambiguous there, but a chassis that reported two
+// slots in one block would collapse them into one series — the same fault that
+// merged dp0 and dp1. If a multi-slot cp_stats block ever turns up, the slot
+// belongs in the name; there is no way to tell from a single-slot sample which
+// spelling is right, so this waits for one rather than guessing.
+func (c *counterCollector) cpStatsLine(raw string) {
+	line := strings.TrimRight(raw, " \t\r")
+	if line == "" {
+		return
+	}
+	// A leaf has to be tested before an open brace, since "acl_delete: 0," and
+	// "errors: {" differ only in what follows the colon.
+	if m := cpsLeafRe.FindStringSubmatch(line); m != nil {
+		if len(c.cpsPath) == 0 {
+			return // a value outside any object; nothing to name it with
+		}
+		name := c.plane + "__cpstats__"
+		// path[0] is the platform root and is not part of the name
+		for _, seg := range c.cpsPath[1:] {
+			name += seg + "_"
+		}
+		c.emit(name+sanitizeCounter(m[1]), atofu(m[2]))
+		return
+	}
+	if m := cpsOpenRe.FindStringSubmatch(line); m != nil {
+		c.cpsPath = append(c.cpsPath, sanitizeCounter(m[1]))
+		return
+	}
+	if cpsCloseRe.MatchString(line) && len(c.cpsPath) > 0 {
+		c.cpsPath = c.cpsPath[:len(c.cpsPath)-1]
+	}
+}
+
+// fabricLine reads "--- fabric_traffic_stats".
+//
+// On the PA-5250 the block holds no counters at all, only the sentence
+// "Fabric Traffic stats collection not supported in 5200 cp PA-5250". The
+// switch fabric is a 7000/7500 feature, so on the platforms that lack it the
+// block is present but empty. Recognising that explicitly keeps it from being
+// mistaken for a parse failure when no counters appear.
+func (c *counterCollector) fabricLine(trimmed string) {
+	if strings.Contains(trimmed, "not supported") {
+		c.fabricUnsupported = true
 	}
 }

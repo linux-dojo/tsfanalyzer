@@ -28,7 +28,7 @@ func groupsByLabel(g []AnomalyGroup) map[string]AnomalyGroup {
 func TestCounterAnomaliesLoadAverageBands(t *testing.T) {
 	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	// below, between 2.5 and 5, and above 5
-	s := atTime("mp__cpu_load_avg__i_1", base, 0.8, 3.1, 6.2, 2.0, 5.5)
+	s := atTime("mp__cpu_load_avg__l_1", base, 0.8, 3.1, 6.2, 2.0, 5.5)
 	got := groupsByLabel(CounterAnomalies(s))
 
 	warn, ok := got["mp cpu 1 min load above 2.5"]
@@ -60,10 +60,10 @@ func TestCounterAnomaliesLoadAverageBands(t *testing.T) {
 func TestCounterAnomaliesLoadWindowsAreSeparate(t *testing.T) {
 	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	s := Series{}
-	addAt(s, "mp__cpu_load_avg__i_1", base, 6.0)
-	addAt(s, "mp__cpu_load_avg__i_5", base, 6.0)
-	addAt(s, "mp__cpu_load_avg__i_15", base, 3.0)
-	addAt(s, "dp__cpu_load_avg__i_1", base, 6.0)
+	addAt(s, "mp__cpu_load_avg__l_1", base, 6.0)
+	addAt(s, "mp__cpu_load_avg__l_5", base, 6.0)
+	addAt(s, "mp__cpu_load_avg__l_15", base, 3.0)
+	addAt(s, "dp__cpu_load_avg__l_1", base, 6.0)
 	got := groupsByLabel(CounterAnomalies(s))
 	for _, want := range []string{
 		"mp cpu 1 min load above 5",
@@ -200,8 +200,8 @@ func TestCounterAnomaliesSortedBySeverityThenCount(t *testing.T) {
 	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	s := Series{}
 	addAt(s, "mp__processes__x_1_cpu", base, 90)               // high
-	addAt(s, "mp__cpu_load_avg__i_1", base, 6, 6, 6)          // critical, 3
-	addAt(s, "mp__cpu_load_avg__i_5", base, 6)                // critical, 1
+	addAt(s, "mp__cpu_load_avg__l_1", base, 6, 6, 6)          // critical, 3
+	addAt(s, "mp__cpu_load_avg__l_5", base, 6)                // critical, 1
 	out := CounterAnomalies(s)
 	if len(out) < 3 {
 		t.Fatalf("want 3 groups, got %d", len(out))

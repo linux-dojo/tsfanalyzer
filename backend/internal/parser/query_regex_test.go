@@ -133,16 +133,16 @@ func TestAnchoredRegexStillDiscriminates(t *testing.T) {
 // The prefix stripper runs on a case-folded line, so it cannot require the
 // uppercase "P"/"-T" the parsing patterns use. Reusing those patterns here
 // silently disabled the whole fallback.
-func TestStripLogPrefixIsCaseInsensitive(t *testing.T) {
+func TestStripFoldedLogPrefixIsCaseInsensitive(t *testing.T) {
 	line := "p 823-t4099  08/24/2026 11:47:16:126 info ( 224): enforcer exception ipv4 8.8.8.8 - 8.8.8.8"
-	msg, ok := stripLogPrefix(line)
+	msg, ok := stripFoldedLogPrefix(line)
 	if !ok {
 		t.Fatal("a lower-cased agent line should still have its prefix recognised")
 	}
 	if msg != "enforcer exception ipv4 8.8.8.8 - 8.8.8.8" {
 		t.Errorf("stripped to %q", msg)
 	}
-	if _, ok := stripLogPrefix("2026-06-09 11:27:40.087 -0700  --- panio"); ok {
+	if _, ok := stripFoldedLogPrefix("2026-06-09 11:27:40.087 -0700  --- panio"); ok {
 		t.Error("a monitor line has no agent prefix to strip")
 	}
 }

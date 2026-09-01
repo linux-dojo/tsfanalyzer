@@ -390,6 +390,18 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 			}
 			f5.Close()
 		}
+		// file-scoped signatures: named log files scanned for known fault
+		// patterns, kept beside the counter/log anomalies rather than merged,
+		// since each finding is a specific line rather than a trend
+		if f6, ferr := os.Open(rec.StoragePath); ferr == nil {
+			if sig, serr := parser.ScanLogSignatures(f6); serr == nil {
+				_ = s.store.SaveLogSignatures(rec.ID, sig)
+			} else {
+				log.Printf("parse %s: log signatures: %v", rec.ID, serr)
+			}
+			f6.Close()
+		}
+
 		fromCounters := parser.CounterAnomalies(samples)
 		groups = append(groups, fromCounters...)
 		groups = parser.SortAnomalies(groups)
@@ -536,7 +548,7 @@ func (s *Server) handleContent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"entries": entries, "total": st.Total, "offset": offset, "limit": pageLimit,
 			"file_total": st.FileTotal, "timestamped": st.Timestamped,
-			"first": st.First, "last": st.Last,
+			"first": st.First, "last": st.Last, "structured": st.Structured,
 		})
 		return
 	}
@@ -748,7 +760,13 @@ func (s *Server) handleAnomalies(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "no anomalies extracted for this file")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"file_id": id, "anomalies": groups})
+	sig, sigErr := s.store.LogSignatures(id)
+	if sigErr != nil {
+		sig = nil
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"file_id": id, "anomalies": groups, "signatures": sig,
+	})
 }
 
 func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {

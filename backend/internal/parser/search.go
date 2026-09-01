@@ -138,7 +138,7 @@ func (t termNode) match(lower string) bool {
 	// This is done only for anchored patterns because it costs a prefix parse
 	// per line, and an unanchored pattern gains nothing from it.
 	if t.anchored {
-		if msg, ok := stripLogPrefix(lower); ok {
+		if msg, ok := stripFoldedLogPrefix(lower); ok {
 			return t.re.MatchString(msg)
 		}
 	}
@@ -169,8 +169,16 @@ var logPrefixRe = regexp.MustCompile(`(?i)^(?:` +
 	`\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}\.\d+\s*\[[a-z]+\s*\d+\]:` +
 	`)\s?`)
 
-// stripLogPrefix removes that bookkeeping, reporting whether there was any.
-func stripLogPrefix(line string) (string, bool) {
+// stripFoldedLogPrefix removes that bookkeeping, reporting whether there was
+// any.
+//
+// gphip.go has its own stripLogPrefix that does a similar job for the HIP
+// parser. This is deliberately not that function: that one runs on lines in
+// their original case and reuses the parsing patterns, which require an
+// uppercase "P" and "-T". Search matches on a case-folded line, so it needs a
+// case-insensitive pattern of its own — reusing the other one is precisely the
+// bug this replaced.
+func stripFoldedLogPrefix(line string) (string, bool) {
 	if loc := logPrefixRe.FindStringIndex(line); loc != nil {
 		return line[loc[1]:], true
 	}

@@ -154,9 +154,9 @@ func TestCpuBlock(t *testing.T) {
 	want := map[string]float64{
 		"dp__cpu__last_3m_avg_pct": 17,
 		"dp__cpu__last_3m_max_pct": 24,
-		"dp__cpu_load_avg__i_1":    1.44,
-		"dp__cpu_load_avg__i_5":    1.67,
-		"dp__cpu_load_avg__i_15":   1.58,
+		"dp__cpu_load_avg__l_1":    1.44,
+		"dp__cpu_load_avg__l_5":    1.67,
+		"dp__cpu_load_avg__l_15":   1.58,
 	}
 	for name, v := range want {
 		ss, ok := got[name]
@@ -289,7 +289,7 @@ func TestNetstatDetail(t *testing.T) {
 
 func TestMpPrefix(t *testing.T) {
 	got := collectFromString(t, sampleDpMonitor, "mp")
-	if _, ok := got["mp__cpu_load_avg__i_1"]; !ok {
+	if _, ok := got["mp__cpu_load_avg__l_1"]; !ok {
 		t.Fatal("mp prefix not applied")
 	}
 }
@@ -733,4 +733,235 @@ func TestVmpow(t *testing.T) {
 		"dp__vmpow__used_wqe_pct":           0,
 		"dp__vmpow__rcv_thresh":             1792,
 	})
+}
+
+// cpuBlock builds a "--- cpu" block with the given Load Avg row.
+func cpuBlock(loadAvg string) string {
+	return "2026-06-09 11:29:44.537 -0700  --- cpu\n" +
+		"Last 180 seconds\n" +
+		"Avg (%)    Max (%)\n" +
+		"17         24\n" +
+		"Load Avg:\n" + loadAvg + "\n"
+}
+
+// The Load Avg row is /proc/loadavg in full:
+//
+//	2.32 1.59 1.45 6/1462 319676
+//
+// The three averages were being read and the last two fields dropped. The
+// trailing number is the last PID the kernel assigned, so the difference
+// between two samples is the number of processes created in that interval — in
+// the sample archive that runs 834 to 10,283 between consecutive samples, which
+// is what distinguishes a steady box from one in a respawn loop.
+func TestLoadAvgKeepsThreadCountsAndLastPID(t *testing.T) {
+	got := collectFromString(t, cpuBlock("2.32 1.59 1.45 6/1462 319676"), "mp")
+	for name, want := range map[string]float64{
+		"mp__cpu_load_avg__l_1":          2.32,
+		"mp__cpu_load_avg__l_5":          1.59,
+		"mp__cpu_load_avg__l_15":         1.45,
+		"mp__cpu_load_avg__run_thread":   6,
+		"mp__cpu_load_avg__total_thread": 1462,
+		"mp__cpu_load_avg__last_pid":     319676,
+	} {
+		ss, ok := got[name]
+		if !ok {
+			t.Errorf("missing %s", name)
+			continue
+		}
+		if ss[0].Value != want {
+			t.Errorf("%s = %v, want %v", name, ss[0].Value, want)
+		}
+	}
+}
+
+// A row without the trailing fields must still yield the three averages rather
+// than failing to match at all.
+func TestLoadAvgWithoutThreadFields(t *testing.T) {
+	got := collectFromString(t, cpuBlock("0.10 0.20 0.30"), "dp")
+	if _, ok := got["dp__cpu_load_avg__l_1"]; !ok {
+		t.Fatal("the three averages must still be read from a short row")
+	}
+	if _, ok := got["dp__cpu_load_avg__last_pid"]; ok {
+		t.Error("no PID field was present, so none should be emitted")
+	}
+}
+
+// The load-average anomaly rule used to enumerate (mp|dp). A high-end chassis
+// adds a control plane and one dataplane per slot, so it has to match those
+// too or their CPU pressure would never raise an anomaly.
+func TestLoadAvgAnomalyRuleCoversHighEndPlanes(t *testing.T) {
+	for _, name := range []string{
+		"mp__cpu_load_avg__l_1", "dp__cpu_load_avg__l_5",
+		"cp__cpu_load_avg__l_15", "dp0__cpu_load_avg__l_1", "dp1__cpu_load_avg__l_5",
+	} {
+		if !loadAvgAnomRe.MatchString(name) {
+			t.Errorf("%s should be eligible for the load-average anomaly rule", name)
+		}
+	}
+	for _, name := range []string{
+		"mp__cpu_load_avg__l_2", "mp__cpu__last_3m_avg_pct", "xp__cpu_load_avg__l_1",
+	} {
+		if loadAvgAnomRe.MatchString(name) {
+			t.Errorf("%s should not match the load-average rule", name)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// High-end chassis: control plane and multiple dataplanes
+// ---------------------------------------------------------------------------
+
+// Every dataplane on a multi-dataplane chassis names its log "dp-monitor.log";
+// what distinguishes them is the per-plane root under /opt. Keying on the
+// filename merged dp0 and dp1 into a single "dp" series — interleaving samples
+// from two different dataplanes — and missed cp-monitor.log entirely.
+func TestPlaneOfPrefersTheDirectory(t *testing.T) {
+	cases := map[string]string{
+		"var/log/pan/mp-monitor.log":         "mp",
+		"var/log/pan/dp-monitor.log":         "dp",
+		"var/log/pan/mp-monitor.log.4":       "mp",
+		"opt/var.cp/log/pan/cp-monitor.log":  "cp",
+		"opt/var.dp0/log/pan/dp-monitor.log": "dp0",
+		"opt/var.dp1/log/pan/dp-monitor.log": "dp1",
+		"opt/var.dp2/log/pan/dp-monitor.log": "dp2",
+		// slotted chassis: the slot has to be part of the name, or two slots'
+		// counters merge exactly as dp0 and dp1 did
+		"opt/var/s1/cp/log/pan/cp-monitor.log":   "s1cp",
+		"opt/var/s1/dp0/log/pan/dp-monitor.log":  "s1dp0",
+		"opt/var/s1/dp1/log/pan/dp-monitor.log":  "s1dp1",
+		"opt/var/s2/dp0/log/pan/dp-monitor.log":  "s2dp0",
+		"opt/var/s4/cp/log/pan/cp-monitor.log.3": "s4cp",
+	}
+	for path, want := range cases {
+		m := monitorFileRe.FindStringSubmatch(path)
+		if m == nil {
+			t.Errorf("%s matched no monitor log", path)
+			continue
+		}
+		if got := planeOf(path, m[1]); got != want {
+			t.Errorf("%s -> %q, want %q", path, got, want)
+		}
+	}
+}
+
+// The low-end layout must keep working. An earlier attempt at a single
+// combined pattern needed two "(?:^|/)" in sequence, which requires a doubled
+// slash, so it matched no /var/log/pan path at all and would have dropped
+// every existing mp and dp counter.
+func TestSingleDataplaneLayoutStillMatches(t *testing.T) {
+	for _, p := range []string{"var/log/pan/mp-monitor.log", "var/log/pan/dp-monitor.log.3"} {
+		if monitorFileRe.FindStringSubmatch(p) == nil {
+			t.Errorf("%s no longer matches; all existing counters would vanish", p)
+		}
+	}
+	for _, p := range []string{
+		"var/log/pan/wildfire-monitor.log",
+		"opt/var.dp0/log/pan/pan_task_12.log",
+	} {
+		if monitorFileRe.FindStringSubmatch(p) != nil {
+			t.Errorf("%s should not be treated as a plane monitor log", p)
+		}
+	}
+}
+
+// The control plane reports Max CPU as a full-precision float while the
+// dataplane reports integers, so an integer-only pattern silently dropped
+// every control-plane CPU sample — all 40 of them in the PA-5250 archive,
+// hiding a control plane sitting at 89%.
+func TestCpuAcceptsFractionalMax(t *testing.T) {
+	got := collectFromString(t, "2026-08-17 10:09:48.231 -0700  --- cpu\n"+
+		"Last 180 seconds\nAvg (%)    Max (%)\n89         90.332360570687413\n", "cp")
+	if ss, ok := got["cp__cpu__last_3m_avg_pct"]; !ok || ss[0].Value != 89 {
+		t.Errorf("avg = %v, want 89", got["cp__cpu__last_3m_avg_pct"])
+	}
+	ss, ok := got["cp__cpu__last_3m_max_pct"]
+	if !ok {
+		t.Fatal("a fractional Max was dropped entirely")
+	}
+	if ss[0].Value < 90.33 || ss[0].Value > 90.34 {
+		t.Errorf("max = %v, want ~90.3324", ss[0].Value)
+	}
+}
+
+const sampleCpStats = `2026-08-17 10:08:37.491 -0700  --- cp_stats
+sw.mprelay.s1.cp.platform: { 
+  netmsg: { 
+    errors: { 
+      acl_delete: 0, 
+      arp_update: 3, 
+    }, 
+    stats: { 
+      acl_delete: 0, 
+      arp_delete: 26, 
+      arp_update: 99774, 
+    }, 
+  }, 
+  stats: { 
+    arp_update_fail: 7, 
+    mac_delete_fail: 0, 
+  }, 
+}
+`
+
+// The nesting decides the name, and the outermost platform object is dropped.
+func TestCpStatsNestedNames(t *testing.T) {
+	got := collectFromString(t, sampleCpStats, "cp")
+	want := map[string]float64{
+		"cp__cpstats__netmsg_errors_acl_delete": 0,
+		"cp__cpstats__netmsg_errors_arp_update": 3,
+		"cp__cpstats__netmsg_stats_acl_delete":  0,
+		"cp__cpstats__netmsg_stats_arp_delete":  26,
+		"cp__cpstats__netmsg_stats_arp_update":  99774,
+		"cp__cpstats__stats_arp_update_fail":    7,
+		"cp__cpstats__stats_mac_delete_fail":    0,
+	}
+	for name, v := range want {
+		ss, ok := got[name]
+		if !ok {
+			t.Errorf("missing %s", name)
+			continue
+		}
+		if ss[0].Value != v {
+			t.Errorf("%s = %v, want %v", name, ss[0].Value, v)
+		}
+	}
+	// "stats" appears twice at different depths; they must not collide
+	if len(got["cp__cpstats__netmsg_stats_acl_delete"]) == 0 ||
+		len(got["cp__cpstats__stats_arp_update_fail"]) == 0 {
+		t.Error("the two stats objects must stay distinct")
+	}
+	// the platform root must not leak into any name
+	for name := range got {
+		if strings.Contains(name, "mprelay") || strings.Contains(name, "platform") {
+			t.Errorf("the platform root leaked into %q", name)
+		}
+	}
+}
+
+// Braces must not leave the stack unbalanced across blocks, or the next
+// block's names would inherit stale path segments.
+func TestCpStatsStackResetsBetweenBlocks(t *testing.T) {
+	got := collectFromString(t, sampleCpStats+sampleCpStats, "cp")
+	ss := got["cp__cpstats__netmsg_stats_arp_update"]
+	if len(ss) != 2 {
+		t.Fatalf("got %d samples across two blocks, want 2", len(ss))
+	}
+	for name := range got {
+		if strings.Count(name, "netmsg") > 1 {
+			t.Errorf("stale nesting leaked into %q", name)
+		}
+	}
+}
+
+// Below a PA-7000 the block exists but carries no counters. That is the
+// platform, not a parse failure.
+func TestFabricTrafficStatsUnsupportedIsNotAFailure(t *testing.T) {
+	got := collectFromString(t,
+		"2026-08-17 10:09:54.171 -0700  --- fabric_traffic_stats\n"+
+			"Fabric Traffic stats collection not supported in 5200 cp PA-5250\n", "cp")
+	for name := range got {
+		if strings.Contains(name, "fabric") {
+			t.Errorf("no fabric counters should be emitted, got %q", name)
+		}
+	}
 }

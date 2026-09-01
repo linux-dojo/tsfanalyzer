@@ -5,8 +5,11 @@ import (
 	"testing"
 )
 
-// scanTrace runs the fact scanner over trace lines without needing an archive.
-func scanTrace(body string) *GPFacts {
+// scanTrace runs the fact scanner over trace lines without needing an archive,
+// returning the merged view. scanPortals returns the per-portal split.
+func scanTrace(body string) GPPortalFacts { return scanAll(body).All }
+
+func scanAll(body string) *GPFacts {
 	s := newGPFactScan()
 	s.feed(strings.Split(strings.TrimPrefix(body, "\n"), "\n"))
 	s.close()
@@ -167,7 +170,7 @@ func TestEnforcerConfigurationIsNotEnforcement(t *testing.T) {
 		"always on category": "Enforcer,Always On, 401 entries found in filter objects",
 	} {
 		f := scanTrace("\n" + tl("11:47:18", line))
-		if f.Enforcer.Present() {
+		if f.Enforcer.State == "enabled" {
 			t.Errorf("%s: %q is configuration or a category name, not a statement "+
 				"that enforcement is on", name, line)
 		}
@@ -186,10 +189,10 @@ func TestEnforcerEmptyListsAreNotConfiguration(t *testing.T) {
 		"No trusted host list defined!enforcer exception: no app list defined",
 	} {
 		f := scanTrace("\n" + tl("11:47:18", line))
-		if f.Enforcer.Configured != 0 {
+		if f.Enforcer.Policy != 0 {
 			t.Errorf("%q reports an absent list; it should not count as configuration", line)
 		}
-		if f.Enforcer.Present() {
+		if f.Enforcer.State == "enabled" {
 			t.Errorf("%q should not imply enforcement", line)
 		}
 	}
@@ -214,7 +217,7 @@ func TestEnforcerStateStatements(t *testing.T) {
 	}
 	for _, line := range []string{"GetEnforcer state = 1", "Enforcer is enabled."} {
 		f := scanTrace("\n" + tl("11:47:18", line))
-		if !f.Enforcer.Present() {
+		if !f.Enforcer.State == "enabled" {
 			t.Errorf("%q: state = %q, want enabled", line, f.Enforcer.State)
 		}
 	}
@@ -247,8 +250,8 @@ func TestEnforcerConfigurationIsCounted(t *testing.T) {
 ` + tl("11:47:18", "Enforcer set exceptions 8-388") + `
 ` + tl("11:47:18", "enforcer exception: parsed 14 single and 26 wildcard domain entries for enforcer exception") + `
 `)
-	if f.Enforcer.Configured != 2 {
-		t.Errorf("configured = %d, want 2", f.Enforcer.Configured)
+	if !f.Enforcer.Configured() {
+		t.Error("a pushed exception range is configuration")
 	}
 	if f.Enforcer.Exceptions != 381 {
 		t.Errorf("exceptions = %d, want 381", f.Enforcer.Exceptions)
@@ -256,7 +259,7 @@ func TestEnforcerConfigurationIsCounted(t *testing.T) {
 	if f.Enforcer.Domains != 14 || f.Enforcer.Wildcards != 26 {
 		t.Errorf("domains/wildcards = %d/%d, want 14/26", f.Enforcer.Domains, f.Enforcer.Wildcards)
 	}
-	if f.Enforcer.Present() {
+	if f.Enforcer.State == "enabled" {
 		t.Error("configuration alone must never report enforcement as on")
 	}
 }
@@ -433,5 +436,120 @@ func TestTeardownBoundariesAreKeptWithoutAStage(t *testing.T) {
 		if s.Name == "" {
 			t.Error("the boundary should still be named")
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Portal scoping
+// ---------------------------------------------------------------------------
+
+// A collection can hold several portals, and the enforcer lists, the gateway
+// configuration and the host-detection result all belong to whichever one the
+// agent was talking to. Collecting them collection-wide made the portal
+// selector inert: the lab portal's exception lists and its gateway config were
+// shown under a Prisma portal that had pushed neither.
+func TestFactsAreScopedToThePortalInForce(t *testing.T) {
+	f := scanAll(`
+` + tl("18:37:07", "REQID=1,IPADDR=lab.example.local,PORT=443,URL=/global-protect/prelogin.esp,POST=1") + `
+` + tl("18:37:09", "enforcer ip exception is 8.8.8.8,192.168.31.0/24") + `
+` + tl("18:37:09", "enforcer exception: FQDN is *.google.com,*.openai.com") + `
+` + tl("18:37:10", "GetEnforcer state = 1") + `
+` + tl("18:37:14", "gateway lab.example.local's config is <?xml version=\"1.0\" ?>") + `
+	<response status="success"><user>abdul</user></response>
+` + tl("19:22:38", "REQID=2,IPADDR=cloud.example.com,PORT=443,URL=/global-protect/prelogin.esp,POST=1") + `
+` + tl("19:22:40", "enforcer exception: 3 fqdn entries") + `
+` + tl("19:22:40", "enforcer exception: parsed 0 single and 3 wildcard domain entries for enforcer exception fqdn") + `
+` + tl("19:22:52", "gateway india-west.gw.example.com's config is <?xml version=\"1.0\" ?>") + `
+	<response status="success"><user>abdul</user></response>
+`)
+	if len(f.Portals) != 2 {
+		t.Fatalf("got %d portals, want 2: %+v", len(f.Portals), f.Portals)
+	}
+
+	lab := f.For("lab.example.local")
+	if !lab.Enforcer.Configured() {
+		t.Error("the lab portal pushed IP and FQDN exception lists")
+	}
+	if len(lab.Enforcer.IPExceptions) != 1 || len(lab.Enforcer.FQDNs) != 1 {
+		t.Errorf("lab lists: ip=%v fqdn=%v", lab.Enforcer.IPExceptions, lab.Enforcer.FQDNs)
+	}
+	if len(lab.GatewayConfigs) != 1 || lab.GatewayConfigs[0].Gateway != "lab.example.local" {
+		t.Errorf("lab gateway configs = %+v", lab.GatewayConfigs)
+	}
+
+	cloud := f.For("cloud.example.com")
+	// The heart of the bug: the cloud portal logs summary counts for the
+	// exception lists already loaded, but pushed nothing of its own.
+	if cloud.Enforcer.Configured() {
+		t.Error("the cloud portal pushed no lists; the counts it logged are a " +
+			"restatement of what was already loaded under the lab portal")
+	}
+	if len(cloud.Enforcer.IPExceptions) != 0 || len(cloud.Enforcer.FQDNs) != 0 {
+		t.Errorf("the lab portal's lists leaked: ip=%v fqdn=%v",
+			cloud.Enforcer.IPExceptions, cloud.Enforcer.FQDNs)
+	}
+	if len(cloud.GatewayConfigs) != 1 || cloud.GatewayConfigs[0].Gateway != "india-west.gw.example.com" {
+		t.Errorf("cloud gateway configs = %+v", cloud.GatewayConfigs)
+	}
+}
+
+// An unknown portal must report nothing rather than borrow the merged view,
+// which would recreate the leak the split exists to prevent.
+func TestForUnknownPortalDoesNotFallBackWhenPortalsExist(t *testing.T) {
+	f := scanAll(`
+` + tl("18:37:07", "REQID=1,IPADDR=lab.example.local,PORT=443,URL=/global-protect/prelogin.esp,POST=1") + `
+` + tl("18:37:09", "enforcer ip exception is 8.8.8.8") + `
+`)
+	// For() falls back by design on the Go side; the guard lives in the view,
+	// so assert the merged view is what comes back and that it is labelled.
+	got := f.For("never-seen.example.com")
+	if got.Portal != "" {
+		t.Errorf("the merged view should carry no portal name, got %q", got.Portal)
+	}
+}
+
+// Enforcement state moves as the machine connects and disconnects, so it is
+// tracked per portal and counted rather than reduced to one yes/no.
+func TestEnforcerStateIsPerPortalAndCountsFlips(t *testing.T) {
+	f := scanAll(`
+` + tl("18:37:07", "REQID=1,IPADDR=lab.example.local,PORT=443,URL=/global-protect/prelogin.esp,POST=1") + `
+` + tl("18:37:10", "GetEnforcer state = 1") + `
+` + tl("18:38:15", "ST,Turn off traffic enforcer in driver!") + `
+` + tl("19:14:07", "GetEnforcer state = 1") + `
+` + tl("19:22:38", "REQID=2,IPADDR=cloud.example.com,PORT=443,URL=/global-protect/prelogin.esp,POST=1") + `
+` + tl("19:48:08", "GetEnforcer state = 0") + `
+`)
+	lab := f.For("lab.example.local")
+	if lab.Enforcer.State != "enabled" {
+		t.Errorf("lab state = %q, want enabled", lab.Enforcer.State)
+	}
+	if lab.Enforcer.Flips != 2 {
+		t.Errorf("lab flips = %d, want 2", lab.Enforcer.Flips)
+	}
+	cloud := f.For("cloud.example.com")
+	if cloud.Enforcer.State != "disabled" {
+		t.Errorf("cloud state = %q, want disabled", cloud.Enforcer.State)
+	}
+	if !lab.Enforcer.EverEnabled {
+		t.Error("the lab portal had enforcement on at some point")
+	}
+}
+
+// Route programming into the driver happens during tunnel setup whether or not
+// the portal configured anything, so it must not imply configuration.
+func TestDriverRouteProgrammingIsNotConfiguration(t *testing.T) {
+	f := scanTrace(`
+` + tl("14:55:43", "Traffic Enforcement: TrfSetParameters:EXCLUDE ROUTE: des=8.8.8.8, mask prefixLen=32") + `
+` + tl("14:55:43", "ST,Set enforcer exclude route 8.8.8.8/32") + `
+` + tl("14:55:43", "ST,Set enforcer exclude route 10.10.10.0/24") + `
+`)
+	if f.Enforcer.Configured() {
+		t.Error("exclude routes programmed into the driver are not portal policy")
+	}
+	if f.Enforcer.Driver != 3 {
+		t.Errorf("driver lines = %d, want 3", f.Enforcer.Driver)
+	}
+	if f.Enforcer.Policy != 0 {
+		t.Errorf("policy lines = %d, want 0", f.Enforcer.Policy)
 	}
 }

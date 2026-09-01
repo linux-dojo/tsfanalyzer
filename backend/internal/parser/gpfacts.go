@@ -113,20 +113,48 @@ func (p GPPrelogin) ClientCert() bool { return strings.TrimSpace(p.CCUsername) !
 // So only explicit statements of state count, the last one wins, and
 // configuration is recorded separately as configuration.
 type GPEnforcer struct {
-	// State is "enabled", "disabled" or "unknown". Unknown is a real and
-	// common answer: a collection can carry exception configuration without
-	// ever stating whether enforcement is on.
+	// State is "enabled", "disabled" or "unknown", as of the last statement
+	// made while this portal was in force.
 	State string    `json:"state"`
 	At    time.Time `json:"at,omitempty"`
 	// Deciding is the line that settled it, so the answer is checkable.
 	Deciding string `json:"deciding,omitempty"`
-	// Configured counts exception lines seen. It says the portal pushed
-	// enforcer configuration; it does not say enforcement is active.
-	Configured int      `json:"configured,omitempty"`
+	// EverEnabled and Flips describe a state that moves. On a machine that
+	// connects and disconnects repeatedly the enforcer is switched on and off
+	// with it, so a single yes/no taken from the end of the log says more about
+	// when the collection was gathered than about the configuration.
+	EverEnabled bool `json:"ever_enabled,omitempty"`
+	Flips       int  `json:"flips,omitempty"`
+
+	// Policy counts exception lines that carry actual content pushed by this
+	// portal. Driver counts route programming into the driver, which happens
+	// during tunnel setup whether or not the portal configured anything.
+	// Keeping them apart is what makes "configured on this portal" answerable.
+	Policy int `json:"policy,omitempty"`
+	Driver int `json:"driver,omitempty"`
+
+	// The lists themselves, which are the substance of the configuration.
+	IPExceptions []string `json:"ip_exceptions,omitempty"`
+	FQDNs        []string `json:"fqdns,omitempty"`
+
 	Exceptions int      `json:"exceptions,omitempty"`
 	Domains    int      `json:"domains,omitempty"`
 	Wildcards  int      `json:"wildcards,omitempty"`
 	Evidence   []string `json:"evidence,omitempty"`
+}
+
+// Configured reports whether this portal pushed enforcer policy.
+//
+// Only content-bearing lines count. The agent also re-logs summary counts —
+// "enforcer exception: 3 fqdn entries", "parsed 0 single and 3 wildcard" —
+// which describe whatever is currently loaded, so they survive a switch to a
+// portal that configured nothing. In the two-portal sample the lab portal
+// pushes "enforcer ip exception is 8.8.8.8,..." and an FQDN list while the
+// Prisma portal pushes neither, yet both log the summary counts; counting
+// those would report the Prisma portal as configured, which is the bug this
+// distinction exists to prevent.
+func (e GPEnforcer) Configured() bool {
+	return len(e.IPExceptions) > 0 || len(e.FQDNs) > 0 || e.Exceptions > 0
 }
 
 // Present reports whether enforcement is actually on.
@@ -206,17 +234,40 @@ func (c GPGatewayConfig) SplitTunnel() bool {
 	return len(c.AccessRoutes) > 0
 }
 
-// GPFacts is everything gathered from the service trace.
-type GPFacts struct {
+// GPPortalFacts is everything the trace says while one portal was in force.
+//
+// These facts are portal-scoped in reality and were previously collected
+// collection-wide, so switching portal in the UI changed nothing: a lab
+// portal's enforcer lists and gateway configuration were shown under a Prisma
+// portal that had pushed neither.
+type GPPortalFacts struct {
+	Portal         string            `json:"portal"`
 	Enforcer       GPEnforcer        `json:"enforcer"`
 	HostDetection  GPHostDetection   `json:"host_detection"`
 	CertChecks     []GPCertCheck     `json:"cert_checks,omitempty"`
 	Prelogins      []GPPrelogin      `json:"prelogins,omitempty"`
 	GatewayConfigs []GPGatewayConfig `json:"gateway_configs,omitempty"`
-	// Stages are the "----X starts----" boundaries, in order. They are the
-	// authoritative stage sequence: the event log describes what happened,
-	// these say which step the agent believed it was on.
-	Stages []GPTraceStage `json:"stages,omitempty"`
+	Stages         []GPTraceStage    `json:"stages,omitempty"`
+}
+
+// GPFacts is the trace split by portal, plus a merged view for when no portal
+// is selected.
+type GPFacts struct {
+	All     GPPortalFacts   `json:"all"`
+	Portals []GPPortalFacts `json:"portals,omitempty"`
+}
+
+// For returns the facts for one portal, or the merged view when the name is
+// empty or unknown.
+func (f *GPFacts) For(portal string) GPPortalFacts {
+	if portal != "" {
+		for _, p := range f.Portals {
+			if p.Portal == portal {
+				return p
+			}
+		}
+	}
+	return f.All
 }
 
 // GPTraceStage is one "----X starts----" boundary from the service trace.
@@ -227,7 +278,7 @@ type GPTraceStage struct {
 }
 
 // CertFailures returns only the checks that actually stopped a pre-login.
-func (f GPFacts) CertFailures() []GPCertCheck {
+func (f GPPortalFacts) CertFailures() []GPCertCheck {
 	var out []GPCertCheck
 	for _, c := range f.CertChecks {
 		if c.Failed {
@@ -270,14 +321,31 @@ var (
 		`getenforcer state = [1-9]\d*\b|` +
 		`enforcer is enabled(?:\.|$|[^)])`)
 
-	// Configuration, counted but never treated as evidence of enforcement.
-	gpEnforcerCfgRe = regexp.MustCompile(`(?i)` +
-		`enforcer exception|` +
+	// Configuration, counted but never treated as evidence of enforcement,
+	// and split by whether it carries content.
+	//
+	// gpEnforcerPolicyRe is the portal pushing a list. gpEnforcerDriverRe is
+	// the agent programming routes into the driver during tunnel setup, which
+	// happens regardless. The summary lines ("N fqdn entries", "parsed N
+	// single and M wildcard") are deliberately in neither: they restate what
+	// is already loaded and therefore follow the agent across a portal switch.
+	gpEnforcerPolicyRe = regexp.MustCompile(`(?i)` +
+		`enforcer ip exception is\s+\S|` +
+		`enforcer exception: fqdn is\s+\S|` +
+		`enforcer set exceptions \d+|` +
+		`enforcer exception ipv\d`)
+	gpEnforcerDriverRe = regexp.MustCompile(`(?i)` +
 		`set enforcer exclude route|` +
-		`enforcer ip exception|` +
 		`traffic enforcement:`)
-	// ...except the lines that announce an *empty* list, which say the
-	// opposite and must not be counted as configuration either.
+	gpEnforcerSummaryRe = regexp.MustCompile(`(?i)` +
+		`enforcer exception: \d+ fqdn entries|` +
+		`parsed \d+ single and \d+ wildcard`)
+	gpEnforcerIPListRe   = regexp.MustCompile(`(?i)enforcer ip exception is\s+(\S+)`)
+	gpEnforcerFQDNListRe = regexp.MustCompile(`(?i)enforcer exception: fqdn is\s+(\S+)`)
+
+	// Lines that announce an *absent* list. They mention the enforcer and look
+	// like configuration, but say the opposite, so they are excluded before
+	// any of the counting above.
 	gpEnforcerEmptyRe = regexp.MustCompile(`(?i)` +
 		`no enforcer ip exception list defined|` +
 		`no fqdn ist defined|` + // the agent's own spelling
@@ -370,22 +438,49 @@ func ExtractGPFacts(r io.ReadSeeker) (*GPFacts, error) {
 // newGPFactScan starts a scan with the enforcer unknown rather than absent:
 // "we were never told" and "it is off" are different answers.
 func newGPFactScan() *gpFactScan {
-	return &gpFactScan{facts: &GPFacts{Enforcer: GPEnforcer{State: "unknown"}}}
+	return &gpFactScan{facts: &GPFacts{}, byPortal: map[string]*GPPortalFacts{}}
 }
 
-// gpFactScan folds the trace into GPFacts. It is a small state machine because
-// several of these facts are spread over consecutive lines: the host-detection
-// IP, hostname, query and result are four separate lines, and a certificate
-// check is only interpretable once you know whether a pre-login followed it.
+// gpFactScan folds the trace into GPFacts, keeping one set of facts per portal
+// as well as a merged one.
+//
+// Portal scoping is the point. The enforcer lists, the internal host detection
+// result and the gateway configuration all come from whichever portal the
+// agent is talking to, and a collection can hold several. Collecting them
+// collection-wide made the portal selector inert and showed one portal's
+// configuration under another portal's name.
+//
+// It is a state machine because several facts span consecutive lines: the
+// host-detection IP, hostname, query and result are four separate lines, and a
+// certificate check is only interpretable once you know whether a pre-login
+// followed it.
 type gpFactScan struct {
 	facts *GPFacts
 
-	portal string
-	// pendingCert indexes into facts.CertChecks for checks not yet resolved.
+	// portal is the address of the last portal a pre-login was sent to, and it
+	// scopes everything that follows until the next one.
+	portal   string
+	order    []string
+	byPortal map[string]*GPPortalFacts
+
+	// pendingCert indexes into the current portal's CertChecks.
 	pendingCert []int
 	// partial host detection being assembled
 	ihdIP, ihdHost, ihdLookup string
 	ihdAt                     time.Time
+}
+
+// cur returns the fact set for the portal in force. Lines logged before any
+// pre-login belong to no portal; they land in a nameless bucket that is merged
+// into the overall view but never offered as a selectable portal.
+func (s *gpFactScan) cur() *GPPortalFacts {
+	pf, ok := s.byPortal[s.portal]
+	if !ok {
+		pf = &GPPortalFacts{Portal: s.portal, Enforcer: GPEnforcer{State: "unknown"}}
+		s.byPortal[s.portal] = pf
+		s.order = append(s.order, s.portal)
+	}
+	return pf
 }
 
 func (s *gpFactScan) feed(lines []string) {
@@ -428,11 +523,38 @@ func gpTraceParts(line string) (time.Time, string, bool) {
 func (s *gpFactScan) line(ts time.Time, msg string, all []string, idx int) {
 	trimmed := strings.TrimSpace(msg)
 
+	// The portal in force scopes everything below it, so it is established
+	// first. The pre-login request line is the one unambiguous place the
+	// address appears.
+	if m := gpReqPortalRe.FindStringSubmatch(trimmed); m != nil && gpPreloginSentRe.MatchString(trimmed) {
+		// carry any unresolved certificate check across to the named portal
+		pending := s.pendingCert
+		var carried []GPCertCheck
+		if old := s.byPortal[s.portal]; old != nil {
+			for _, i := range pending {
+				carried = append(carried, old.CertChecks[i])
+			}
+			old.CertChecks = old.CertChecks[:len(old.CertChecks)-len(carried)]
+		}
+		s.portal = m[1]
+		s.pendingCert = s.pendingCert[:0]
+		pf := s.cur()
+		for _, c := range carried {
+			c.Portal = s.portal
+			pf.CertChecks = append(pf.CertChecks, c)
+			s.pendingCert = append(s.pendingCert, len(pf.CertChecks)-1)
+		}
+		s.resolvePending(true)
+		return
+	}
+
+	pf := s.cur()
+
 	// stage boundaries
 	if m := gpTraceStartRe.FindStringSubmatch(trimmed); m != nil {
 		name := m[1]
 		st := traceStageOf(name)
-		s.facts.Stages = append(s.facts.Stages, GPTraceStage{At: ts, Name: name, Stage: st})
+		pf.Stages = append(pf.Stages, GPTraceStage{At: ts, Name: name, Stage: st})
 		if st == StagePortalPrelogin {
 			// a new pre-login means any earlier check never led anywhere
 			s.resolvePending(false)
@@ -450,68 +572,74 @@ func (s *gpFactScan) line(ts time.Time, msg string, all []string, idx int) {
 				break
 			}
 		}
-		s.facts.CertChecks = append(s.facts.CertChecks, c)
-		s.pendingCert = append(s.pendingCert, len(s.facts.CertChecks)-1)
+		pf.CertChecks = append(pf.CertChecks, c)
+		s.pendingCert = append(s.pendingCert, len(pf.CertChecks)-1)
 		return
 	}
 	if gpCertSkipRe.MatchString(trimmed) {
 		for _, i := range s.pendingCert {
-			s.facts.CertChecks[i].Skipped = true
+			pf.CertChecks[i].Skipped = true
 		}
 		return
 	}
-	if m := gpReqPortalRe.FindStringSubmatch(trimmed); m != nil && gpPreloginSentRe.MatchString(trimmed) {
-		s.portal = m[1]
-		for _, i := range s.pendingCert {
-			s.facts.CertChecks[i].Portal = s.portal
-		}
-	}
-	if gpPreloginResultRe.MatchString(trimmed) || gpPreloginSentRe.MatchString(trimmed) {
-		s.resolvePending(true)
-	}
 	if gpPreloginResultRe.MatchString(trimmed) {
+		s.resolvePending(true)
 		s.readPreloginResponse(ts, all, idx)
 		return
 	}
 
 	// enforcer: state statements first, and they are the only thing that
-	// decides it. The last statement wins, since the enforcer can be turned
-	// on or off during the life of the log.
+	// decides it. The last statement while this portal was in force wins.
 	if gpEnforcerOffRe.MatchString(trimmed) {
-		e := &s.facts.Enforcer
-		e.State, e.At, e.Deciding = "disabled", ts, trimmed
+		s.setEnforcer(pf, "disabled", ts, trimmed)
 		return
 	}
 	if gpEnforcerOnRe.MatchString(trimmed) {
-		e := &s.facts.Enforcer
-		e.State, e.At, e.Deciding = "enabled", ts, trimmed
+		s.setEnforcer(pf, "enabled", ts, trimmed)
 		return
 	}
-	if gpEnforcerCfgRe.MatchString(trimmed) && !gpEnforcerEmptyRe.MatchString(trimmed) {
-		e := &s.facts.Enforcer
-		e.Configured++
-		if len(e.Evidence) < 5 {
-			e.Evidence = append(e.Evidence, trimmed)
+	if !gpEnforcerEmptyRe.MatchString(trimmed) {
+		e := &pf.Enforcer
+		switch {
+		case gpEnforcerPolicyRe.MatchString(trimmed):
+			e.Policy++
+			if len(e.Evidence) < 6 {
+				e.Evidence = append(e.Evidence, trimmed)
+			}
+			if m := gpEnforcerIPListRe.FindStringSubmatch(trimmed); m != nil {
+				e.IPExceptions = addOnce(e.IPExceptions, m[1])
+			}
+			if m := gpEnforcerFQDNListRe.FindStringSubmatch(trimmed); m != nil {
+				e.FQDNs = addOnce(e.FQDNs, m[1])
+			}
+			if m := gpEnforcerCountRe.FindStringSubmatch(trimmed); m != nil {
+				e.Exceptions = atoiSafe(m[2]) - atoiSafe(m[1]) + 1
+			}
+			return
+		case gpEnforcerDriverRe.MatchString(trimmed):
+			e.Driver++
+			return
+		case gpEnforcerSummaryRe.MatchString(trimmed):
+			// A restatement of what is already loaded, not a push from this
+			// portal — see GPEnforcer.Configured. Recorded for the counts it
+			// carries, but it never marks a portal as configured.
+			if m := gpEnforcerDomRe.FindStringSubmatch(trimmed); m != nil && e.Policy > 0 {
+				e.Domains, e.Wildcards = atoiSafe(m[1]), atoiSafe(m[2])
+			}
+			return
 		}
-		if m := gpEnforcerCountRe.FindStringSubmatch(trimmed); m != nil {
-			e.Exceptions = atoiSafe(m[2]) - atoiSafe(m[1]) + 1
-		}
-		if m := gpEnforcerDomRe.FindStringSubmatch(trimmed); m != nil {
-			e.Domains, e.Wildcards = atoiSafe(m[1]), atoiSafe(m[2])
-		}
-		return
 	}
 
 	// internal host detection
 	switch {
 	case gpIHDNoneRe.MatchString(trimmed):
-		if !s.facts.HostDetection.Configured {
-			s.facts.HostDetection.Detail = trimmed
-			s.facts.HostDetection.At = ts
+		if !pf.HostDetection.Configured {
+			pf.HostDetection.Detail = trimmed
+			pf.HostDetection.At = ts
 		}
 		return
 	case gpIHDNoV6Re.MatchString(trimmed):
-		s.facts.HostDetection.IPv6 = false
+		pf.HostDetection.IPv6 = false
 		return
 	}
 	if m := gpIHDIPRe.FindStringSubmatch(trimmed); m != nil {
@@ -529,7 +657,7 @@ func (s *gpFactScan) line(ts time.Time, msg string, all []string, idx int) {
 	if m := gpIHDResultRe.FindStringSubmatch(trimmed); m != nil {
 		// error 0 is a successful detection; anything else means the agent
 		// could not confirm it is inside the network
-		h := &s.facts.HostDetection
+		h := &pf.HostDetection
 		h.Configured = true
 		h.IP, h.Host, h.Lookup = s.ihdIP, s.ihdHost, s.ihdLookup
 		h.Resolved, h.Err = m[1], m[2]
@@ -542,15 +670,44 @@ func (s *gpFactScan) line(ts time.Time, msg string, all []string, idx int) {
 
 	// gateway configuration
 	if m := gpGatewayCfgRe.FindStringSubmatch(trimmed); m != nil {
-		s.facts.GatewayConfigs = append(s.facts.GatewayConfigs,
-			parseGatewayConfig(m[1], ts, all, idx))
+		pf.GatewayConfigs = append(pf.GatewayConfigs, parseGatewayConfig(m[1], ts, all, idx))
 		return
 	}
 }
 
+// setEnforcer records a state statement, counting how often the state moves.
+func (s *gpFactScan) setEnforcer(pf *GPPortalFacts, state string, ts time.Time, line string) {
+	e := &pf.Enforcer
+	if e.State != "unknown" && e.State != state {
+		e.Flips++
+	}
+	if state == "enabled" {
+		e.EverEnabled = true
+	}
+	e.State, e.At, e.Deciding = state, ts, line
+}
+
+// addOnce keeps a list of distinct values in the order first seen.
+func addOnce(list []string, v string) []string {
+	for _, x := range list {
+		if x == v {
+			return list
+		}
+	}
+	return append(list, v)
+}
+
 func (s *gpFactScan) resolvePending(proceeded bool) {
+	pf := s.byPortal[s.portal]
+	if pf == nil {
+		s.pendingCert = s.pendingCert[:0]
+		return
+	}
 	for _, i := range s.pendingCert {
-		c := &s.facts.CertChecks[i]
+		if i >= len(pf.CertChecks) {
+			continue
+		}
+		c := &pf.CertChecks[i]
 		c.Proceeded = proceeded
 		// Only a check that was neither skipped nor followed by a pre-login is
 		// a failure. See the note on GPCertCheck: the raw code is not enough.
@@ -559,7 +716,67 @@ func (s *gpFactScan) resolvePending(proceeded bool) {
 	s.pendingCert = s.pendingCert[:0]
 }
 
-func (s *gpFactScan) close() { s.resolvePending(false) }
+// close finishes the scan and assembles the per-portal and merged views.
+func (s *gpFactScan) close() {
+	s.resolvePending(false)
+
+	for _, name := range s.order {
+		pf := s.byPortal[name]
+		// The nameless bucket holds lines logged before any pre-login. It is
+		// merged into the overall view but is not a portal anyone can select.
+		if name != "" {
+			s.facts.Portals = append(s.facts.Portals, *pf)
+		}
+		s.mergeInto(&s.facts.All, pf)
+	}
+	if s.facts.All.Enforcer.State == "" {
+		s.facts.All.Enforcer.State = "unknown"
+	}
+}
+
+// mergeInto folds one portal's facts into the collection-wide view, which is
+// what the UI shows when no portal is selected. Later statements win, exactly
+// as they do within a portal.
+func (s *gpFactScan) mergeInto(dst, src *GPPortalFacts) {
+	dst.CertChecks = append(dst.CertChecks, src.CertChecks...)
+	dst.Prelogins = append(dst.Prelogins, src.Prelogins...)
+	dst.GatewayConfigs = append(dst.GatewayConfigs, src.GatewayConfigs...)
+	dst.Stages = append(dst.Stages, src.Stages...)
+
+	e, se := &dst.Enforcer, src.Enforcer
+	if se.State != "unknown" && se.State != "" {
+		if e.State != "unknown" && e.State != "" && e.State != se.State {
+			e.Flips++
+		}
+		e.State, e.At, e.Deciding = se.State, se.At, se.Deciding
+	}
+	e.EverEnabled = e.EverEnabled || se.EverEnabled
+	e.Flips += se.Flips
+	e.Policy += se.Policy
+	e.Driver += se.Driver
+	for _, v := range se.IPExceptions {
+		e.IPExceptions = addOnce(e.IPExceptions, v)
+	}
+	for _, v := range se.FQDNs {
+		e.FQDNs = addOnce(e.FQDNs, v)
+	}
+	if se.Exceptions > e.Exceptions {
+		e.Exceptions = se.Exceptions
+	}
+	if se.Domains > 0 || se.Wildcards > 0 {
+		e.Domains, e.Wildcards = se.Domains, se.Wildcards
+	}
+	for _, ev := range se.Evidence {
+		if len(e.Evidence) < 6 {
+			e.Evidence = append(e.Evidence, ev)
+		}
+	}
+	if src.HostDetection.Configured && !dst.HostDetection.Configured {
+		dst.HostDetection = src.HostDetection
+	} else if dst.HostDetection.Detail == "" {
+		dst.HostDetection.Detail = src.HostDetection.Detail
+	}
+}
 
 // readPreloginResponse collects the XML that follows the "prelogin to portal
 // result is" line. The body is written as continuation lines with no trace
@@ -577,7 +794,8 @@ func (s *gpFactScan) readPreloginResponse(ts time.Time, all []string, idx int) {
 	p.AutoSubmit = tagValue(body, "autosubmit")
 	p.UsernameLabel = tagValue(body, "username-label")
 	if p.Status != "" || p.ConnectedIP != "" {
-		s.facts.Prelogins = append(s.facts.Prelogins, p)
+		pf := s.cur()
+		pf.Prelogins = append(pf.Prelogins, p)
 	}
 }
 

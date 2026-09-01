@@ -62,6 +62,11 @@ type LogPageStats struct {
 	// First and Last bound the timestamps actually present.
 	First string `json:"first,omitempty"`
 	Last  string `json:"last,omitempty"`
+	// Structured marks a file of one-record-per-line JSON. Those records are
+	// long and wrap over many display rows, so the viewer bands them in
+	// alternating colours; without it there is no way to see where one record
+	// ends and the next begins.
+	Structured bool `json:"structured,omitempty"`
 }
 
 // StructureLogPage returns one page of entries in range, plus the in-range
@@ -84,10 +89,12 @@ func StructureLogPageStats(r io.Reader, from, to time.Time, offset, limit int) (
 	if looksLikeGPLog(head) {
 		everything = StructureGPLog(rest, time.Time{}, time.Time{})
 	} else {
-		everything = StructureLog(rest, time.Time{}, time.Time{})
+		// The year-less formats (syslog, and JSON logs whose "time" is
+		// "Jul 14 01:31:52") borrow the year from elsewhere in the same file.
+		everything = StructureLogYear(rest, time.Time{}, time.Time{}, looseYearHint(head))
 	}
 
-	st := LogPageStats{FileTotal: len(everything)}
+	st := LogPageStats{FileTotal: len(everything), Structured: jsonLinesLog(head)}
 	for _, e := range everything {
 		if e.Ts == "" {
 			continue
@@ -167,7 +174,20 @@ func normalizeLogTs(ts string) string {
 // entries. Every line inherits the timestamp of its enclosing "--- <proc>"
 // block and a label derived from the section headers inside the block.
 // from/to bounds (zero = open) filter on the inherited timestamp.
+// StructureLog converts a log into labelled, timestamped entries.
+//
+// yearHint is used only by the year-less formats parseLooseTs handles.
 func StructureLog(r io.Reader, from, to time.Time) []LogEntry {
+	return structureLog(r, from, to, 0, false)
+}
+
+// StructureLogYear is StructureLog with a year for the formats that omit one,
+// and a flag marking a structured-record file so the viewer can band its rows.
+func StructureLogYear(r io.Reader, from, to time.Time, yearHint int) []LogEntry {
+	return structureLog(r, from, to, yearHint, false)
+}
+
+func structureLog(r io.Reader, from, to time.Time, yearHint int, _ bool) []LogEntry {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
@@ -218,6 +238,24 @@ func StructureLog(r io.Reader, from, to time.Time) []LogEntry {
 		if m := leadTsRe.FindStringSubmatch(trimmed); m != nil {
 			if t, ok := parseTs(m[1] + " " + m[2]); ok {
 				ts, haveTs = t, true
+			}
+		} else if t, ok := parseLooseTs(line, yearHint); ok {
+			// One of the many other shapes: syslog, ctime, JSON "time", redis,
+			// nginx, a fixed-width row with the timestamp on the right. 68 of
+			// the 327 log files in a PA-5250 archive had no recognised
+			// timestamp at all before this, which left them invisible to the
+			// time filter.
+			ts, haveTs = t, true
+			// The hint tracks rather than latches. reboot.log alternates
+			// between lines that carry a year ("Unkown reboot at Wed Mar 12
+			// 08:20:21 PDT 2025") and lines that do not ("UI Initiated at Mar
+			// 13 10:59:48"), and it spans March 2025 to August 2026 — so one
+			// year fixed for the whole file would be wrong for most of it.
+			// Each year-bearing line updates the hint the year-less ones use.
+			if y := explicitYear(line); y != 0 {
+				yearHint = y
+			} else if yearHint == 0 {
+				yearHint = t.Year()
 			}
 		}
 

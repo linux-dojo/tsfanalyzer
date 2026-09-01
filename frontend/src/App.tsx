@@ -9,7 +9,7 @@ import "dygraphs/dist/dygraph.css";
    ever shows the set that matches what it is — the two archives share almost
    nothing beyond being browsable and searchable. */
 type Tab =
-  | "system" | "logs" | "graphs" | "appstats" | "licenses" | "config"
+  | "anomalies" | "system" | "logs" | "graphs" | "appstats" | "licenses" | "config"
   | "gp-overview" | "gp-connection" | "gp-auth" | "gp-hip" | "gp-anomalies";
 
 interface TsFile {
@@ -89,6 +89,10 @@ interface LogFilesState {
   query: string;
   results: SearchResult[] | null;
   scoped: string[]; // restrict the search to these paths
+  /* A line the user asked to see from somewhere else — a signature finding in
+     the Anomalies tab, say. The log viewer consumes it on mount and clears it,
+     so it fires once rather than every time the tab is revisited. */
+  pendingOpen?: { path: string; line: number };
 }
 
 const logStateCache = new Map<string, LogFilesState>();
@@ -99,7 +103,7 @@ function logStateFor(fileId: string): LogFilesState {
     st = {
       open: false, minimized: false, cwd: "", selected: [], from: "", to: "",
       viewItems: [], maximized: false, fileFilter: "", query: "",
-      results: null, scoped: [],
+      results: null, scoped: [], pendingOpen: undefined,
     };
     logStateCache.set(fileId, st);
     while (logStateCache.size > GRAPH_CACHE_MAX_FILES) {
@@ -111,7 +115,11 @@ function logStateFor(fileId: string): LogFilesState {
   return st;
 }
 
+/* Anomalies leads and is therefore the landing tab, since tabsFor(...)[0] is
+   what a newly opened file selects. It was previously a sub-tab of Graphs,
+   which buried the one view that answers "what is wrong with this box". */
 const FIREWALL_TABS: { id: Tab; label: string }[] = [
+  { id: "anomalies", label: "Anomalies" },
   { id: "system", label: "System Info" },
   { id: "logs", label: "Log Files" },
   { id: "graphs", label: "Graphs" },
@@ -353,6 +361,7 @@ interface GpGateway {
   name?: string;
   ipv4?: string;
   ipv6?: string;
+  portal?: string;
   priority?: number;
   manual?: boolean;
   region_match?: boolean;
@@ -378,6 +387,7 @@ interface GpPortalGateway {
   fqdn: string;
   name?: string;
   ipv4?: string;
+  manual?: boolean;
   priority?: number;
   duration_ms?: number;
   weight?: number;
@@ -469,7 +479,14 @@ interface GpEnforcer {
   state: string;
   at?: string;
   deciding?: string;
-  configured?: number;
+  ever_enabled?: boolean;
+  flips?: number;
+  /* policy = content-bearing lists pushed by this portal; driver = route
+     programming that happens during tunnel setup regardless */
+  policy?: number;
+  driver?: number;
+  ip_exceptions?: string[];
+  fqdns?: string[];
   exceptions?: number;
   domains?: number;
   wildcards?: number;
@@ -501,13 +518,36 @@ interface GpGatewayConfig {
   truncated?: boolean;
 }
 interface GpTraceStage { at: string; name: string; stage: string }
-interface GpFacts {
+/* Facts are portal-scoped: the enforcer lists, the internal host detection
+   result and the gateway configuration all come from whichever portal the
+   agent was talking to. Collecting them collection-wide made the portal
+   selector inert and showed one portal's configuration under another's name. */
+interface GpPortalFacts {
+  portal: string;
   enforcer: GpEnforcer;
   host_detection: GpHostDetection;
   cert_checks?: GpCertCheck[];
   prelogins?: GpPrelogin[];
   gateway_configs?: GpGatewayConfig[];
   stages?: GpTraceStage[];
+}
+interface GpFacts {
+  all: GpPortalFacts;
+  portals?: GpPortalFacts[];
+}
+
+/* Pick the selected portal's facts, falling back to the merged view. */
+function factsFor(facts: GpFacts | null, portal: string): GpPortalFacts | null {
+  if (!facts) return null;
+  if (portal) {
+    const hit = facts.portals?.find((p) => p.portal === portal);
+    if (hit) return hit;
+    /* A portal the selector offers but the trace never named cannot borrow
+       another portal's configuration — that is the bug being fixed — so it
+       reports nothing rather than something wrong. */
+    if (facts.portals?.length) return null;
+  }
+  return facts.all ?? null;
 }
 
 interface GpData {
@@ -584,7 +624,7 @@ function hipPortalNote(data: GpData, portal: string): string {
    dozens of certificate alarms on connections that worked, which is how an
    anomalies tab stops being read. */
 function GpCertAnomaly({ facts, portal }: { facts: GpFacts | null; portal: string }) {
-  const certs = (facts?.cert_checks ?? []).filter((c) => !portal || c.portal === portal);
+  const certs = factsFor(facts, portal)?.cert_checks ?? [];
   const failed = certs.filter((c) => c.failed);
   if (!certs.length) return null;
   if (!failed.length) {
@@ -1247,7 +1287,7 @@ function GpOverviewTab({ fileId, portal, setPortal }: GpTabProps) {
           </section>
         ))}
       </div>
-      <GpPosture facts={data.facts} />
+      <GpPosture facts={data.facts} portal={portal} />
       <GpGatewayConfigs facts={data.facts} portal={portal} />
     </div>
   );
@@ -1264,11 +1304,25 @@ function GpOverviewTab({ fileId, portal, setPortal }: GpTabProps) {
    sends it out to an external gateway instead, which is a genuinely confusing
    state to debug, so the query and its error code are shown rather than a bare
    yes/no. */
-function GpPosture({ facts }: { facts: GpFacts | null }) {
-  if (!facts) return null;
-  const e = facts.enforcer;
-  const h = facts.host_detection;
-  const certs = facts.cert_checks ?? [];
+function GpPosture({ facts, portal }: { facts: GpFacts | null; portal: string }) {
+  const pf = factsFor(facts, portal);
+  if (!pf) {
+    return (
+      <p className="muted">
+        The service trace never names this portal, so none of the enforcer,
+        host-detection or certificate detail below can be attributed to it.
+      </p>
+    );
+  }
+  const e = pf.enforcer;
+  const h = pf.host_detection;
+  const certs = pf.cert_checks ?? [];
+  // A portal is configured if it sent content, not if the agent merely
+  // restated counts it was already holding from a previous portal.
+  const configured =
+    (e.ip_exceptions?.length ?? 0) > 0 ||
+    (e.fqdns?.length ?? 0) > 0 ||
+    (e.exceptions ?? 0) > 0;
   const failed = certs.filter((c) => c.failed);
   const codes = [...new Set(certs.map((c) => c.code))];
 
@@ -1282,59 +1336,68 @@ function GpPosture({ facts }: { facts: GpFacts | null }) {
             is on, and reading those lines as evidence is how this card
             previously reported both sample bundles as enforced when the
             service had logged "GetEnforcer disabled" 132 times. */}
-        <p className={e.state === "enabled" ? "gp-no" : e.state === "disabled" ? "gp-yes" : "muted"}>
-          {e.state === "enabled" ? "Enabled" : e.state === "disabled" ? "Not enabled" : "Not stated in these logs"}
+        {/* Two separate questions, and conflating them is what made this
+            card wrong across portals.
+
+            "Did this portal push enforcer policy?" is answered by the lists it
+            sent. "Is enforcement switched on?" is a driver state that flips as
+            the machine connects and disconnects — in the two-portal sample it
+            moved six times — so a single yes/no taken from the end of the log
+            says more about when the collection was gathered than about the
+            configuration. */}
+        <p className={configured ? "gp-no" : "gp-yes"}>
+          {configured ? "Configured on this portal" : "Not configured on this portal"}
         </p>
-        {e.state === "enabled" && (
-          <p className="muted">
-            Traffic is blocked while the agent is disconnected, so a failed
-            connection costs this endpoint its access, not just its tunnel.
-          </p>
-        )}
-        {e.state === "unknown" && (
-          <p className="muted">
-            No line in the service trace states whether enforcement is on.
-            Exception configuration alone does not settle it.
-          </p>
-        )}
-        {e.deciding && (
-          <table className="kv">
-            <tbody>
-              <tr>
-                <th>Decided by</th>
-                <td><code className="gp-decide">{e.deciding}</code></td>
-              </tr>
-            </tbody>
-          </table>
-        )}
-        {!!e.configured && (
-          <>
-            <p className="muted">
-              {e.configured.toLocaleString()} enforcer exception line
-              {e.configured === 1 ? "" : "s"} — IP ranges, FQDNs, applications or
-              exclude routes pushed to the driver. This is configuration; it is
-              present whether or not enforcement is switched on.
-            </p>
-            <table className="kv">
-              <tbody>
-                {!!e.exceptions && (
-                  <tr><th>Exception entries</th><td>{e.exceptions.toLocaleString()}</td></tr>
-                )}
-                {(!!e.domains || !!e.wildcards) && (
-                  <tr>
-                    <th>Domain entries</th>
-                    <td>{e.domains ?? 0} single, {e.wildcards ?? 0} wildcard</td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-            {!!e.evidence?.length && (
-              <details className="gp-details">
-                <summary>Configuration lines</summary>
-                <pre className="gp-pre">{e.evidence.join("\n")}</pre>
-              </details>
+        <table className="kv">
+          <tbody>
+            <tr>
+              <th>Enforcement</th>
+              <td>
+                {e.state === "enabled" ? "on" : e.state === "disabled" ? "off" : "never stated"}
+                {e.state !== "unknown" && " at the end of these logs"}
+                {!!e.flips && ` · switched ${e.flips} time${e.flips === 1 ? "" : "s"}`}
+                {e.state !== "enabled" && e.ever_enabled && " · was on earlier"}
+              </td>
+            </tr>
+            {e.deciding && (
+              <tr><th>Decided by</th><td><code className="gp-decide">{e.deciding}</code></td></tr>
             )}
-          </>
+            {!!e.ip_exceptions?.length && (
+              <tr>
+                <th>IP exceptions</th>
+                <td>{e.ip_exceptions.map((x) => <div key={x}><code>{x}</code></div>)}</td>
+              </tr>
+            )}
+            {!!e.fqdns?.length && (
+              <tr>
+                <th>FQDN exceptions</th>
+                <td>{e.fqdns.map((x) => <div key={x}><code>{x}</code></div>)}</td>
+              </tr>
+            )}
+            {!!e.exceptions && (
+              <tr><th>Exception entries</th><td>{e.exceptions.toLocaleString()}</td></tr>
+            )}
+            {(!!e.domains || !!e.wildcards) && configured && (
+              <tr><th>Domain entries</th><td>{e.domains ?? 0} single, {e.wildcards ?? 0} wildcard</td></tr>
+            )}
+          </tbody>
+        </table>
+        {configured ? (
+          <p className="muted">
+            Traffic is blocked while the agent is disconnected, except for the
+            addresses above.
+          </p>
+        ) : (
+          <p className="muted">
+            This portal pushed no exception lists.
+            {!!e.driver && ` The ${e.driver.toLocaleString()} "Traffic Enforcement" and exclude-route lines under this portal are the agent programming routes into the driver during tunnel setup, which happens either way.`}
+          </p>
+        )}
+        {!!e.evidence?.length && (
+          <details className="gp-details">
+            <summary>Lines that decided this</summary>
+            <pre className="gp-pre">{e.evidence.join("\n")}</pre>
+          </details>
         )}
       </section>
 
@@ -1415,15 +1478,22 @@ function GpPosture({ facts }: { facts: GpFacts | null }) {
    actually carry. Access routes and exclusions are the part people come here
    for, so they lead. */
 function GpGatewayConfigs({ facts, portal }: { facts: GpFacts | null; portal: string }) {
-  const configs = facts?.gateway_configs ?? [];
   const [sel, setSel] = useState(0);
-  if (!configs.length) return null;
+  // Scoped to the selected portal. The previous version filtered a global list
+  // by a predicate that was always true, so every portal showed every
+  // gateway's configuration — including gateways it never contacted.
+  const configs = factsFor(facts, portal)?.gateway_configs ?? [];
+  if (!configs.length) {
+    return portal ? (
+      <section className="gp-card gp-card-wide">
+        <h3>Gateway configuration</h3>
+        <p className="muted">No gateway pushed a configuration under this portal.</p>
+      </section>
+    ) : null;
+  }
   // Keep the newest configuration per gateway; the agent re-fetches it on
   // every login and the older copies say nothing new.
-  const latest = [...new Map(configs.map((c) => [c.gateway, c])).values()];
-  const shown = portal
-    ? latest.filter((c) => configs.some((x) => x.gateway === c.gateway))
-    : latest;
+  const shown = [...new Map(configs.map((c) => [c.gateway, c])).values()];
   const c = shown[Math.min(sel, shown.length - 1)];
   if (!c) return null;
 
@@ -1633,7 +1703,7 @@ function GpFlow({ data, portal }: { data: GpData; portal: string }) {
       </div>
 
       {data.gateways && data.gateways.gateways.length > 0 && (
-        <GpGateways sel={data.gateways} />
+        <GpGateways sel={data.gateways} portal={portal} />
       )}
     </div>
   );
@@ -1642,10 +1712,34 @@ function GpFlow({ data, portal }: { data: GpData; portal: string }) {
 /* Gateway scoring. The agent's error for every failure here is the same
    unhelpful sentence about the network being unreachable, so the priority,
    region and response-time columns are what actually explain it. */
-function GpGateways({ sel }: { sel: GpGatewaySelection }) {
+function GpGateways({ sel, portal }: { sel: GpGatewaySelection; portal: string }) {
+  /* Each portal publishes its own gateway list. Showing the whole archive's
+     gateways under whichever portal happened to be selected made a lab portal
+     with one manual gateway look like it owned four Prisma Access gateways it
+     had never contacted. */
+  const rows = portal ? sel.gateways.filter((g) => g.portal === portal) : sel.gateways;
+  if (rows.length === 0) {
+    return (
+      <div className="gp-gateways">
+        <h3 className="gp-h3">Gateway selection</h3>
+        <p className="muted">
+          No gateway was offered under this portal in these logs.
+        </p>
+      </div>
+    );
+  }
+  /* The summary counts describe the whole selection, so they only belong on
+     the unfiltered view; a per-portal subset would contradict them. */
+  const showSummary = !portal || rows.length === sel.gateways.length;
   return (
     <div className="gp-gateways">
       <h3 className="gp-h3">Gateway selection</h3>
+      {!showSummary && (
+        <p className="muted">
+          {rows.length} gateway{rows.length === 1 ? "" : "s"} offered by {portal}.
+        </p>
+      )}
+      {showSummary && (
       <p className="muted">
         Selection is {sel.type ?? "unknown"}
         {sel.external_count !== undefined && ` · ${sel.external_count} external`}
@@ -1653,6 +1747,7 @@ function GpGateways({ sel }: { sel: GpGatewaySelection }) {
         {sel.cutoff_secs !== undefined && ` · cutoff ${sel.cutoff_secs}s`}
         {sel.best && ` · chose ${sel.best}`}
       </p>
+      )}
       <table className="gp-gw-table">
         <thead>
           <tr>
@@ -1663,7 +1758,7 @@ function GpGateways({ sel }: { sel: GpGatewaySelection }) {
           </tr>
         </thead>
         <tbody>
-          {sel.gateways.map((g) => (
+          {rows.map((g) => (
             <tr key={g.fqdn} className={g.selected ? "gp-gw-sel" : ""}>
               <td>{g.fqdn}</td>
               <td>{g.name || "—"}</td>
@@ -1795,6 +1890,84 @@ function StatusIcon({ status, error }: { status: string; error?: string }) {
 
 /* ---------- per-file view: sidebar tabs ---------- */
 
+/* A fixed identity strip above every tab.
+
+   Analysis is a lot of tab-switching, and it is easy to end up reading a graph
+   without remembering which of three open tech-support files it belongs to.
+   The banner answers "which box is this" from anywhere, and the fields are the
+   ones that decide how to read everything else: the model and PAN-OS version
+   determine which counters and log formats to expect. It is fetched once per
+   file and cached, so switching tabs does not refetch it. */
+const deviceCache = new Map<string, DeviceIdentity>();
+
+interface DeviceIdentity {
+  hostname?: string;
+  ip?: string;
+  version?: string;
+  model?: string;
+  family?: string;
+  serial?: string;
+}
+
+/* System-info keys vary a little between PAN-OS releases, so each field takes
+   the first key that is present rather than assuming one spelling. */
+const DEVICE_FIELDS: [keyof DeviceIdentity, string[]][] = [
+  ["hostname", ["hostname", "devicename"]],
+  ["ip", ["ip-address", "mgmt-ip", "management-ip"]],
+  ["version", ["sw-version", "panos-version"]],
+  ["model", ["model"]],
+  ["family", ["platform-family", "family", "platform"]],
+  ["serial", ["serial"]],
+];
+
+function DeviceBanner({ fileId }: { fileId: string }) {
+  const [dev, setDev] = useState<DeviceIdentity | null>(deviceCache.get(fileId) ?? null);
+
+  useEffect(() => {
+    if (deviceCache.has(fileId)) return;
+    let live = true;
+    fetch(`/api/v1/files/${fileId}/system-info`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+      .then((d) => {
+        const kv = new Map<string, string>(
+          (d.system_info ?? d.info ?? []).map((e: KV) => [e.key.toLowerCase(), e.value])
+        );
+        const out: DeviceIdentity = {};
+        for (const [field, keys] of DEVICE_FIELDS) {
+          for (const k of keys) {
+            const v = kv.get(k);
+            if (v) { out[field] = v; break; }
+          }
+        }
+        deviceCache.set(fileId, out);
+        if (live) setDev(out);
+      })
+      .catch(() => { /* the banner is context, not content: stay quiet */ });
+    return () => { live = false; };
+  }, [fileId]);
+
+  if (!dev || Object.keys(dev).length === 0) return null;
+
+  const cells: [string, string | undefined][] = [
+    ["Host", dev.hostname],
+    ["Mgmt IP", dev.ip],
+    ["Model", dev.model],
+    ["Platform", dev.family],
+    ["PAN-OS", dev.version],
+    ["Serial", dev.serial],
+  ];
+  return (
+    <div className="dev-banner">
+      {cells.filter(([, v]) => v).map(([k, v]) => (
+        <span key={k} className="dev-cell">
+          <span className="dev-k">{k}</span>
+          <span className="dev-v">{v}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function FileView({ id }: { id: string }) {
   const [file, setFile] = useState<TsFile | null>(null);
   const [tab, setTab] = useState<Tab | null>(null);
@@ -1805,6 +1978,17 @@ function FileView({ id }: { id: string }) {
   // can hold several portals, and mixing their gateways, logins and events
   // together is what made the counts wrong in the first place.
   const [gpPortal, setGpPortal] = useState("");
+
+  /* Jumping from a finding to the line it came from: record the request on the
+     log viewer's own state, then switch tabs. Routing it through that state
+     rather than a prop means the viewer picks it up wherever it is mounted. */
+  const openLogLine = (path: string, line: number) => {
+    const st = logStateFor(id);
+    st.pendingOpen = { path, line };
+    st.open = true;
+    st.maximized = true;
+    setTab("logs");
+  };
 
   useEffect(() => {
     fetch(`/api/v1/files/${id}`)
@@ -1869,8 +2053,10 @@ function FileView({ id }: { id: string }) {
         ))}
       </aside>
       <main className="content">
+        {file?.kind !== "gp-agent" && <DeviceBanner fileId={id} />}
         {tab === "system" && <SystemInfo fileId={id} />}
         {tab === "logs" && <LogFiles fileId={id} />}
+        {tab === "anomalies" && <AnomaliesTab fileId={id} onOpenLine={openLogLine} />}
         {tab === "graphs" && <Graphs fileId={id} />}
         {tab === "appstats" && <AppStatsTab fileId={id} />}
         {tab === "licenses" && <LicensesTab fileId={id} />}
@@ -2193,6 +2379,235 @@ interface AnomalyMark {
   lines: string[];
 }
 
+/* ---------- Anomalies tab ----------
+
+   The landing view. Three things, in the order a reader needs them:
+
+   1. Signature hits — specific lines in named log files that indicate a
+      specific fault. These are concrete ("the RAID array reported False at
+      01:26:50"), so they lead.
+   2. Grouped anomalies — recurring log events and counter threshold breaches,
+      which describe trends rather than incidents.
+   3. Memory / OOM, which was already its own analysis and keeps its own pane.
+
+   Signatures that matched nothing are still listed, quietly. "Checked, clean"
+   and "never looked" are different answers and only the first is reassuring. */
+interface LogFinding {
+  id: string;
+  title: string;
+  severity: string;
+  why?: string;
+  path: string;
+  line: number;
+  ts?: string;
+  text: string;
+}
+interface LogFindingGroup {
+  id: string;
+  title: string;
+  severity: string;
+  why?: string;
+  pattern: string;
+  sample: string;
+  count: number;
+  first?: string;
+  last?: string;
+  files?: string[];
+  events: LogFinding[];
+  truncated?: boolean;
+}
+interface LogSignatureReport {
+  groups: LogFindingGroup[];
+  checked: Record<string, number>;
+  truncated?: Record<string, boolean>;
+}
+
+const SEV_RANK: Record<string, number> = { critical: 0, warning: 1, info: 2 };
+
+function AnomaliesTab({
+  fileId,
+  onOpenLine,
+}: {
+  fileId: string;
+  onOpenLine: (path: string, line: number) => void;
+}) {
+  const [view, setView] = useState<"findings" | "grouped" | "memory">("findings");
+  const [sig, setSig] = useState<LogSignatureReport | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    fetch(`/api/v1/files/${fileId}/anomalies`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((d) => { if (live) setSig(d.signatures ?? null); })
+      .catch((e: Error) => { if (live) setErr(e.message); });
+    return () => { live = false; };
+  }, [fileId]);
+
+  const pane = (v: string) => ({ display: view === v ? "block" : "none" } as const);
+
+  return (
+    <section>
+      <h2>Anomalies</h2>
+      <div className="cfg-subtabs graphs-subtabs">
+        <button className={view === "findings" ? "active" : ""} onClick={() => setView("findings")}>
+          Findings
+        </button>
+        <button className={view === "grouped" ? "active" : ""} onClick={() => setView("grouped")}>
+          Recurring &amp; thresholds
+        </button>
+        <button className={view === "memory" ? "active" : ""} onClick={() => setView("memory")}>
+          Memory / OOM
+        </button>
+      </div>
+      <div style={pane("findings")}>
+        <SignatureFindings sig={sig} err={err} onOpenLine={onOpenLine} />
+      </div>
+      <div style={pane("grouped")}>
+        <AnomaliesView fileId={fileId} visible={view === "grouped"} />
+      </div>
+      <div style={pane("memory")}>
+        <MemoryView fileId={fileId} visible={view === "memory"} />
+      </div>
+    </section>
+  );
+}
+
+/* One row per kind of event with its count; the individual lines live in a
+   drawer, opened on click.
+
+   Grouping is by the *shape* of the matched line rather than by signature,
+   because a signature is too coarse: reboot.log's 29 reboots are 13 UI
+   initiated, 6 from configd restarts exhausted, 5 CLI and 5 unknown — one row
+   saying "System reboot ×29" would hide that the box rebooted itself six
+   times. Five rows say it. */
+function SignatureFindings({
+  sig,
+  err,
+  onOpenLine,
+}: {
+  sig: LogSignatureReport | null;
+  err: string | null;
+  onOpenLine: (path: string, line: number) => void;
+}) {
+  const [open, setOpen] = useState<LogFindingGroup | null>(null);
+
+  if (err) return <p className="error">Could not load: {err}</p>;
+  if (!sig) return <p className="muted">Loading…</p>;
+
+  const groups = sig.groups ?? [];
+  const withHits = new Set(groups.map((g) => g.id));
+  const clean = Object.keys(sig.checked ?? {}).filter((id) => !withHits.has(id));
+  const totals = groups.reduce(
+    (acc, g) => { acc[g.severity] = (acc[g.severity] ?? 0) + g.count; return acc; },
+    {} as Record<string, number>
+  );
+
+  return (
+    <div className={"sig-layout" + (open ? " sig-layout-open" : "")}>
+      <div className="sig-list">
+        {groups.length === 0 ? (
+          <p className="muted">
+            None of the {Object.keys(sig.checked ?? {}).length} signature checks matched.
+          </p>
+        ) : (
+          <>
+            <p className="sig-summary">
+              {(["critical", "warning", "info"] as const)
+                .filter((sv) => totals[sv])
+                .map((sv) => (
+                  <span key={sv} className={"sev-chip sev-" + sv}>
+                    {totals[sv]} {sv}
+                  </span>
+                ))}
+              <span className="muted">
+                {groups.length} distinct {groups.length === 1 ? "issue" : "issues"}
+              </span>
+            </p>
+            <table className="gp-gw-table sig-table">
+              <thead>
+                <tr>
+                  <th>Severity</th><th>Issue</th><th>Event</th>
+                  <th className="sig-num">Count</th><th>First seen</th><th>Last seen</th>
+                </tr>
+              </thead>
+              <tbody>
+                {groups.map((g, i) => (
+                  <tr
+                    key={i}
+                    className={"sig-row" + (open === g ? " sig-row-open" : "")}
+                    onClick={() => setOpen(open === g ? null : g)}
+                    title="Show every matching line"
+                  >
+                    <td><span className={"sev-chip sev-" + g.severity}>{g.severity}</span></td>
+                    <td>{g.title}</td>
+                    <td className="sig-text">{g.pattern}</td>
+                    <td className="sig-num">{g.count.toLocaleString()}</td>
+                    <td className="sig-ts">{g.first || "—"}</td>
+                    <td className="sig-ts">{g.last || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
+        )}
+        {clean.length > 0 && (
+          <p className="muted sig-clean">Checked and clean: {clean.join(", ")}.</p>
+        )}
+      </div>
+
+      {open && (
+        <aside className="sig-drawer">
+          <header>
+            <span className={"sev-chip sev-" + open.severity}>{open.severity}</span>
+            <strong>{open.title}</strong>
+            <button className="view-toggle sig-close" onClick={() => setOpen(null)} title="Close">
+              ✕
+            </button>
+          </header>
+          {open.why && <p className="sig-why">{open.why}</p>}
+          <table className="kv">
+            <tbody>
+              <tr><th>Events</th><td>{open.count.toLocaleString()}</td></tr>
+              {open.first && (
+                <tr><th>Span</th><td>{open.first} → {open.last}</td></tr>
+              )}
+              {!!open.files?.length && (
+                <tr>
+                  <th>Files</th>
+                  <td>{open.files.map((f) => <div key={f} className="sig-path">{f}</div>)}</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+          <h4 className="sig-drawer-h">Matching lines</h4>
+          <ol className="sig-events">
+            {open.events.map((e, i) => (
+              <li key={i}>
+                <button
+                  className="sig-ev-jump"
+                  onClick={() => onOpenLine(e.path, e.line)}
+                  title={`Open ${e.path} at line ${e.line}`}
+                >
+                  <span className="sig-ev-loc">
+                    {e.path.split("/").pop()}:{e.line} &rsaquo;
+                  </span>
+                  <span className="sig-ev-text">{e.text}</span>
+                </button>
+              </li>
+            ))}
+          </ol>
+          {open.truncated && (
+            <p className="muted">
+              Showing the first {open.events.length.toLocaleString()} of {open.count.toLocaleString()}.
+            </p>
+          )}
+        </aside>
+      )}
+    </div>
+  );
+}
+
 function Graphs({ fileId }: { fileId: string }) {
   const cached = graphStateFor(fileId);
   const [view, setViewState] = useState<"counters" | "anomalies" | "memory">(cached.view);
@@ -2200,6 +2615,7 @@ function Graphs({ fileId }: { fileId: string }) {
     graphStateFor(fileId).view = v; // remembered across left-nav navigation
     setViewState(v);
   };
+  void view; void setView; // Graphs now holds only the counter charts
 
   // All three panes stay mounted and are hidden with CSS rather than
   // unmounted, so selected counters, marks, filters and zoom survive
@@ -2216,25 +2632,8 @@ function Graphs({ fileId }: { fileId: string }) {
   return (
     <section>
       <h2>Graphs</h2>
-      <div className="cfg-subtabs graphs-subtabs">
-        <button className={view === "counters" ? "active" : ""} onClick={() => setView("counters")}>
-          Counters
-        </button>
-        <button className={view === "anomalies" ? "active" : ""} onClick={() => setView("anomalies")}>
-          Anomalies
-        </button>
-        <button className={view === "memory" ? "active" : ""} onClick={() => setView("memory")}>
-          Memory / OOM
-        </button>
-      </div>
       <div style={pane("counters")}>
-        <CounterGraphs fileId={fileId} visible={view === "counters"} />
-      </div>
-      <div style={pane("anomalies")}>
-        <AnomaliesView fileId={fileId} visible={view === "anomalies"} />
-      </div>
-      <div style={pane("memory")}>
-        <MemoryView fileId={fileId} visible={view === "memory"} />
+        <CounterGraphs fileId={fileId} visible={true} />
       </div>
     </section>
   );
@@ -4760,25 +5159,6 @@ function splitFieldClause(raw: string): [string, string] {
   return [raw, ""];
 }
 
-/* What to send the backend for a given mode.
-
-   The Go query language already has a /regex/ term that is taken whole rather
-   than tokenized, so regex mode is expressed by wrapping the box contents in
-   slashes. Any unescaped slash inside the pattern has to be escaped first, or
-   it would close the term early. The trailing "| $2 > 10" field clause and the
-   -A/-B/-C flags stay outside the wrapper, since they are not part of the
-   pattern. */
-function asServerQuery(raw: string, mode: SearchMode): string {
-  if (mode !== "regex") return raw;
-  const [body, clause] = splitFieldClause(raw);
-  let pattern = body;
-  let flags = "";
-  // lift the context flags out so they keep working in regex mode
-  pattern = pattern.replace(CONTEXT_FLAG_RE, (m) => { flags += " " + m.trim(); return " "; }).trim();
-  if (!pattern) return raw;
-  const escaped = pattern.replace(/\\.|\//g, (m) => (m === "/" ? "\\/" : m));
-  return `/${escaped}/${flags}${clause ? " |" + clause : ""}`;
-}
 
 function parseLineQuery(rawInput: string, mode: SearchMode = "search"): LineQuery {
   const [raw, clause] = splitFieldClause(rawInput);
@@ -4942,6 +5322,26 @@ function parseLineQuery(rawInput: string, mode: SearchMode = "search"): LineQuer
   return { empty: false, before, after, match: (line) => fn(line.toLowerCase()), ...extras };
 }
 
+/* What to send the backend for a given mode.
+
+   The Go query language already has a /regex/ term that is taken whole rather
+   than tokenized, so regex mode is expressed by wrapping the box contents in
+   slashes. Any unescaped slash inside the pattern has to be escaped first, or
+   it would close the term early. The trailing "| $2 > 10" field clause and the
+   -A/-B/-C flags stay outside the wrapper, since they are not part of the
+   pattern. */
+function asServerQuery(raw: string, mode: SearchMode): string {
+  if (mode !== "regex") return raw;
+  const [body, clause] = splitFieldClause(raw);
+  let pattern = body;
+  let flags = "";
+  // lift the context flags out so they keep working in regex mode
+  pattern = pattern.replace(CONTEXT_FLAG_RE, (m) => { flags += " " + m.trim(); return " "; }).trim();
+  if (!pattern) return raw;
+  const escaped = pattern.replace(/\\.|\//g, (m) => (m === "/" ? "\\/" : m));
+  return `/${escaped}/${flags}${clause ? " |" + clause : ""}`;
+}
+
 /* ---------- Log Files tab ---------- */
 
 function LogFiles({ fileId }: { fileId: string }) {
@@ -5031,6 +5431,21 @@ function LogFiles({ fileId }: { fileId: string }) {
     setViewItems((v) => [...v.filter((it) => it.path !== path), { path, line }]);
     if (maximize) setMaximized(true);
   };
+
+  /* A jump requested from another tab — a signature finding in Anomalies. It
+     is consumed once and cleared, so returning to this tab later does not
+     re-open the same file. */
+  useEffect(() => {
+    const st = logStateFor(fileId);
+    const req = st.pendingOpen;
+    if (!req) return;
+    st.pendingOpen = undefined;
+    setOpen(true);
+    setMinimized(false);
+    setMaximized(true);
+    openFromSearch(req.path, req.line, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  });
 
   const closeViewItem = (path: string) =>
     setViewItems((v) => v.filter((it) => it.path !== path));
@@ -5646,7 +6061,7 @@ function LogContent({
   // File-wide figures that travel with the page, so an empty result can say
   // whether the filter excluded everything or the timestamps were never parsed.
   const [span, setSpan] = useState<
-    { fileTotal: number; timestamped: number; first: string; last: string } | null
+    { fileTotal: number; timestamped: number; first: string; last: string; structured: boolean } | null
   >(null);
   const [offset, setOffset] = useState(() =>
     highlightLine ? Math.floor((highlightLine - 1) / PAGE_LIMIT) * PAGE_LIMIT : 0
@@ -5750,6 +6165,7 @@ function LogContent({
             timestamped: Number(d.timestamped) || 0,
             first: String(d.first ?? ""),
             last: String(d.last ?? ""),
+            structured: !!d.structured,
           });
         })
         .catch(() => setErr("Could not load file."));
@@ -6073,7 +6489,12 @@ function LogContent({
                   className={
                     "vt-row" +
                     (r.entryIdx === hlEntryIdx && r.first ? " hl-vt" : "") +
-                    (!query.empty && !r.match ? " vt-ctx" : "")
+                    (!query.empty && !r.match ? " vt-ctx" : "") +
+                    /* One structured record wraps over several display rows,
+                       so the banding follows the record rather than the row —
+                       otherwise the stripes cut through the middle of a
+                       message and make it harder to read, not easier. */
+                    (span?.structured ? (r.entryIdx % 2 ? " vt-rec-b" : " vt-rec-a") : "")
                   }
                 >
                   <span className="lt-ts">{r.ts}</span>

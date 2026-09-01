@@ -45,6 +45,8 @@ type Store interface {
 	Config(fileID string) (*parser.ConfigDoc, error)
 	SaveAnomalies(fileID string, groups []parser.AnomalyGroup) error
 	Anomalies(fileID string) ([]parser.AnomalyGroup, error)
+	SaveLogSignatures(fileID string, rep *parser.LogSignatureReport) error
+	LogSignatures(fileID string) (*parser.LogSignatureReport, error)
 	SaveAppStats(fileID string, st *parser.AppStats) error
 	AppStats(fileID string) (*parser.AppStats, error)
 	SaveLicenses(fileID string, lics []parser.License) error
@@ -100,6 +102,7 @@ type Memory struct {
 	archive   map[string][]parser.ArchiveEntry
 	config    map[string]*parser.ConfigDoc
 	anomalies map[string][]parser.AnomalyGroup
+	logsigs   map[string]*parser.LogSignatureReport
 	appstats  map[string]*parser.AppStats
 	licenses  map[string][]parser.License
 	memory    map[string]MemoryReport
@@ -115,6 +118,7 @@ func NewMemory() *Memory {
 		archive:   make(map[string][]parser.ArchiveEntry),
 		config:    make(map[string]*parser.ConfigDoc),
 		anomalies: make(map[string][]parser.AnomalyGroup),
+		logsigs:   make(map[string]*parser.LogSignatureReport),
 		appstats:  make(map[string]*parser.AppStats),
 		licenses:  make(map[string][]parser.License),
 		memory:    make(map[string]MemoryReport),
@@ -163,6 +167,7 @@ func (m *Memory) Delete(id string) error {
 	delete(m.archive, id)
 	delete(m.config, id)
 	delete(m.anomalies, id)
+	delete(m.logsigs, id)
 	delete(m.appstats, id)
 	delete(m.licenses, id)
 	delete(m.memory, id)
@@ -293,6 +298,29 @@ func (m *Memory) Anomalies(fileID string) ([]parser.AnomalyGroup, error) {
 		return nil, ErrNotFound
 	}
 	return groups, nil
+}
+
+// SaveLogSignatures stores the file-scoped signature scan. The empty result is
+// stored too: "checked and clean" is a different answer from "never ran", and
+// only the first is worth telling the reader.
+func (m *Memory) SaveLogSignatures(fileID string, rep *parser.LogSignatureReport) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.files[fileID]; !ok {
+		return ErrNotFound
+	}
+	m.logsigs[fileID] = rep
+	return nil
+}
+
+func (m *Memory) LogSignatures(fileID string) (*parser.LogSignatureReport, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	rep, ok := m.logsigs[fileID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return rep, nil
 }
 
 func (m *Memory) SaveConfig(fileID string, cfg *parser.ConfigDoc) error {

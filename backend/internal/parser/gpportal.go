@@ -60,6 +60,11 @@ type GPPortalGateway struct {
 	DurationMS *int `json:"duration_ms,omitempty"`
 	Weight     *int `json:"weight,omitempty"`
 
+	// Manual marks a gateway the user configured by hand rather than one the
+	// portal offered for scoring. It is a candidate — usually the chosen one —
+	// not an exclusion, which is what distinguishes it from "manual-only".
+	Manual bool `json:"manual,omitempty"`
+
 	// Excluded says why a gateway was never in contention: "region" when the
 	// client's location does not match, "manual-only" when it is configured
 	// for manual selection. Empty means it was a candidate.
@@ -120,6 +125,16 @@ var (
 	pDiscoverRe   = regexp.MustCompile(`(?i)Discover (external|internal) gateway: gateway count is (\d+), cutoff time is (\d+)`)
 	pGwPriorityRe = regexp.MustCompile(`(?i)^.*?gateway (\S+) priority is (-?\d+)`)
 	pGwManualRe   = regexp.MustCompile(`(?i)gateway (\d+) of (\S+) is manual select only`)
+	// "One external gateway gp.tpmlab.local, priority=1, manual is 1"
+	//
+	// A manually configured gateway never goes through scoring, so it produces
+	// only this line and none of the weight/duration lines a discovered
+	// gateway does. The round parser skipped it (its "priority is" pattern
+	// explicitly excludes the "priority=" spelling), which is why a portal
+	// whose only gateway is manual reported "0 gateways" while the Connection
+	// tab showed it connecting to one.
+	pGwOneRe = regexp.MustCompile(
+		`(?i)One (external|internal) gateway (\S+?), priority=(-?\d+), manual is (\d)`)
 	pGwRegionRe   = regexp.MustCompile(`(?i)REGION-PRIO, gateway (\d+) is not selectable base on region`)
 	pGwDescRe     = regexp.MustCompile(`(?i)Process gateway: host (\S+), description (.+?)\s*$`)
 	pGwAddrRe     = regexp.MustCompile(`Gateway (\S+?)\(([^)]*)\): ipv4 (\S*), ipv6`)
@@ -338,6 +353,19 @@ func (p *portalFold) feed(line string) {
 	}
 	if p.roundByFQ == nil {
 		p.roundByFQ = map[string]*GPPortalGateway{}
+	}
+
+	if m := pGwOneRe.FindStringSubmatch(line); m != nil {
+		g := p.roundGateway(m[2])
+		if n, err := strconv.Atoi(m[3]); err == nil {
+			g.Priority = &n
+		}
+		if m[4] == "1" {
+			// Manual gateways are candidates, not exclusions: this one is the
+			// gateway the user picked, and it is the one that gets used.
+			g.Manual = true
+		}
+		return
 	}
 
 	if m := pGwPriorityRe.FindStringSubmatch(line); m != nil && !strings.Contains(line, "priority=") {
