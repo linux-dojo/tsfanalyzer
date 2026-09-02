@@ -662,8 +662,21 @@ function GpCertAnomaly({ facts, portal }: { facts: GpFacts | null; portal: strin
   );
 }
 
-function GpAnomaliesTab({ fileId, portal, setPortal }: GpTabProps) {
+function GpAnomaliesTab({ fileId, portal, setPortal, onOpenLine }: GpTabProps) {
   const { data, error } = useGp(fileId);
+  /* Signature findings for an agent collection come from the same scan the
+     firewall side uses — the catalogue is path-scoped, so the agent entries
+     only read PanGPA/PanGPS and the PAN-OS entries never fire here. */
+  const [sig, setSig] = useState<LogSignatureReport | null>(null);
+  useEffect(() => {
+    let live = true;
+    fetch(`/api/v1/files/${fileId}/anomalies`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+      .then((d) => { if (live) setSig(d.signatures ?? null); })
+      .catch(() => { /* an agent bundle may have no anomaly record at all */ });
+    return () => { live = false; };
+  }, [fileId]);
+
   if (error) return <p className="error">Could not load: {error}</p>;
   if (!data) return <p className="muted">Loading…</p>;
 
@@ -686,6 +699,9 @@ function GpAnomaliesTab({ fileId, portal, setPortal }: GpTabProps) {
     <div className="gp-anomalies">
       <h2>Anomalies</h2>
       <GpPortalPicker portals={data.portals} portal={portal} setPortal={setPortal} />
+      {(sig?.groups?.length ?? 0) > 0 && (
+        <SignatureFindings sig={sig} err={null} onOpenLine={onOpenLine ?? (() => {})} />
+      )}
       <GpCertAnomaly facts={data.facts} portal={portal} />
       <p className="muted">
         Repeated failures across {attempts.length} attempt{attempts.length === 1 ? "" : "s"},
@@ -721,6 +737,9 @@ interface GpTabProps {
   fileId: string;
   portal: string;
   setPortal: (a: string) => void;
+  /* Only the Anomalies tab uses this, to jump from a finding to the log line
+     it came from. Optional so the other GP tabs need not thread it through. */
+  onOpenLine?: (path: string, line: number) => void;
 }
 
 /* The picker itself. An endpoint often talks to more than one portal, each with
@@ -2070,7 +2089,12 @@ function FileView({ id }: { id: string }) {
         {tab === "gp-auth" && <GpAuthTab fileId={id} portal={gpPortal} setPortal={setGpPortal} />}
         {tab === "gp-hip" && <GpHipTab fileId={id} portal={gpPortal} setPortal={setGpPortal} />}
         {tab === "gp-anomalies" && (
-          <GpAnomaliesTab fileId={id} portal={gpPortal} setPortal={setGpPortal} />
+          <GpAnomaliesTab
+            fileId={id}
+            portal={gpPortal}
+            setPortal={setGpPortal}
+            onOpenLine={openLogLine}
+          />
         )}
       </main>
     </div>

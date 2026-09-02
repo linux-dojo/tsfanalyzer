@@ -376,6 +376,22 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 		}
 	}
 
+	// pass 4b: file-scoped signatures — named log files scanned for known
+	// fault patterns. This runs for every archive, not just firewall ones:
+	// each signature names the files it reads, so the PAN-OS entries are inert
+	// on a GlobalProtect collection and the agent entries are inert on a
+	// tech-support file. One catalogue, separated by path.
+	if status == "parsed" {
+		if f6, ferr := os.Open(rec.StoragePath); ferr == nil {
+			if sig, serr := parser.ScanLogSignatures(f6); serr == nil {
+				_ = s.store.SaveLogSignatures(rec.ID, sig)
+			} else {
+				log.Printf("parse %s: log signatures: %v", rec.ID, serr)
+			}
+			f6.Close()
+		}
+	}
+
 	// pass 5: anomalies — recurring system-log events plus counter threshold
 	// breaches and trends, merged into one list (best-effort). Both sources
 	// are PAN-OS-specific; the GP agent's own anomaly rules come separately.
@@ -390,18 +406,6 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 			}
 			f5.Close()
 		}
-		// file-scoped signatures: named log files scanned for known fault
-		// patterns, kept beside the counter/log anomalies rather than merged,
-		// since each finding is a specific line rather than a trend
-		if f6, ferr := os.Open(rec.StoragePath); ferr == nil {
-			if sig, serr := parser.ScanLogSignatures(f6); serr == nil {
-				_ = s.store.SaveLogSignatures(rec.ID, sig)
-			} else {
-				log.Printf("parse %s: log signatures: %v", rec.ID, serr)
-			}
-			f6.Close()
-		}
-
 		fromCounters := parser.CounterAnomalies(samples)
 		groups = append(groups, fromCounters...)
 		groups = parser.SortAnomalies(groups)
@@ -756,13 +760,19 @@ func (s *Server) configTree(id, storagePath, cfgPath string) (*parser.ConfigNode
 func (s *Server) handleAnomalies(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	groups, err := s.store.Anomalies(id)
-	if errors.Is(err, store.ErrNotFound) {
+	sig, sigErr := s.store.LogSignatures(id)
+	// Anomaly groups are a PAN-OS notion, so a GlobalProtect collection has
+	// none — but it can still have signature findings. 404 only when there is
+	// genuinely nothing, or the agent's findings would be unreachable.
+	if errors.Is(err, store.ErrNotFound) && sigErr != nil {
 		httpError(w, http.StatusNotFound, "no anomalies extracted for this file")
 		return
 	}
-	sig, sigErr := s.store.LogSignatures(id)
 	if sigErr != nil {
 		sig = nil
+	}
+	if groups == nil {
+		groups = []parser.AnomalyGroup{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"file_id": id, "anomalies": groups, "signatures": sig,

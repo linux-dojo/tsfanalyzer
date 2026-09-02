@@ -324,3 +324,61 @@ func TestLowSeveritySignatures(t *testing.T) {
 		t.Error("low must sort below info so it never displaces a real finding")
 	}
 }
+
+// PanGPA is the app the user sees; PanGPS is the service that does the work.
+// The app is the client and the service the server, over a local socket. While
+// that connection is down the UI has nothing to query, so GlobalProtect looks
+// dead to the user regardless of what the tunnel is doing.
+func TestGPAtoGPSSocketFailure(t *testing.T) {
+	fs, _ := scanLines("PanGPA.log",
+		"P 692-T259   08/10/2026 09:31:44:777 Error(  80): CPanSocket::Connect - Failed to connect to server at port:4767",
+		"P 692-T259   08/10/2026 09:31:44:777 Error( 195): Cannot connect to service, error: 61",
+		"P 692-T259   08/10/2026 09:31:44:777 Info ( 207): Connecting to Pan MS Service end failed. keep monitoring the socket.",
+		"P 692-T259   08/10/2026 09:31:44:777 Info ( 555): StartSocketMonitor - socket monitoring started.",
+	)
+	// One event, not four. The companion lines describe the same failure, and
+	// matching them too would multiply every count by four.
+	if n := ids(fs, nil)["gpa_gps_ipc"]; n != 1 {
+		t.Errorf("got %d findings for one failure, want 1", n)
+	}
+
+	// The macOS agent words the recovery differently, so the pattern must not
+	// depend on it.
+	fs, _ = scanLines("PanGPA.log",
+		"P3101-T35395 08/24/2026 15:20:33:436 Error(  80): CPanSocket::Connect - Failed to connect to server at port:4767",
+		"P3101-T35395 08/24/2026 15:20:33:436 Error( 258): Cannot connect to service, error: 61",
+		"P3101-T35395 08/24/2026 15:20:33:436 Dump (1732): socket monitoring found connection failed. restart init connection it",
+	)
+	if n := ids(fs, nil)["gpa_gps_ipc"]; n != 1 {
+		t.Errorf("macOS wording: got %d, want 1", n)
+	}
+}
+
+// A healthy agent log must produce nothing.
+func TestGPAtoGPSQuietWhenConnected(t *testing.T) {
+	fs, _ := scanLines("PanGPA.log",
+		"P 692-T259   08/10/2026 09:31:44:777 Info ( 254): InitConnection ...",
+		"P 692-T259   08/10/2026 09:31:45:100 Debug(  57): fd still open before connect",
+	)
+	if n := ids(fs, nil)["gpa_gps_ipc"]; n != 0 {
+		t.Errorf("got %d findings on a clean log, want 0", n)
+	}
+}
+
+// The catalogue is one list separated by path: agent entries must not fire on
+// a firewall file, and PAN-OS entries must not fire on an agent file.
+func TestSignatureCataloguesDoNotCrossOver(t *testing.T) {
+	gpLine := "P 692-T259 08/10/2026 09:31:44:777 Error( 80): CPanSocket::Connect - Failed to connect to server at port:4767"
+	if n := ids(scanLines("var/log/pan/ms.log", gpLine))["gpa_gps_ipc"]; n != 0 {
+		t.Error("the agent signature should only read PanGPA logs")
+	}
+	fwLine := "SYSTEM REBOOT [UI Initiated at Mar 13 10:59:48]"
+	if n := ids(scanLines("PanGPA.log", fwLine))["reboot"]; n != 0 {
+		t.Error("the reboot signature should only read reboot.log")
+	}
+	// PanGPS is the server side and has its own formats; the app-side socket
+	// signature is scoped to the client log only.
+	if n := ids(scanLines("PanGPS.log", gpLine))["gpa_gps_ipc"]; n != 0 {
+		t.Error("this is the app's view of the failure, so it reads PanGPA")
+	}
+}

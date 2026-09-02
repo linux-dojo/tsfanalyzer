@@ -219,6 +219,29 @@ var logSignatures = []LogSignature{
 		// The written form used a negative lookahead, which RE2 cannot compile.
 		Exclude: regexp.MustCompile(`quota|is star|is up|inserted|License|LDAP`),
 	},
+
+	// ---- GlobalProtect agent ------------------------------------------
+	//
+	// Path-scoped like everything else, so these are inert on a firewall
+	// tech-support file and the firewall signatures are inert on an agent
+	// collection. One catalogue, separated by the files each entry names.
+	{
+		ID: "gpa_gps_ipc", Title: "GlobalProtect app cannot reach its service", Severity: "warning",
+		Why: "PanGPA (the app the user sees) talks to PanGPS (the service that does the " +
+			"work) over a local socket, app as client and service as server. While this " +
+			"fails the UI has no service to query, so GlobalProtect appears dead to the " +
+			"user even when a tunnel is up. The app retries and the socket monitor " +
+			"restarts the connection, so a burst of these is a stall rather than a " +
+			"permanent break — but it is what the user was looking at.",
+		PathRe: regexp.MustCompile(`(?:^|/)PanGPA(?:\.\d+)?\.log$`),
+		// Keyed on the connect failure alone. The companion "Cannot connect to
+		// service, error: N" line reports the same event, so matching both
+		// would double every count. The recovery wording varies between
+		// versions — "keep monitoring the socket" in one, "socket monitoring
+		// found connection failed. restart init connection" in the macOS
+		// bundle — so it is deliberately not part of the pattern.
+		Re: regexp.MustCompile(`CPanSocket::Connect - Failed to connect to server at port:\d+`),
+	},
 }
 
 // deviceCertOKRe recognises the one value that is not a finding.
