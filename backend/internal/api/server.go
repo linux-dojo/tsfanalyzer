@@ -266,7 +266,10 @@ func (s *Server) parseArchive(rec store.TechSupportFile) string {
 			fg.Close()
 		}
 		if fg, gerr := os.Open(rec.StoragePath); gerr == nil {
-			if at, aerr := parser.ExtractGPAttempts(fg); aerr == nil {
+			// The timeline comes from PanGPS.log's own state machine, not the
+			// event log: the event log is a summary and does not record every
+			// attempt, so a whole connection could happen and never appear.
+			if at, aerr := parser.ExtractGPStateAttempts(fg); aerr == nil {
 				rep.Attempts = at
 			} else {
 				log.Printf("parse %s: gp attempts: %v", rec.ID, aerr)
@@ -704,7 +707,7 @@ func (s *Server) handleGP(w http.ResponseWriter, r *http.Request) {
 		"portals":  rep.Portals,
 		"hip":      rep.HIP,
 		"auth":     rep.Auth,
-		"stages":   parser.GPStageOrder,
+		"stages":   parser.GPStateOrder,
 	})
 }
 

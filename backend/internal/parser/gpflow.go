@@ -101,6 +101,14 @@ type GPAttempt struct {
 	User    string          `json:"user,omitempty"`
 	Events  int             `json:"events"`
 
+	// States is every "--Set state to X" transition inside this attempt, and
+	// Notes a few orienting lines. Both carry a file and line so the row can
+	// link straight into the log viewer.
+	States []GPStateChange `json:"states,omitempty"`
+	Notes  []GPNote        `json:"notes,omitempty"`
+	// FailStage is the stage PAN-OS itself blamed, when it said so.
+	FailStage GPStage `json:"fail_stage,omitempty"`
+
 	// How the user got through the portal, and how the gateway was satisfied.
 	// The point of single sign-on here is that the portal authenticates
 	// interactively once, hands back a cookie, and the gateway accepts that
@@ -128,6 +136,22 @@ type GPAttempt struct {
 	// starting a new one — without this, one user-facing login is split in two
 	// and the cookie hand-off between portal and gateway is lost.
 	awaitingAuth bool
+}
+
+// GPStateChange is one "--Set state to X" transition.
+type GPStateChange struct {
+	At    time.Time `json:"at"`
+	State string    `json:"state"`
+	Line  int       `json:"line,omitempty"`
+	Path  string    `json:"path,omitempty"`
+}
+
+// GPNote is a line worth showing under the stage it belongs to.
+type GPNote struct {
+	At   time.Time `json:"at"`
+	Text string    `json:"text"`
+	Line int       `json:"line,omitempty"`
+	Path string    `json:"path,omitempty"`
 }
 
 // stageMarker maps an event-log message to a stage and what it says about it.

@@ -341,6 +341,8 @@ interface GpStageResult {
   at?: string;
   detail?: string;
 }
+interface GpStateChange { at: string; state: string; line?: number; path?: string }
+interface GpNote { at: string; text: string; line?: number; path?: string }
 
 interface GpAttempt {
   start: string;
@@ -354,6 +356,10 @@ interface GpAttempt {
   gateway?: string;
   user?: string;
   events: number;
+  /* every "--Set state to X" inside the attempt, and a few orienting lines */
+  states?: GpStateChange[];
+  notes?: GpNote[];
+  fail_stage?: string;
 }
 
 interface GpGateway {
@@ -1601,6 +1607,14 @@ function GpGatewayConfigs({ facts, portal }: { facts: GpFacts | null; portal: st
   );
 }
 
+/* Full timestamp to the millisecond. Go marshals time.Time as RFC3339, whose
+   fractional part varies in length, so it is padded rather than sliced blindly. */
+function fmtGpTs(iso: string): string {
+  const [d, t = ""] = iso.replace("T", " ").split(" ");
+  const [hms = "", frac = ""] = t.replace("Z", "").split(".");
+  return `${d} ${hms}.${(frac.replace(/[^0-9]/g, "") + "000").slice(0, 3)}`;
+}
+
 /* A connection is a fixed sequence of stages, each reachable only if the one
    before it succeeded. Showing where each attempt stopped is the diagnosis:
    "37 attempts stopped at gateway select" says far more than 400 log lines. */
@@ -1642,7 +1656,13 @@ function GpFlow({ data, portal }: { data: GpData; portal: string }) {
         )}
       </div>
 
-      <div className="gp-stagehead">
+      {/* The column count follows the stage list. It used to be hardcoded to
+          eight in CSS, so adding the terminal "disconnected" stage would have
+          silently pushed every bar out of line with its header. */}
+      <div
+        className="gp-stagehead"
+        style={{ gridTemplateColumns: `repeat(${stages.length}, 1fr)` }}
+      >
         {stages.map((s) => (
           <span key={s} title={s}>{s}</span>
         ))}
@@ -1655,8 +1675,13 @@ function GpFlow({ data, portal }: { data: GpData; portal: string }) {
               onClick={() => setOpenIdx(openIdx === i ? null : i)}
               title={a.reason || a.outcome}
             >
-              <span className="gp-attempt-ts">{a.start.replace("T", " ").slice(0, 19)}</span>
-              <span className="gp-bar">
+              {/* to the millisecond: connection cycles here are seconds long,
+                  and the seconds were being clipped by the column width */}
+              <span className="gp-attempt-ts">{fmtGpTs(a.start)}</span>
+              <span
+                className="gp-bar"
+                style={{ gridTemplateColumns: `repeat(${stages.length}, 1fr)` }}
+              >
                 {stages.map((s) => {
                   const r = a.stages.find((x) => x.stage === s);
                   const st = r?.status ?? "not reached";
@@ -1688,6 +1713,19 @@ function GpFlow({ data, portal }: { data: GpData; portal: string }) {
                     is usually the tell: a gateway stage thirty seconds after
                     the one before it is a timeout, the same stage a
                     millisecond later is a rejection. */}
+                {!!a.states?.length && (
+                  <div className="gp-states">
+                    {/* The state machine in order. This is what the agent
+                        believed it was doing, and where a cycle that looks
+                        fine on the bars turns out to have dropped. */}
+                    {a.states.map((st, i) => (
+                      <span key={i} className={"gp-state gp-state-" + st.state.toLowerCase().replace(/[^a-z]+/g, "-")}>
+                        <span className="gp-state-at">{st.at.replace("T", " ").slice(11, 23)}</span>
+                        {st.state}
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <ol className="gp-stagelist">
                   {a.stages.map((s, si) => {
                     const prev = si > 0 ? a.stages[si - 1] : undefined;
@@ -1715,6 +1753,19 @@ function GpFlow({ data, portal }: { data: GpData; portal: string }) {
                     );
                   })}
                 </ol>
+                {!!a.notes?.length && (
+                  <details className="gp-details">
+                    <summary>Key lines ({a.notes.length})</summary>
+                    <ul className="gp-notes">
+                      {a.notes.map((n, i) => (
+                        <li key={i}>
+                          <span className="gp-note-at">{n.at.replace("T", " ").slice(11, 23)}</span>
+                          <span className="gp-note-text">{n.text}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
               </div>
             )}
           </div>

@@ -864,7 +864,9 @@ td button { border: 0; background: #fdecea; color: #c0392b; padding: 5px 10px; b
 .gp-chip-warn { background: #fff4e0; color: #9a6300; border: 1px solid #ffe2b0; }
 
 /* the stage columns line up with the cells in every attempt row below */
-.gp-stagehead, .gp-bar { display: grid; grid-template-columns: repeat(8, 1fr); gap: 3px; }
+/* The column count is set inline from the stage list; a hardcoded one here
+   silently misaligned the bars from their headers when a stage was added. */
+.gp-stagehead, .gp-bar { display: grid; gap: 3px; }
 .gp-stagehead {
   margin-left: 152px; margin-right: 92px; font-size: 10px; color: #8a9099;
   text-transform: uppercase; letter-spacing: .3px;
@@ -873,7 +875,7 @@ td button { border: 0; background: #fdecea; color: #c0392b; padding: 5px 10px; b
 
 .gp-attempts { border: 1px solid #e3e6ea; border-radius: 6px; overflow: hidden; margin-top: 4px; }
 .gp-attempt {
-  display: grid; grid-template-columns: 150px 1fr 90px; gap: 2px; align-items: center;
+  display: grid; grid-template-columns: 200px 1fr 90px; gap: 2px; align-items: center;
   width: 100%; background: none; border: 0; border-bottom: 1px solid #f1f3f5;
   padding: 4px 8px; cursor: pointer; text-align: left; font-size: 11px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -1097,3 +1099,20 @@ td button { border: 0; background: #fdecea; color: #c0392b; padding: 5px 10px; b
 .vt-rec-b { background: #ffffff !important; }
 .vt-rec-a.vt-ctx, .vt-rec-b.vt-ctx { opacity: 0.62; }
 .hl-vt { background: #fff3cd !important; }
+
+/* State transitions and key lines inside an expanded attempt */
+.gp-states { display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 4px; }
+.gp-state {
+  font-size: 11px; padding: 2px 8px; border-radius: 10px;
+  background: #eef1f5; color: #3c4654; white-space: nowrap;
+}
+.gp-state-at { color: #8a94a3; margin-right: 6px; font-family: ui-monospace, monospace; }
+.gp-state-connected { background: #dff3e6; color: #1a5c36; }
+.gp-state-disconnected, .gp-state-disconnecting { background: #fdeaea; color: #a02020; }
+.gp-state-retrieving-configuration { background: #e8eefb; color: #2455c3; }
+.gp-notes { margin: 6px 0 0; padding-left: 16px; font-size: 11.5px; }
+.gp-notes li { margin-bottom: 3px; }
+.gp-note-at { color: #8a94a3; font-family: ui-monospace, monospace; margin-right: 8px; }
+.gp-note-text { font-family: ui-monospace, monospace; color: #26313f; }
+/* the terminal stage reads as an end, not another step */
+.gp-cell-failed { background: #d24444; }
