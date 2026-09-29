@@ -4,27 +4,27 @@ Browser-based tool to upload, parse, and analyze Palo Alto Networks firewall tec
 
 ## Architecture
 
+What `docker compose up` actually runs — two containers, no datastores:
+
 ```
-browser ── nginx ──► api (Go) ──► postgres + timescaledb   (metadata, parsed values, counter time-series)
-                       │     ──► minio                     (raw .tgz blobs)
-                       └────────► redis ──► worker (Go)    (async extraction + regex parsers)
+browser ── nginx ──► api (Go) ──► local disk volume   (raw .tgz blobs)
+                                  in-memory store     (registry, parsed values, counter series)
 ```
 
-- **api** — Go HTTP API: uploads, file registry, parsed-data queries, graph data
-- **worker** — Go: extracts `.tgz`, runs pluggable regex parsers, writes results to DB
-- **postgres (TimescaleDB)** — file metadata, system info, logs index, counter hypertables
-- **minio** — S3-compatible object storage for raw uploads
-- **redis** — job queue (asynq)
-- **frontend** — React + TypeScript (Vite), tabs: System Info · Logs · Graphs · Config · My Files
+- **api** — Go HTTP API: uploads, file registry, parsed-data queries, graph data.
+  Parsers run inline in a goroutine right after upload.
+- **frontend** — React + TypeScript (Vite), tabs: Anomalies · System Info · Logs · Graphs · Config · My Files
 
-> **Current state (vs. target above).** The diagram is the target. As built today,
-> the **api** is the only backend process doing real work: it stores raw `.tgz` files
-> on a **local disk volume** (not MinIO), keeps the file registry and all parsed data
-> in an **in-memory store** (not Postgres/TimescaleDB), and runs the parsers **inline
-> in a goroutine** right after upload (not via Redis/asynq in the **worker**, which is
-> still a stub). The store sits behind a `store.Store` interface so a Postgres-backed
-> implementation can drop in without touching the API or parsers. The Go backend is
-> currently **stdlib-only** (empty `go.mod` dependencies).
+The Go backend is **stdlib-only** (empty `go.mod` dependencies), so the whole
+thing builds from two Dockerfiles and nothing else.
+
+> **Where it's heading.** The store sits behind a `store.Store` interface, so
+> Postgres/TimescaleDB for parsed data, MinIO for raw blobs and a Redis/asynq
+> worker for extraction can each drop in without touching the API or the
+> parsers. The compose file carried stub services for all four for a while;
+> they were pulling three images and a 4 GB postgres on every start while doing
+> nothing, so they were removed until the code that needs them exists.
+> `backend/cmd/worker` is still a stub and is not built or run.
 
 ### Two kinds of archive
 

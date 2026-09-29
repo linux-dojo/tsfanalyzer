@@ -133,8 +133,11 @@ func TestMidCycleDisconnectedDoesNotSplitTheAttempt(t *testing.T) {
 
 // PAN-OS names the failing stage itself when it can, which beats inference.
 func TestTSLogReasonWins(t *testing.T) {
-	reason, stage := stateFailureReason(
+	reason, stage, rank := stateFailureReason(
 		"TSLog: Set error_stage = Portal pre-login, error = The network connection is unreachable or the portal is unresponsive.")
+	if rank != reasonTSLog {
+		t.Errorf("rank = %d, want the most trusted", rank)
+	}
 	if !strings.Contains(reason, "unreachable") {
 		t.Errorf("reason = %q", reason)
 	}
@@ -142,7 +145,7 @@ func TestTSLogReasonWins(t *testing.T) {
 		t.Errorf("stage = %q, want portal pre-login", stage)
 	}
 	// "Connected" is a status, not a failure.
-	if r, _ := stateFailureReason("portal status is Connected."); r != "" {
+	if r, _, _ := stateFailureReason("portal status is Connected."); r != "" {
 		t.Errorf("a healthy status must not read as a failure: %q", r)
 	}
 }
@@ -156,5 +159,82 @@ func TestStateOrderIncludesTerminalStage(t *testing.T) {
 	}
 	if len(GPStateOrder) != 9 {
 		t.Errorf("stage count = %d; the grid columns are derived from this", len(GPStateOrder))
+	}
+}
+
+// The diagnosis must beat the symptom even though the symptom is logged first.
+//
+// A failing pre-login writes "cannot restore last portal config" and "portal
+// status is Invalid portal" a tenth of a second before PAN-OS writes its own
+// verdict. Taking the first reason seen reported the symptom and threw the
+// diagnosis away — which is what the real macOS trace does.
+func TestBestReasonWinsNotTheFirst(t *testing.T) {
+	at := attemptsFromState([]stateLine{
+		sl("08:17:38", "--Set state to Retrieving configuration..."),
+		sl("08:17:40", "----Portal Pre-login starts----"),
+		sl("08:17:45", "cannot restore last portal config from file /Users/x/PanPortalCfg.dat."),
+		sl("08:17:45", "portal status is Invalid portal."),
+		sl("08:17:45", "TSLog: Set error_stage = Portal pre-login, error = The network connection is unreachable or the portal is unresponsive."),
+		sl("08:17:45", "--Set state to Disconnected"),
+	})
+	if len(at) != 1 {
+		t.Fatalf("got %d attempts, want 1", len(at))
+	}
+	if !strings.Contains(at[0].Reason, "unreachable") {
+		t.Errorf("reason = %q, want PAN-OS's own verdict, not the earlier symptom", at[0].Reason)
+	}
+	if at[0].FailStage != StagePortalPrelogin {
+		t.Errorf("fail stage = %q, want portal pre-login", at[0].FailStage)
+	}
+}
+
+// The full macOS trace: a failed cycle followed by a successful one, with a
+// teardown "Portal Processing" between them that must not register.
+func TestMacTraceTwoCycles(t *testing.T) {
+	at := attemptsFromState([]stateLine{
+		sl("08:17:38", "--Set state to Retrieving configuration..."),
+		sl("08:17:40", "----Portal Pre-login starts----"),
+		sl("08:17:45", "TSLog: Set error_stage = Portal pre-login, error = The network connection is unreachable or the portal is unresponsive."),
+		sl("08:17:45", "--Set state to Disconnected"),
+		sl("08:17:59", "----Portal Processing starts----"),
+		sl("08:17:59", "Logging out gateway, reason is StopThreads"),
+		sl("08:17:59", "--Set state to Retrieving configuration..."),
+		sl("08:17:59", "----Portal Pre-login starts----"),
+		sl("08:18:01", "----Portal Login starts----"),
+		sl("08:18:11", "----Network Discover starts----"),
+		sl("08:18:15", "----Gateway Pre-login starts----"),
+		sl("08:18:15", "----Gateway Login starts----"),
+		sl("08:18:16", "----Tunnel Creation starts----"),
+		sl("08:18:17", "--Set state to Connected"),
+	})
+	if len(at) != 2 {
+		t.Fatalf("got %d attempts, want 2", len(at))
+	}
+	if at[0].Outcome != "failed" || at[1].Outcome != "connected" {
+		t.Errorf("outcomes = %q, %q; want failed then connected", at[0].Outcome, at[1].Outcome)
+	}
+	// the failed cycle lit only pre-login, plus the terminal marker
+	first := stageSet(at[0])
+	if _, ok := first[StagePortalAuth]; ok {
+		t.Error("the failed cycle never reached portal login")
+	}
+	if first[StageDisconnected] != "failed" {
+		t.Error("the failed cycle needs its terminal marker")
+	}
+	// the successful cycle lit the whole run and has no terminal marker
+	second := stageSet(at[1])
+	for _, want := range []GPStage{
+		StagePortalPrelogin, StagePortalAuth, StageDiscovery,
+		StageGatewaySelect, StageGatewayAuth, StageTunnel,
+	} {
+		if _, ok := second[want]; !ok {
+			t.Errorf("successful cycle missing stage %q", want)
+		}
+	}
+	if _, ok := second[StageDisconnected]; ok {
+		t.Error("a cycle that connected and stayed up has no terminal marker")
+	}
+	if _, ok := second[StagePortalConfig]; ok {
+		t.Error("the teardown Portal Processing must not light the config stage")
 	}
 }

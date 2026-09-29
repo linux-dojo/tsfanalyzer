@@ -188,6 +188,7 @@ func attemptsFromState(lines []stateLine) []GPAttempt {
 	seenStage := map[GPStage]bool{}
 	var connected bool
 	var lastState string
+	reasonRank := reasonNone
 
 	closeAttempt := func(end time.Time) {
 		if cur == nil {
@@ -200,6 +201,7 @@ func attemptsFromState(lines []stateLine) []GPAttempt {
 		seenStage = map[GPStage]bool{}
 		connected = false
 		lastState = ""
+		reasonRank = reasonNone
 	}
 
 	open := func(l stateLine, trigger string) {
@@ -275,9 +277,21 @@ func attemptsFromState(lines []stateLine) []GPAttempt {
 				Stage: StageHIP, Status: "ok", At: l.ts, Detail: l.msg,
 			})
 		}
-		if reason, stage := stateFailureReason(l.msg); reason != "" {
-			if cur.Reason == "" {
-				cur.Reason = reason
+		// Best reason wins, not the first.
+		//
+		// Taking the first was wrong in a way that only shows on real logs: a
+		// failing pre-login writes "cannot restore last portal config" and
+		// "portal status is Invalid portal" a tenth of a second *before*
+		// PAN-OS writes its own verdict —
+		//
+		//	TSLog: Set error_stage = Portal pre-login, error = The network
+		//	connection is unreachable or the portal is unresponsive.
+		//
+		// so first-wins reported a symptom and discarded the diagnosis.
+		if reason, stage, rank := stateFailureReason(l.msg); reason != "" && rank < reasonRank {
+			reasonRank = rank
+			cur.Reason = reason
+			if stage != "" {
 				cur.FailStage = stage
 			}
 		}
@@ -299,26 +313,36 @@ func teardownFollows(lines []stateLine, from, within int) bool {
 	return false
 }
 
-// stateFailureReason extracts why an attempt failed, and the stage it names.
-func stateFailureReason(msg string) (string, GPStage) {
+// reasonRank orders failure reasons by how much they are worth trusting.
+// Lower is better.
+const (
+	reasonTSLog  = 0 // PAN-OS names the stage and the message itself
+	reasonStatus = 1 // "portal status is X"
+	reasonOther  = 2 // inferred from a symptom line
+	reasonNone   = 3
+)
+
+// stateFailureReason extracts why an attempt failed, the stage it names, and
+// how far it is worth trusting.
+func stateFailureReason(msg string) (string, GPStage, int) {
 	// PAN-OS records the stage and message itself when it can, which beats
 	// anything inferred.
 	if m := stTSLogRe.FindStringSubmatch(msg); m != nil {
-		return strings.TrimSpace(m[2]), stateStage(m[1])
+		return strings.TrimSpace(m[2]), stateStage(m[1]), reasonTSLog
 	}
 	if m := stStatusRe.FindStringSubmatch(msg); m != nil {
 		status := strings.TrimSuffix(strings.TrimSpace(m[1]), ".")
 		if strings.EqualFold(status, "Connected") {
-			return "", ""
+			return "", "", reasonNone
 		}
-		return "portal status: " + status, StagePortalAuth
+		return "portal status: " + status, StagePortalAuth, reasonStatus
 	}
 	for _, re := range stReasonRes {
 		if m := re.FindStringSubmatch(msg); m != nil {
-			return strings.TrimSpace(m[1]), ""
+			return strings.TrimSpace(m[1]), "", reasonOther
 		}
 	}
-	return "", ""
+	return "", "", reasonNone
 }
 
 // noteStateLine keeps a few orienting lines per stage for the expanded row.

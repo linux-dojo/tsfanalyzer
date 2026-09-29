@@ -1,9 +1,19 @@
+# The whole tool is two containers: a Go API that parses archives on disk, and
+# an nginx serving the built frontend and proxying /api to it.
+#
+# There used to be postgres, redis, minio and a worker here. They came from the
+# phase-1 scaffold and were never used: the backend imports no database, no
+# redis client and no S3 client, and cmd/worker was a sleep loop. They cost
+# three image pulls and a 4 GB postgres on every `docker compose up`, and one of
+# them (minio) is what broke the build on macOS. If the parser ever needs a job
+# queue or object storage, add the service back at that point.
 services:
   api:
     build: ./backend
     command: ["/app/api"]
-    env_file: .env
     environment:
+      API_PORT: "8081"
+      UPLOAD_DIR: /data/uploads
       # Let Go's GC work against the container limit instead of discovering it
       # by being killed. Keep this below mem_limit.
       GOMEMLIMIT: "3GiB"
@@ -11,47 +21,10 @@ services:
       - "8081:8081"
     volumes:
       - upload-data:/data/uploads
-    depends_on: [postgres, redis, minio]
     # a parse that still runs the container out of memory should come back
     # rather than leave nginx talking to a dead upstream (502 Bad Gateway)
     restart: unless-stopped
     mem_limit: 4g
-
-  worker:
-    build: ./backend
-    command: ["/app/worker"]
-    env_file: .env
-    volumes:
-      - upload-data:/data/uploads
-    depends_on: [postgres, redis, minio]
-
-  postgres:
-    image: timescale/timescaledb:latest-pg16
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-pantsa}
-      POSTGRES_USER: ${POSTGRES_USER:-pantsa}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
-    volumes:
-      - pg-data:/var/lib/postgresql/data
-      - ./backend/migrations:/docker-entrypoint-initdb.d:ro
-    ports:
-      - "5432:5432"
-
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - redis-data:/data
-
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-pantsa}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-too}
-    volumes:
-      - minio-data:/data
-    ports:
-      - "9001:9001"
 
   frontend:
     build: ./frontend
@@ -61,7 +34,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  pg-data:
-  redis-data:
-  minio-data:
   upload-data:
