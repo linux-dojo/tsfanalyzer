@@ -209,7 +209,20 @@ func readEntry(r io.ReadSeeker, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return io.ReadAll(entry)
+	// Bounded, because the tar header's declared size is attacker-controlled
+	// and need not match the bytes that follow it. maxConfigSize is checked
+	// against that declared size when candidates are ranked; this is the check
+	// against what the stream actually produces. Without it an entry
+	// advertising a kilobyte could hand back gigabytes and take the container
+	// to its memory limit.
+	data, err := io.ReadAll(io.LimitReader(entry, maxConfigSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxConfigSize {
+		return nil, errors.New("config file exceeds the maximum supported size")
+	}
+	return data, nil
 }
 
 /* ---------- Panorama fingerprints ---------- */
@@ -288,6 +301,30 @@ func parseConfigXML(data []byte) (*ConfigNode, error) {
 // decode fills n from start and consumes tokens up to and including the
 // matching end element, recursing into children.
 func (n *ConfigNode) decode(dec *xml.Decoder, start xml.StartElement) error {
+	return n.decodeAt(dec, start, 0)
+}
+
+// maxXMLDepth bounds element nesting.
+//
+// decodeAt recurses once per level, and Go grows a goroutine stack until it
+// hits the 1 GB runtime ceiling — at which point the process dies with
+// "goroutine stack exceeds", which is a FATAL error, not a recoverable panic.
+// So a config file containing a few hundred thousand nested elements, which
+// compresses to almost nothing inside an uploaded archive, would take the
+// whole API process down rather than failing one request.
+//
+// A real PAN-OS running config nests around 15 levels; the deepest observed
+// across our sample archives is under 30. 512 leaves enormous headroom while
+// keeping the stack bounded.
+const maxXMLDepth = 512
+
+// ErrXMLTooDeep is returned when nesting exceeds maxXMLDepth.
+var ErrXMLTooDeep = errors.New("config XML nests deeper than the supported limit")
+
+func (n *ConfigNode) decodeAt(dec *xml.Decoder, start xml.StartElement, depth int) error {
+	if depth > maxXMLDepth {
+		return ErrXMLTooDeep
+	}
 	n.Tag = start.Name.Local
 	if len(start.Attr) > 0 {
 		n.Attrs = make(map[string]string, len(start.Attr))
@@ -308,7 +345,7 @@ func (n *ConfigNode) decode(dec *xml.Decoder, start xml.StartElement) error {
 			child := &ConfigNode{}
 			// xml.Decoder reuses its internal attribute storage between
 			// tokens, so the start element must be copied before recursing.
-			if err := child.decode(dec, t.Copy()); err != nil {
+			if err := child.decodeAt(dec, t.Copy(), depth+1); err != nil {
 				return err
 			}
 			n.Children = append(n.Children, child)

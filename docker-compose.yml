@@ -14,6 +14,21 @@ services:
     environment:
       API_PORT: "8081"
       UPLOAD_DIR: /data/uploads
+      # The API answers only for Host values it recognises (localhost, a bare
+      # IP, and the compose service names). That is what stops a hostile site
+      # from pointing a name it controls at 127.0.0.1 and talking to this API
+      # as though it were same-origin — DNS rebinding.
+      #
+      # Reaching the tool by any other name means listing it here, comma
+      # separated. "*" turns the check off for a deployment behind a proxy
+      # that rewrites Host.
+      ALLOWED_HOSTS: ""
+      # Empty means no CORS headers at all, which is right for both supported
+      # deployments: nginx and the Vite dev proxy both make the API same-origin.
+      # Set a single concrete origin only if you split the frontend off. Never
+      # a wildcard — this API has no authentication, so "*" lets any page the
+      # user visits read every archive they have uploaded.
+      CORS_ALLOW_ORIGIN: ""
       # Let Go's GC work against the container limit instead of discovering it
       # by being killed. Keep this below mem_limit.
       GOMEMLIMIT: "3GiB"

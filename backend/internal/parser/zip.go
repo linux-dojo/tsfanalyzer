@@ -21,6 +21,9 @@ import (
 // ErrNotZip means the file is not a zip archive, so no conversion applies.
 var ErrNotZip = errors.New("not a zip archive")
 
+// ErrZipTooLarge means the zip decompresses past maxInflatedBytes.
+var ErrZipTooLarge = errors.New("zip archive decompresses to more than the supported size")
+
 // LooksLikeZip reports whether a file begins with the zip local-file header.
 // The extension is not trusted: what matters is what the bytes are.
 func LooksLikeZip(path string) bool {
@@ -60,6 +63,7 @@ func ConvertZipToTgz(src, dst string) error {
 	tw := tar.NewWriter(gz)
 
 	written := 0
+	remaining := int64(maxInflatedBytes)
 	for _, f := range zr.File {
 		if f.FileInfo().IsDir() {
 			continue
@@ -72,6 +76,12 @@ func ConvertZipToTgz(src, dst string) error {
 		if oerr != nil {
 			continue // unreadable member: keep the rest
 		}
+		// The declared size is attacker-controlled, so it is checked against
+		// the budget before a single byte is written rather than after.
+		if int64(f.UncompressedSize64) > remaining {
+			rc.Close()
+			return ErrZipTooLarge
+		}
 		hdr := &tar.Header{
 			Name:    name,
 			Mode:    0o644,
@@ -82,10 +92,22 @@ func ConvertZipToTgz(src, dst string) error {
 			rc.Close()
 			return werr
 		}
-		n, cerr := io.Copy(tw, rc)
+		// ... and the stream is bounded too, because a member may produce more
+		// bytes than its header admits to. Without both checks a 10 MB zip of
+		// zeroes inflates to gigabytes on the upload volume, which is a disk
+		// exhaustion the 512 MiB upload cap does nothing to prevent: that cap
+		// bounds the compressed bytes, not the decompressed ones.
+		n, cerr := io.Copy(tw, &limitedReader{r: rc, n: remaining + 1})
 		rc.Close()
 		if cerr != nil {
+			if errors.Is(cerr, ErrArchiveTooLarge) {
+				return ErrZipTooLarge
+			}
 			return cerr
+		}
+		remaining -= n
+		if remaining < 0 {
+			return ErrZipTooLarge
 		}
 		if n != hdr.Size {
 			// The declared size and the actual bytes disagree; the tar stream

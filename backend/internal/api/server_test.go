@@ -16,6 +16,18 @@ import (
 	"pan-ts-analyzer/internal/store"
 )
 
+// TestMain lets this package's existing tests keep using httptest.NewRequest
+// with a relative target.
+//
+// That helper fills in Host: "example.com", and ServeHTTP now refuses a Host it
+// does not recognise — the DNS-rebinding guard. Allowing exactly that one name
+// for the test binary keeps the guard under test elsewhere: the rejection cases
+// in security_test.go use different names, so they still exercise it.
+func TestMain(m *testing.M) {
+	extraHosts = []string{"example.com"}
+	os.Exit(m.Run())
+}
+
 // buildTechSupportTgz builds a minimal valid tech-support archive.
 func buildTechSupportTgz(t *testing.T) []byte {
 	t.Helper()

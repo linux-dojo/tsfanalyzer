@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -85,15 +86,110 @@ func NewServer(st store.Store, uploadDir string) *Server {
 	return s
 }
 
+// allowedOrigin is the single cross-origin caller permitted to read the API,
+// taken from CORS_ALLOW_ORIGIN. Empty — the default — sends no CORS headers at
+// all, which is what the supported deployments need.
+//
+// # Why this is not "*" any more
+//
+// It used to be. Every response carried Access-Control-Allow-Origin: *, which
+// is the one header that switches OFF the browser's same-origin protection.
+// Combined with the fact that this API has no authentication, that meant:
+//
+//	any web page the user happened to visit, while the tool was running on
+//	their machine, could fetch http://localhost:8081/api/v1/files, enumerate
+//	every tech-support archive they had uploaded, read the full text of every
+//	file inside them — running configs, addressing, serial numbers, usernames,
+//	pre-shared keys — and DELETE them. Silently, with no interaction beyond
+//	loading the page.
+//
+// Without the wildcard the browser still issues such a request but refuses to
+// hand the response back to the calling script, which is precisely the
+// protection being given away.
+//
+// Neither supported deployment needs CORS:
+//
+//	production   nginx serves the SPA and proxies /api/ — same origin.
+//	development  Vite's dev-server proxy forwards /api — also same origin.
+//
+// So the header is opt-in for anyone with a genuinely split deployment, and
+// it is a single concrete origin, never a wildcard.
+var allowedOrigin = os.Getenv("CORS_ALLOW_ORIGIN")
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if allowedOrigin != "" {
+		// Vary matters even for one fixed origin: a shared cache must not
+		// serve a response minted for the allowed origin to a different one.
+		w.Header().Add("Vary", "Origin")
+		if r.Header.Get("Origin") == allowedOrigin {
+			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		}
+	}
+
+	// Cheap, universally applicable hardening: this API returns JSON and
+	// plain text and is never a legitimate frame or script source.
+	//
+	// Set before any early return, so a rejected request carries them too — a
+	// 403 body is still a response a browser will process.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+
+	// A page cannot set the Host header from script, so requiring a local or
+	// configured Host defeats DNS rebinding — the attack that remains once the
+	// wildcard above is gone, where a hostile name resolves to 127.0.0.1 and
+	// the request becomes same-origin from the browser's point of view.
+	if !hostAllowed(r.Host) {
+		httpError(w, http.StatusForbidden,
+			"request Host not allowed; set ALLOWED_HOSTS if this deployment is reached by another name")
+		return
+	}
+
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	s.mux.ServeHTTP(w, r)
+}
+
+// extraHosts are additional Host values accepted, from ALLOWED_HOSTS
+// (comma separated). "*" disables the check for deployments behind a proxy
+// that rewrites Host.
+var extraHosts = strings.Split(os.Getenv("ALLOWED_HOSTS"), ",")
+
+// hostAllowed reports whether a request's Host header is one this server
+// should answer. The container service name "api" is allowed because that is
+// how nginx reaches it on the compose network.
+func hostAllowed(host string) bool {
+	// SplitHostPort rather than a hand-rolled split on the last colon: an IPv6
+	// literal is full of colons, and getting that wrong would either reject a
+	// legitimate [::1] or accept a name that merely contains one.
+	h := host
+	if hostOnly, _, err := net.SplitHostPort(host); err == nil {
+		h = hostOnly
+	}
+	h = strings.ToLower(strings.Trim(h, "[]"))
+	switch h {
+	case "", "localhost", "127.0.0.1", "::1", "api", "frontend":
+		return true
+	}
+	for _, e := range extraHosts {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "*" {
+			return true
+		}
+		if e != "" && e == h {
+			return true
+		}
+	}
+	// A bare IP literal is not a rebinding target: rebinding needs a NAME
+	// whose resolution the attacker controls.
+	if net.ParseIP(h) != nil {
+		return true
+	}
+	return false
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
