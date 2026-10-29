@@ -217,7 +217,7 @@ func TestEnforcerStateStatements(t *testing.T) {
 	}
 	for _, line := range []string{"GetEnforcer state = 1", "Enforcer is enabled."} {
 		f := scanTrace("\n" + tl("11:47:18", line))
-		if !f.Enforcer.State == "enabled" {
+		if f.Enforcer.State != "enabled" {
 			t.Errorf("%q: state = %q, want enabled", line, f.Enforcer.State)
 		}
 	}
