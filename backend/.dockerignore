@@ -1,0 +1,9 @@
+# `go run ./cmd/api` stores uploads and their search blobs under ./data, which
+# can reach gigabytes; none of it belongs in the build context.
+data
+bin
+*.tgz
+*.sblob
+test_output.txt
+vet_output.txt
+.env

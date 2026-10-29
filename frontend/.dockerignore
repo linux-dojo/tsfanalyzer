@@ -1,0 +1,8 @@
+# The image installs its own dependencies with `npm ci`. Without this,
+# `COPY . .` lays the host's node_modules over them: on a Mac that brought in
+# esbuild's JS package from a different version than the linux binary npm ci
+# had installed, and the build died with "Host version ... does not match
+# binary version". The host's packages are for the wrong OS anyway.
+node_modules
+dist
+.env
