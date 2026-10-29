@@ -220,7 +220,8 @@ func TestParseSearchQueryFlags(t *testing.T) {
 		{"failed -B 3 -A 4", 3, 4},
 		{"oom -A5", 0, 5},
 		{"plain query", 0, 0},
-		{"x -A 999", 0, maxContextLines}, // capped
+		{"x -A 999", 0, 999},
+		{"x -A 99999", 0, maxContextLines}, // capped
 	}
 	for _, c := range cases {
 		q := ParseSearchQuery(c.q)

@@ -125,7 +125,7 @@ func TestEverySignatureIsAccountedFor(t *testing.T) {
 			t.Errorf("duplicate signature id %q", s.ID)
 		}
 		seen[s.ID] = true
-		if s.Severity != "critical" && s.Severity != "warning" && s.Severity != "info" {
+		if SeverityRank(s.Severity) > 3 {
 			t.Errorf("%s: unexpected severity %q", s.ID, s.Severity)
 		}
 		if s.Why == "" {

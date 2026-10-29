@@ -235,7 +235,10 @@ var (
 	// analysis below supplies the reason.
 	gpNoGatewayRe   = regexp.MustCompile(`(?i)network connection is unreachable or the gateway is unresponsive`)
 	gpNoNetworkRe   = regexp.MustCompile(`(?i)no network connectivity`)
-	gpFlowPortalRe  = regexp.MustCompile(`(?i)(?:portal|to the portal) ([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z0-9.\-]+)`)
+	// "portal <fqdn>", or the login line, which puts "login completed with
+	// address" between the two. The FQDN class allows dots, so a sentence's
+	// full stop is captured too and has to be trimmed by the caller.
+	gpFlowPortalRe  = regexp.MustCompile(`(?i)(?:portal|to the portal|portal login completed with address) ([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z0-9.\-]+)`)
 	gpFlowGatewayRe = regexp.MustCompile(`(?i)(?:gateway|with Gateway|to gateway) ([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z0-9.\-]+)`)
 	gpFlowUserRe    = regexp.MustCompile(`(?i)and user (\S+?)\.?$`)
 
@@ -357,7 +360,8 @@ func attemptsFromLines(lines []gpFlowLine) []GPAttempt {
 		cur.Events++
 
 		if m := gpFlowPortalRe.FindStringSubmatch(l.msg); m != nil {
-			cur.Portal, lastPortal = m[1], m[1]
+			p := strings.TrimRight(m[1], ".")
+			cur.Portal, lastPortal = p, p
 		}
 		// Whether this line ends the attempt. It is applied *after* the stage
 		// markers below, because the settling line is itself the verdict —
@@ -418,7 +422,11 @@ func attemptsFromLines(lines []gpFlowLine) []GPAttempt {
 		// to whatever comes next, not to this one — without this a tunnel that
 		// came up cleanly was retroactively marked failed by the drop that
 		// followed it minutes later.
-		if cur.settled {
+		//
+		// HIP is the exception. It runs over the tunnel that just came up, so
+		// it is always logged after the line that settled the attempt, and
+		// skipping it left every connected attempt stopped short at "tunnel".
+		if cur.settled && !(tunnelOK(best) && hipLine(l.msg)) {
 			continue
 		}
 
@@ -441,7 +449,8 @@ func attemptsFromLines(lines []gpFlowLine) []GPAttempt {
 			if mk.stage == StageGatewaySelect || mk.stage == StageGatewayAuth ||
 				mk.stage == StageTunnel || mk.stage == StageHIP {
 				if g := gpFlowGatewayRe.FindStringSubmatch(l.msg); g != nil {
-					cur.Gateway, lastGateway = g[1], g[1]
+					gw := strings.TrimRight(g[1], ".")
+					cur.Gateway, lastGateway = gw, gw
 				}
 			}
 			break
@@ -473,6 +482,21 @@ func attemptsFromLines(lines []gpFlowLine) []GPAttempt {
 	}
 	flush()
 	return out
+}
+
+func tunnelOK(best map[GPStage]GPStageResult) bool {
+	return best[StageTunnel].Status == "ok"
+}
+
+// hipLine reports whether the first stage marker a line matches is a HIP one,
+// using the same first-match rule as the marker loop.
+func hipLine(msg string) bool {
+	for _, mk := range gpStageMarkers {
+		if mk.re.MatchString(msg) {
+			return mk.stage == StageHIP
+		}
+	}
+	return false
 }
 
 func rank(status string) int {

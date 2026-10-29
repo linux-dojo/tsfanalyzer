@@ -20,7 +20,7 @@ import (
 type LogSignature struct {
 	ID       string
 	Title    string
-	Severity string // critical | warning | info
+	Severity string // critical | warning | info | low
 	// Why explains what the match tells the reader, which is the part that
 	// makes a hit actionable rather than just highlighted.
 	Why string

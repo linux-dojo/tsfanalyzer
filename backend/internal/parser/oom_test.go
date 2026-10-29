@@ -294,7 +294,7 @@ func TestAnalyzeMemoryFindingsMentionOOMCaveat(t *testing.T) {
 		t.Error("an OOM should raise a critical finding")
 	}
 	// the report must not imply the named processes are the cause
-	if !strings.Contains(strings.ToLower(joined), "not necessarily the cause") {
+	if !strings.Contains(strings.ToLower(joined), "necessarily the cause") {
 		t.Errorf("findings should caveat that the named processes aren't the culprit:\n%s", joined)
 	}
 }

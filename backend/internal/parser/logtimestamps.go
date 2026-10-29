@@ -161,8 +161,8 @@ func parseBareTs(line string, yearHint int) (time.Time, bool) {
 		if day == "" {
 			day, mon = m[4], m[3]
 		}
-		return mk(atoiOr(m[7], 0), monthNum(mon), atoiOr(day, 0),
-			atoiOr(m[5], 0), atoiOr(m[6], 0), 0)
+		return mk(atoiOr(m[8], 0), monthNum(mon), atoiOr(day, 0),
+			atoiOr(m[5], 0), atoiOr(m[6], 0), atoiOr(m[7], 0))
 	}
 	if m := tsRedisRe.FindStringSubmatch(line); m != nil {
 		return mk(atoiOr(m[3], 0), monthNum(m[2]), atoiOr(m[1], 0),

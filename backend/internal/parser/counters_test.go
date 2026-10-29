@@ -108,12 +108,12 @@ func TestCpu15mPerMinuteRows(t *testing.T) {
 	}
 	// first row = block ts, second row = one minute earlier
 	blockTs, _ := time.Parse("2006-01-02 15:04:05", "2026-06-09 11:27:40")
-	// store order follows file order; sample[0] is row 0
-	if !avg1[0].Ts.Equal(blockTs) || !avg1[1].Ts.Equal(blockTs.Add(-time.Minute)) {
+	// a Series is oldest-first, so row 2 of the file is sample[0]
+	if !avg1[0].Ts.Equal(blockTs.Add(-time.Minute)) || !avg1[1].Ts.Equal(blockTs) {
 		t.Fatalf("row timestamps wrong: %v, %v", avg1[0].Ts, avg1[1].Ts)
 	}
-	if avg1[1].Value != 1 || max1[1].Value != 2 {
-		t.Fatalf("core1 row2 = avg %v max %v, want 1/2", avg1[1].Value, max1[1].Value)
+	if avg1[0].Value != 1 || max1[0].Value != 2 {
+		t.Fatalf("core1 row2 = avg %v max %v, want 1/2", avg1[0].Value, max1[0].Value)
 	}
 	if _, ok := got["dp__cpu__00_avg"]; !ok {
 		t.Fatal("zero-padded core name dp__cpu__00_avg missing")
@@ -523,11 +523,13 @@ func TestResourceUtil(t *testing.T) {
 	if v := got["dp__ru__pktbuf_avg"]; len(v) != 15 || v[0].Value != 3 {
 		t.Fatalf("pktbuf_avg = %+v", v)
 	}
-	if v := got["dp__ru__swtags_max"]; len(v) != 15 || v[0].Value != 6 {
+	// the file row is newest-first and a Series is oldest-first, so the
+	// row's first column is the last sample
+	blockTs, _ := time.Parse("2006-01-02 15:04:05", "2026-06-09 16:00:00")
+	if v := got["dp__ru__swtags_max"]; len(v) != 15 || v[14].Value != 6 || !v[14].Ts.Equal(blockTs) {
 		t.Fatalf("swtags_max = %+v", v)
 	}
-	// newest-first: the "1" is column 5 -> 4 minutes before the block ts
-	blockTs, _ := time.Parse("2006-01-02 15:04:05", "2026-06-09 16:00:00")
+	// the "1" is column 5 -> 4 minutes before the block ts
 	smax := got["dp__ru__session_max"]
 	var hit bool
 	for _, s := range smax {
